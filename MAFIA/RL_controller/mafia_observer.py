@@ -11,8 +11,6 @@ Market Observer in the MASA framework. MAFIA consists of:
 
 Each agent has CSA, TA, and ST-Fusion modules. Outputs are aggregated to
 generate market_vector and boundary_risk.
-
-Author: MASA
 See: Đặc Tả Kỹ Thuật (Technical Specification) - MAFIA.md
 """
 import os
@@ -54,6 +52,7 @@ class MAFIAObserver:
         """
         self.config = config
         self.action_dim = action_dim  # N (number of stocks)
+        self.last_topk_indices = None
         
         # Validate MAFIA hyperparameters exist
         self._validate_config()
@@ -113,10 +112,12 @@ class MAFIAObserver:
             **kwargs: Must include 'mode' ('train', 'valid', 'test')
         
         Returns:
-            tuple: (market_vector, lambda_val, boundary_risk)
-                - market_vector: (batch, N) numpy array
+            tuple: (market_vector, lambda_val, boundary_risk, market_scores_full, gate_weights)
+                - market_vector: (batch, N) numpy array - Top-K weights, zero elsewhere
                 - lambda_val: (batch,) numpy array (dummy zeros for MAFIA)
                 - boundary_risk: (batch,) numpy array (continuous risk value)
+                - market_scores_full: (batch, N) numpy array - Full market scores (softmax on all N assets, no Top-K mask)
+                - gate_weights: (batch, 4) numpy array - Dense MoE gate weights for 4 stock experts
         """
         mode = kwargs.get('mode', 'train')
         
@@ -148,32 +149,63 @@ class MAFIAObserver:
             if ochlv_tensor.shape[3] == 5:
                 ochlv_tensor = ochlv_tensor.permute(0, 1, 3, 2)
         
+        # Extract market-index OCHLV data if available
+        market_index_ochlv_tensor = None
+        if 'market_index_ochlv_data' in kwargs and kwargs['market_index_ochlv_data'] is not None:
+            # Direct market-index data provided
+            market_index_ochlv_tensor = self._prepare_market_index_ochlv_tensor(kwargs['market_index_ochlv_data'])
+        elif 'env' in kwargs and kwargs['env'] is not None:
+            # Try to extract from environment
+            env = kwargs['env']
+            if hasattr(env, '_extract_market_index_ochlv_window') and hasattr(env, 'curData'):
+                try:
+                    cur_date = env.curData['date'].iloc[0] if hasattr(env.curData, 'iloc') else env.curData['date'][0]
+                    market_index_ochlv_np = env._extract_market_index_ochlv_window(cur_date, window_size=self.config.mafia_T_w)
+                    market_index_ochlv_tensor = self._prepare_market_index_ochlv_tensor(market_index_ochlv_np)
+                except Exception as e:
+                    # If extraction fails, skip market-index agent
+                    print(f"Warning: Could not extract market-index OCHLV data: {e}")
+                    market_index_ochlv_tensor = None
+        
         if mode == 'train':
             self.mafia_model.train()
-            market_vector, boundary_risk = self.mafia_model(ochlv_tensor)
+            market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = self.mafia_model(
+                ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
+            )
         else:
             self.mafia_model.eval()
             with th.no_grad():
-                market_vector, boundary_risk = self.mafia_model(ochlv_tensor)
+                market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = self.mafia_model(
+                    ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
+                )
         
         if mode == 'train':
             # Store for training (keep gradient for Policy Gradient)
             self.market_vector_lst.append(market_vector)  # Don't detach - need gradient
             self.boundary_risk_lst.append(boundary_risk.detach())
         
+        # Store gate_weights for analysis/visualization (optional)
+        self.last_gate_weights = gate_weights.detach()
+        
         # Convert to numpy
         market_vector_np = market_vector.detach().cpu().numpy()
         boundary_risk_np = boundary_risk.detach().cpu().numpy()
+        topk_indices_np = topk_indices.detach().cpu().numpy()
+        market_scores_full_np = market_scores_full.detach().cpu().numpy()
+        self.last_topk_indices = topk_indices_np
         
         # Clean NaN/Inf from outputs
         market_vector_np = np.nan_to_num(market_vector_np, nan=0.0, posinf=0.0, neginf=0.0)
         boundary_risk_np = np.nan_to_num(boundary_risk_np, nan=self.config.risk_market, posinf=self.config.risk_market, neginf=self.config.risk_market)
+        market_scores_full_np = np.nan_to_num(market_scores_full_np, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Ensure correct shapes
         if market_vector_np.ndim == 1:
             market_vector_np = market_vector_np.reshape(1, -1)
         if boundary_risk_np.ndim == 0:
             boundary_risk_np = boundary_risk_np.reshape(1)
+        if market_scores_full_np.ndim == 1:
+            market_scores_full_np = market_scores_full_np.reshape(1, -1)
         
         # Handle size mismatch: pad or truncate market_vector to match action_dim
         actual_N = market_vector_np.shape[1]
@@ -186,18 +218,44 @@ class MAFIAObserver:
                 # Truncate
                 market_vector_np = market_vector_np[:, :self.action_dim]
         
+        # Handle size mismatch for market_scores_full: pad or truncate to match action_dim
+        actual_N_full = market_scores_full_np.shape[1]
+        if actual_N_full != self.action_dim:
+            if actual_N_full < self.action_dim:
+                # Pad with uniform distribution (1/N) to maintain probability distribution
+                padding = np.ones((market_scores_full_np.shape[0], self.action_dim - actual_N_full)) / self.action_dim
+                market_scores_full_np = np.concatenate([market_scores_full_np, padding], axis=1)
+                # Renormalize to ensure sum = 1
+                market_scores_full_np = market_scores_full_np / (np.sum(market_scores_full_np, axis=1, keepdims=True) + 1e-8)
+            else:
+                # Truncate
+                market_scores_full_np = market_scores_full_np[:, :self.action_dim]
+                # Renormalize to ensure sum = 1
+                market_scores_full_np = market_scores_full_np / (np.sum(market_scores_full_np, axis=1, keepdims=True) + 1e-8)
+        
         # Final validation: if market_vector is all zeros or contains NaN/Inf, use uniform distribution
         if np.any(np.isnan(market_vector_np)) or np.any(np.isinf(market_vector_np)) or np.sum(np.abs(market_vector_np)) < 1e-8:
             market_vector_np = np.ones((market_vector_np.shape[0], self.action_dim)) / self.action_dim
+        
+        # Final validation for market_scores_full: if all zeros or contains NaN/Inf, use uniform distribution
+        if np.any(np.isnan(market_scores_full_np)) or np.any(np.isinf(market_scores_full_np)) or np.sum(np.abs(market_scores_full_np)) < 1e-8:
+            market_scores_full_np = np.ones((market_scores_full_np.shape[0], self.action_dim)) / self.action_dim
         
         # Return format compatible with MarketObserver
         # lambda_val is not used in MAFIA, return zeros
         lambda_val_np = np.zeros(boundary_risk_np.shape, dtype=np.float32)
         
+        # Extract gate_weights
+        if hasattr(self, 'last_gate_weights') and self.last_gate_weights is not None:
+            gate_weights_np = self.last_gate_weights.detach().cpu().numpy()
+        else:
+            # Fallback: uniform weights for 4 experts
+            gate_weights_np = np.ones((market_vector_np.shape[0], 4)) / 4.0
+        
         # Validate output shapes
         self._validate_output_shapes(market_vector_np, lambda_val_np, boundary_risk_np)
         
-        return market_vector_np, lambda_val_np, boundary_risk_np
+        return market_vector_np, lambda_val_np, boundary_risk_np, market_scores_full_np, gate_weights_np
     
     def _prepare_ochlv_tensor(self, raw_ochlv_data):
         """
@@ -213,6 +271,21 @@ class MAFIAObserver:
         ochlv_tensor = ochlv_tensor.unsqueeze(0)  # Add batch dim: (1, N, M, T_w)
         ochlv_tensor = ochlv_tensor.to(self.device)
         return ochlv_tensor
+    
+    def _prepare_market_index_ochlv_tensor(self, market_index_ochlv_data):
+        """
+        Prepare market-index OCHLV data as tensor.
+        
+        Args:
+            market_index_ochlv_data: (1, 5, T_w) numpy array
+        
+        Returns:
+            torch.Tensor: (1, 1, 5, T_w) tensor on device
+        """
+        mkt_ochlv_tensor = th.from_numpy(market_index_ochlv_data).to(th.float32)
+        mkt_ochlv_tensor = mkt_ochlv_tensor.unsqueeze(0)  # Add batch dim: (1, 1, 5, T_w)
+        mkt_ochlv_tensor = mkt_ochlv_tensor.to(self.device)
+        return mkt_ochlv_tensor
     
     def _validate_input_shapes(self, finemkt_feat, finestock_feat, **kwargs):
         """Validate input shapes match expected format."""

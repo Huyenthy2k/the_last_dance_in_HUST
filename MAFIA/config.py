@@ -26,54 +26,59 @@ from RL_controller.TD3_controller import TD3PolicyOriginal
 class Config():
     def __init__(self, seed_num=2022, current_date=None):
 
-        self.notes = 'AAMAS MASA Implementation'
+        self.notes = 'MAFIA Implementation - MAFIA-only (Legacy models removed)'
 
-        self.benchmark_algo = 'MASA-mafia' # Algorithm: 'MASA-dc', 'MASA-mlp', 'MASA-lstm', 'TD3-Profit', 'TD3-PR', 'TD3-SR', 'CRP', (Please implement firstly before running 'EG', 'OLMAR', 'PAMR', 'CORN', 'RMR', 'EIIE', 'PPN', 'RAT')
-        self.market_name = 'DJIA' # Financial Index: 'DJIA', 'SP500', 'CSI300'
-        self.topK = 10 # Number of assets in a portfolio (10, 20, 30)
-        self.num_epochs = 50 # episode.
+        # MAFIA-only configuration (Legacy TD3-only and old MASA variants removed)
+        self.benchmark_algo = 'MASA-mafia'  # Only supported algorithm
+        self.market_name = 'VNINDEX'  # Financial Index: 'DJIA', 'SP500', 'CSI300'
+        self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
+        self.num_epochs = 1  # episode. (TEST: 2 epochs for validation)
 
-        if 'TD3' in self.benchmark_algo:
-            self.rl_model_name = 'TD3'
-            self.mode = 'RLonly'
-            self.mktobs_algo = None
-            obj_name = self.benchmark_algo.split('-')[1]
-            if obj_name == 'Profit':
-                self.trained_best_model_type = 'max_capital'
-            elif obj_name == 'PR':
-                self.trained_best_model_type = 'pr_loss'
-            elif obj_name == 'SR':
-                self.trained_best_model_type = 'sr_loss'
-            else:
-                raise ValueError("Undefined obj_name [{}] of {}.".format(obj_name, self.benchmark_algo))
-
-        elif 'MASA' in self.benchmark_algo:
-            self.rl_model_name = 'TD3' # RL-based agent is implemented by TD3 in the paper, and can be replaced by other RL approaches.
-            self.mode = 'RLcontroller' # For the proposed MASA framework
-            algo_name = self.benchmark_algo.split('-')[1]
-            if algo_name == 'mafia':
-                self.mktobs_algo = 'mafia_1'  # MAFIA observer
-            else:
-                self.mktobs_algo = '{}_1'.format(algo_name) # 'dc_1', 'ma_1', 'mlp_1'
-            self.trained_best_model_type = 'js_loss'
-        else:
-            # Baseline models
-            self.rl_model_name = self.benchmark_algo
-            self.mode = 'Benchmark'
-            self.mktobs_algo = None
-            self.trained_best_model_type = 'max_capital'
+        # MAFIA configuration (fixed)
+        self.rl_model_name = 'TD3'  # RL agent implemented by TD3
+        self.mode = 'RLcontroller'  # MASA framework with MAFIA observer
+        self.mktobs_algo = 'mafia_1'  # MAFIA observer (only observer supported)
+        self.trained_best_model_type = 'js_loss'
 
         self.is_enable_dynamic_risk_bound = True # True if enabling that the market observer sends info to solver-based agents. 
         self.enable_controller = True # True if enabling the solver-based agent.
         self.enable_market_observer = True # True if enabling the market observer.
+        # Optimized MAFIA toggles / hyperparameters
+        self.mafia_use_gumbel_topk = True
+        self.mafia_top_k = 10
+        self.mafia_gumbel_temperature = 1.0
+        self.mafia_hard_topk_inference = True  # use hard Top-K at eval
+        self.mafia_include_risk_boundary_in_state = True
+        # MAFIA state mode: 'compact' (Top-K market_vector) or 'full-score' (full market_scores_full)
+        # 'compact': Observer chọn Top-K → State có Top-K → RL tự động nhận Top-K từ Observer (state)
+        # 'full-score': Observer đưa ra Full N stocks → State có market_scores_full → RL tự động tự quyết Top-K từ market_scores_full
+        self.mafia_state_mode = 'compact'  # Options: 'compact' or 'full-score'
+        
+        # RL Top-K selection method (only used in 'full-score' mode)
+        # In 'compact' mode: RL automatically uses Top-K from Observer (no selection needed)
+        # In 'full-score' mode: RL automatically self-selects Top-K from market_scores_full
+        self.mafia_rl_topk_selection_method = 'topk'  # Options: 'topk' (select top K), 'threshold' (scores > threshold)
+        self.mafia_rl_topk_threshold = 0.01  # Threshold for 'threshold' method (only stocks with score > threshold)
+        
+        # CBF Controller: Use market_scores_full as prior distribution (works in both modes)
+        self.mafia_cbf_use_prior = False  # If True, CBF uses market_scores_full as prior
+        self.mafia_cbf_prior_weight = 0.3  # Weight for prior distribution (0.0-1.0)
+        
+        # Solver boost behavior (only active in 'full-score' mode when RL has selected Top-K)
+        # In 'full-score' mode: Solver can boost stocks already selected by RL, or keep original logic
+        self.mafia_solver_boost_enabled = False  # If True, Solver boosts stocks selected by RL (only in 'full-score' mode)
+        self.mafia_solver_boost_method = 'blend'  # Options: 'blend' or 'proportional' (same as boost methods)
+        self.mafia_solver_boost_factor = 0.3  # Weight for blending/boosting (0.0-1.0)
+        
+        # Market-index Agent and Self-Attention configuration
+        self.mafia_use_market_index_agent = True  # If True, enable Market-index agent (VNINDEX)
+        self.mafia_attention_agg = 'weighted'  # Aggregation method for ST-Fusion embeddings in attention: 'mean', 'weighted', 'max'
 
         self.trade_pattern = 1 # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
         self.lambda_1 = 1000.0 # return reward weight
         self.lambda_2 = 10.0 # action reward weight
         self.train_freq = [1, 'episode'] 
         self.risk_default = 0.017
-        if (self.market_name == 'DJIA') and (self.topK == 30):
-            self.topK = 29 # Only 29 stocks having complete data in the DJIA during that period.
         self.risk_up_bound = 0.012 # Decided by the observation of the training data set.  
         self.risk_hold_bound = 0.014 
         self.risk_down_bound = 0.017
@@ -88,7 +93,7 @@ class Config():
         # Set to a specific filename to use that file from the data directory
         # Example: self.stock_data_file = 'stock_prices_all_20251108_234851.csv'
         self.stock_data_file = 'stock_prices_all_20251108_234851.csv'  # Set to None for auto-detection
-        self.index_data_file = None  # e.g., 'DJIA_1d_index.csv' or None for auto
+        self.index_data_file = 'VNINDEX_1d_index.csv'  # Optional: 'DJIA_1d_index.csv' or None. If None, market features will be generated from stock data
         self.pricePredModel = 'MA'
         self.cov_lookback = 5 
         self.norm_method = 'sum'
@@ -104,8 +109,8 @@ class Config():
         # TD3 config
         self.reward_scaling = 1 
         self.learning_rate = 0.0001 
-        self.batch_size = 50
-        self.gradient_steps = 1 
+        self.batch_size = 32
+        self.gradient_steps = -1 
         self.ars_trial = 10
 
         if current_date is None:
@@ -123,14 +128,17 @@ class Config():
         self.checkpoint_dir = os.path.join(self.res_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.checkpoint_freq = 1  # Save checkpoint every N epochs (0 to disable)
-        self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh)
+        # Step-based checkpointing (0 to disable, >0 saves every N timesteps)
+        # Recommended: 500-1000 for frequent saves, or 0 to disable
+        self.partial_checkpoint_steps = 200  # Save checkpoint every 50 timesteps (0 to disable)
+        self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh or use auto_resume)
         self.auto_resume_from_latest = True  # Auto-resume from latest checkpoint if exists (when resume_from_checkpoint is None)
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21
         self.seed_num = seed_num
         date_split_dict = {            
             1: {'train_date_start': '2017-01-03 00:00:00',
-                'train_date_end': '2021-12-31 23:59:59',
+                'train_date_end': '2020-12-31 23:59:59',
                 'valid_date_start': '2022-01-01 00:00:00',
                 'valid_date_end': '2023-12-31 23:59:59',
                 'test_date_start': '2024-01-01 00:00:00',
@@ -162,38 +170,29 @@ class Config():
         self.otherRef_indicator_lst = ['MA-{}'.format(self.otherRef_indicator_ma_window), 'DAILYRETURNS-{}'.format(self.dailyRetun_lookback)]
 
         self.mkt_rf = { 
-            'SP500': 1.6575,
-            'CSI300': 3.037,
-            'DJIA': 1.6575,
+            'VNINDEX': 3.0,  # Risk-free rate for Vietnam market (based on 10-year government bond yield, ~3.0% as of 2022). Adjust based on your data period.
         }
 
         self.market_close_time = {
-            'CSI300': '15:00:00',
+            'VNINDEX': '15:00:00',  # Vietnam stock market close time
         }
         self.invest_env_para = {
             'max_shares': 100, 'initial_asset': 1000000, 'reward_scaling': self.reward_scaling, 'norm_method': self.norm_method, 
             'transaction_cost': 0.0003, 'slippage': 0.001, 'seed_num': self.seed_num
         } 
 
-        self.only_long_algo_lst = ['CRP', 'EG', 'OLMAR', 'PAMR', 'RMR']
-        self.use_cash_algo_lst = ['RAT', 'EIIE', 'PPN'] 
-        if self.mode != 'RLcontroller':
-            self.enable_controller = False
-            self.enable_market_observer = False
-            self.is_enable_dynamic_risk_bound = False
+        # Legacy algorithm lists (kept for reference, not used)
+        self.only_long_algo_lst = []  # Removed legacy algorithms
+        self.use_cash_algo_lst = []   # Removed legacy algorithms
+        # MAFIA always uses RLcontroller mode with controller enabled
+        # (removed legacy branching that disabled controller)
 
         if self.risk_default <= self.risk_market:
             raise ValueError("The boundary of safe risk[{}] should not be less than/ equal to the market risk[{}].".format(self.risk_default, self.risk_market))
 
-        if self.mktobs_algo is not None:
-            if 'dc' in self.mktobs_algo:
-                self.is_gen_dc_feat = True
-                self.dc_threshold = [0.01] 
-            elif 'mafia' in self.mktobs_algo:
-                # MAFIA uses its own DC feature generation, but we can set this for compatibility
-                self.is_gen_dc_feat = False
-            else:
-                self.is_gen_dc_feat = False
+        # MAFIA uses its own DC feature generation
+        if self.mktobs_algo == 'mafia_1':
+            self.is_gen_dc_feat = False
         else:
             self.is_gen_dc_feat = False
 
@@ -202,32 +201,17 @@ class Config():
         self.load_market_observer_config()
 
     def load_model_config(self):
-        self.use_features = ['close', 'open', 'high', 'low'] 
-        self.window_size = 31
-        self.po_lr = 0.0001
-        self.po_weight_decay = 0.001
+        # Order matters for CHANGE features (Spec §II.2 Technical Agent)
+        self.use_features = ['close', 'open', 'high', 'low', 'volume']
+        # Note: window_size removed - MAFIA uses mafia_T_w instead (on-the-fly computation)
 
     def load_market_observer_config(self):
         self.freq = '1d'
-        self.finefreq = '60m'
-        self.fine_window_size = 4
+        self.finefreq = '1d'
+        self.fine_window_size = 30
         self.feat_scaler = 10 
         
-        self.hidden_vec_loss_weight = 1e4
-        self.sigma_loss_weight = 1e5
-        self.lambda_min = 0.0
-        self.lambda_max = 1.0
-        self.sigma_min = 0.0  
-        self.sigma_max = 1.0  
-        
-        self.finestock_feat_cols_lst = []
-        self.finemkt_feat_cols_lst = []
-        for ifeat in self.use_features:
-            for iwin in range(1, self.fine_window_size+1):
-                self.finestock_feat_cols_lst.append('stock_{}_{}_w{}'.format(self.finefreq, ifeat, iwin))
-                self.finemkt_feat_cols_lst.append('mkt_{}_{}_w{}'.format(self.finefreq, ifeat, iwin))
-        
-        # MAFIA Hyperparameters
+        # MAFIA Hyperparameters (must be defined first as they're used below)
         self.mafia_T_w = 30  # Observation window size
         self.mafia_DC_thresholds = [0.005, 0.01, 0.02]  # DC thresholds for 3 DC agents
         self.mafia_D = 64  # Embedding dimension
@@ -236,8 +220,92 @@ class Config():
         self.mafia_encoder_heads = 4  # Number of attention heads
         self.mafia_M_tech = 8  # Features for Technical agent (5 OCHLV + 3 indicators)
         self.mafia_M_dc = 5  # Features for DC agents
+        self.mafia_M_mkt = 19  # Features for Market-index agent (5 change + 3 basic + 11 extended indicators)
         self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
         self.mafia_weight_decay = 0.001  # Weight decay for optimizer
+        self.hidden_vec_loss_weight = 1.0  # Weight for market_vector loss in Policy Gradient training
+        
+        # Dense MoE Gating Configuration
+        self.mafia_gating_encoder_type = 'attention_based_aggregation'  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
+        self.mafia_gating_num_heads = 4  # For attention-based encoder
+        self.mafia_gating_dropout = 0.1  # Dropout for gating networks
+        self.mafia_gating_lstm_layers = 2  # For bidirectional_lstm encoder
+        self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
+        
+        self.finestock_feat_cols_lst = []
+        self.finemkt_feat_cols_lst = []
+        # Fine stock windows keep using fine_window_size
+        for ifeat in self.use_features:
+            for iwin in range(1, self.fine_window_size+1):
+                self.finestock_feat_cols_lst.append('stock_{}_{}_w{}'.format(self.finefreq, ifeat, iwin))
+        # Market index windows use mafia_T_w (e.g., 30)
+        for ifeat in self.use_features:
+            for iwin in range(1, self.mafia_T_w+1 if hasattr(self, 'mafia_T_w') else 31):
+                self.finemkt_feat_cols_lst.append('mkt_{}_{}_w{}'.format(self.finefreq, ifeat, iwin))
+
+        # Add market technical indicators to fine market feature list
+        self.finemkt_indicator_cols = [
+            'mkt_{}_sma20'.format(self.finefreq),
+            'mkt_{}_rsi14'.format(self.finefreq),
+            'mkt_{}_atr14'.format(self.finefreq),
+            # Extended indicators (all causal, computed with past-only data)
+            'mkt_{}_macd_hist'.format(self.finefreq),
+            'mkt_{}_bb_width'.format(self.finefreq),
+            'mkt_{}_stoch_k'.format(self.finefreq),
+            'mkt_{}_stoch_d'.format(self.finefreq),
+            'mkt_{}_adx14'.format(self.finefreq),
+            'mkt_{}_obv'.format(self.finefreq),
+            'mkt_{}_mfi14'.format(self.finefreq),
+            'mkt_{}_cci20'.format(self.finefreq),
+            'mkt_{}_vol_std20'.format(self.finefreq),
+            'mkt_{}_drawdown60'.format(self.finefreq),
+            'mkt_{}_regime_sma20_60'.format(self.finefreq),
+        ]
+        for col in self.finemkt_indicator_cols:
+            if col not in self.finemkt_feat_cols_lst:
+                self.finemkt_feat_cols_lst.append(col)
+
+        # Market index feature selection (DEPRECATED - not used in simplified state):
+        # Previous architecture used these explicit features in the state
+        # Now we rely on Observer's Market-Index Agent for learned representation
+        # Kept for backward compatibility or future experimentation
+        self.market_index_feature_names = []
+        # ΔOHLCV windows for all OHLCV features, across mafia_T_w (30)
+        for change_feat in ['open', 'close', 'high', 'low', 'volume']:
+            for iwin in range(1, self.mafia_T_w + 1):
+                feat_name = 'mkt_{}_{}_w{}'.format(self.finefreq, change_feat, iwin)
+                if feat_name in self.finemkt_feat_cols_lst:
+                    self.market_index_feature_names.append(feat_name)
+        # Basic indicators
+        basic_indicators = [
+            'mkt_{}_sma20'.format(self.finefreq),
+            'mkt_{}_rsi14'.format(self.finefreq),
+            'mkt_{}_atr14'.format(self.finefreq),
+        ]
+        for col in basic_indicators:
+            if col in self.finemkt_feat_cols_lst:
+                self.market_index_feature_names.append(col)
+        # Extended indicators (predefined in finemkt_indicator_cols)
+        for col in self.finemkt_indicator_cols:
+            if col in self.finemkt_feat_cols_lst:
+                self.market_index_feature_names.append(col)
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for name in self.market_index_feature_names:
+            if name not in seen:
+                deduped.append(name)
+                seen.add(name)
+        self.market_index_feature_names = deduped
+        # DEPRECATED CODE BELOW - No longer used in state building
+        # State architecture now only uses Observer's learned representation (market_vector/market_scores_full)
+        # This dimension adjustment code is kept for backward compatibility only
+        # Commented out as it's not needed for current simplified state architecture
+        # if len(self.market_index_feature_names) > self.market_index_state_dim:
+        #     self.market_index_feature_names = self.market_index_feature_names[:self.market_index_state_dim]
+        # elif len(self.market_index_feature_names) < self.market_index_state_dim:
+        #     # Fill with None placeholders to be handled downstream
+        #     self.market_index_feature_names.extend([None] * (self.market_index_state_dim - len(self.market_index_feature_names)))
 
     def load_para(self):
         if self.enable_market_observer:
@@ -255,7 +323,7 @@ class Config():
                     policy_name = "MlpPolicy"
         base_para = {
             'policy': policy_name, 'learning_rate': self.learning_rate, 'buffer_size': 1000000,
-            'learning_starts': 100, 'batch_size': self.batch_size, 'tau': 0.005, 'gamma': 0.99, 'train_freq': (self.train_freq[0], self.train_freq[1]),
+            'learning_starts': 100, 'batch_size': self.batch_size, 'tau': 0.005, 'gamma': 0.99, 'train_freq': (self.train_freq[0], self.train_freq[1]), 'verbose': 1,
             'gradient_steps': self.gradient_steps, 'action_noise': None,  'replay_buffer_class': None, 'replay_buffer_kwargs': None, 
             'optimize_memory_usage': False, 'tensorboard_log': None, 'policy_kwargs': None, 
             'verbose': 1, 'seed': self.seed_num, 'device': 'auto', '_init_setup_model': True,
@@ -309,7 +377,11 @@ class Config():
         log_str = log_str + para_str
         para_str = 'only_long_algo_lst: {}, \n'.format(self.only_long_algo_lst)
         log_str = log_str + para_str
-        para_str = 'lstr para: use_features: {}, window_size: {}, freq: {}, finefreq: {}, fine_window_size: {}, \n'.format(self.use_features, self.window_size, self.freq, self.finefreq, self.fine_window_size)
+        para_str = 'checkpoint_freq: {}, partial_checkpoint_steps: {}, \n'.format(self.checkpoint_freq, self.partial_checkpoint_steps)
+        log_str = log_str + para_str
+        para_str = 'lstr para: use_features: {}, freq: {}, finefreq: {}, fine_window_size: {}, mafia_T_w: {}\n'.format(
+            self.use_features, self.freq, self.finefreq, self.fine_window_size, self.mafia_T_w
+        )
         log_str = log_str + para_str
         para_str = 'enable_market_observer: {}, mktobs_algo: {}, feat_scaler: {} \n'.format(self.enable_market_observer, self.mktobs_algo, self.feat_scaler)
         log_str = log_str + para_str

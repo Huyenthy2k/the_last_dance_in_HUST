@@ -76,13 +76,6 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    from RL_controller.market_obs import MarketObserver
-    print("  ✓ RL_controller.market_obs")
-except Exception as e:
-    print(f"  ✗ RL_controller.market_obs: {e}")
-    sys.exit(1)
-
-try:
     from RL_controller.controllers import RL_withController
     print("  ✓ RL_controller.controllers")
 except Exception as e:

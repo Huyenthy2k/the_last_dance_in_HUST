@@ -11,7 +11,7 @@ import numpy as np
 import torch as th
 from torch.nn import functional as F
 from stable_baselines3.common.buffers import ReplayBuffer
-from stable_baselines3.common.noise import ActionNoise
+from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, TrainFreq, TrainFrequencyUnit, RolloutReturn 
@@ -107,9 +107,8 @@ class ActorAdj(BasePolicy):
 
         action_dim = get_action_dim(self.action_space)
         self.action_dim = action_dim
-        # actor_net = create_mlp(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
-        td3_main_branch_dim = features_dim - action_dim
-        actor_net = create_mlp_adj(td3_main_branch_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        # Adjust to consume full compact state as input (no assumption that last action_dim are market weights)
+        actor_net = create_mlp_adj(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
 
         # Deterministic action
         self.mu = th.nn.Sequential(*actor_net)
@@ -137,14 +136,10 @@ class ActorAdj(BasePolicy):
         # Clean NaN/Inf from features
         features = th.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         
-        td3_decision = self.mu(features[:, :-self.action_dim]) # range [0, 1], sum=1
-        mkt_decision = features[:, -self.action_dim:] # range [0, 1], sum=1
-        
-        # Clean NaN/Inf from decisions
+        td3_decision = self.mu(features) # range [0, 1], sum=1
         td3_decision = th.nan_to_num(td3_decision, nan=0.0, posinf=0.0, neginf=0.0)
-        mkt_decision = th.nan_to_num(mkt_decision, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        final_output = (td3_decision + mkt_decision) - 1 # range [-1, 1]
+        # Map to [-1, 1]
+        final_output = (2.0 * td3_decision) - 1.0
         # Final cleanup
         final_output = th.nan_to_num(final_output, nan=0.0, posinf=1.0, neginf=-1.0)
         return final_output
@@ -367,6 +362,11 @@ class TD3Controller(OffPolicyAlgorithm):
         # Update learning rate according to lr schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
+        # Log training start (always log first few times, then every 100)
+        if self.verbose >= 1 and (self._n_updates < 10 or self._n_updates % 100 == 0):
+            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+            print(f"[TRAIN] Starting gradient updates | Total updates: {self._n_updates} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+
         actor_losses, critic_losses = [], []
         for _ in range(gradient_steps):
 
@@ -418,6 +418,13 @@ class TD3Controller(OffPolicyAlgorithm):
         if len(actor_losses) > 0:
             self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        
+        # Log training completion with loss values (always log first few times, then every 100)
+        if self.verbose >= 1 and (self._n_updates < 10 or self._n_updates % 100 == 0):
+            mean_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
+            mean_critic_loss = np.mean(critic_losses)
+            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+            print(f"[TRAIN] Completed | Updates: {self._n_updates} | Actor loss: {mean_actor_loss:.6f} | Critic loss: {mean_critic_loss:.6f} | Buffer size: {buffer_size}", flush=True)
 
     def learn(
         self: SelfTD3,
@@ -428,6 +435,12 @@ class TD3Controller(OffPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfTD3:
+        # Log initial state
+        if self.verbose >= 1:
+            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+            learning_starts = getattr(self, 'learning_starts', 100)
+            print(f"[LEARN] Starting training | Buffer size: {buffer_size} | learning_starts: {learning_starts} | Total timesteps: {total_timesteps}", flush=True)
+            print(f"[LEARN] train_freq: {self.train_freq} | gradient_steps: {self.gradient_steps}", flush=True)
 
         return super().learn(
             total_timesteps=total_timesteps,
@@ -481,6 +494,10 @@ class TD3Controller(OffPolicyAlgorithm):
 
         assert isinstance(env, VecEnv), "You must pass a VecEnv"
         assert train_freq.frequency > 0, "Should at least collect one step or episode."
+        
+        # Log rollout start
+        if self.verbose >= 1 and self._episode_num % 10 == 0:
+            print(f"[ROLLOUT] Starting rollout | Timestep: {self.num_timesteps} | Episode: {self._episode_num}", flush=True)
 
         if env.num_envs > 1:
             assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
@@ -548,6 +565,12 @@ class TD3Controller(OffPolicyAlgorithm):
 
             # Store data in replay buffer (normalized action and unnormalized observation)
             self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos)
+            
+            # Log buffer size periodically
+            if self.verbose >= 1 and num_collected_steps % 100 == 0:
+                buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
+                learning_starts = getattr(self, 'learning_starts', 100)
+                print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{learning_starts} | Timesteps: {self.num_timesteps}", flush=True)
 
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 
@@ -571,6 +594,14 @@ class TD3Controller(OffPolicyAlgorithm):
                     if log_interval is not None and self._episode_num % log_interval == 0:
                         self._dump_logs()
         callback.on_rollout_end()
+        
+        # Log rollout completion with buffer info
+        if self.verbose >= 1 and num_collected_episodes > 0:
+            buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
+            learning_starts = getattr(self, 'learning_starts', 100)
+            print(f"[ROLLOUT] Completed | Collected steps: {num_collected_steps * env.num_envs} | Episodes: {num_collected_episodes}", flush=True)
+            print(f"[ROLLOUT] Buffer size: {buffer_size} | learning_starts: {learning_starts} | Training enabled: {buffer_size >= learning_starts}", flush=True)
+            print(f"[ROLLOUT] Current _n_updates: {getattr(self, '_n_updates', 0)}", flush=True)
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
         

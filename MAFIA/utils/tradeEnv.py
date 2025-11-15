@@ -4,7 +4,6 @@
 ---------------------------------
  Name: tradeEnv.py  
  Description: Define the trading environment for the trading agent.
- Author: MASA
 --------------------------------
 '''
 import numpy as np
@@ -32,6 +31,11 @@ except ImportError:
 from stable_baselines3.common.vec_env import DummyVecEnv
 from scipy.stats import entropy
 import scipy.stats as spstats
+try:
+    from utils.weight_symbol_mapper import get_top_stocks
+except ImportError:
+    # Fallback if weight_symbol_mapper is not available
+    get_top_stocks = None
 
 def _safe_array_from_values(values):
     """Safely convert values to numpy array, handling inhomogeneous shapes."""
@@ -85,7 +89,7 @@ def _safe_array_from_values(values):
 
 class StockPortfolioEnv(gym.Env):
 
-    def __init__(self, config, rawdata, mode, stock_num, action_dim, tech_indicator_lst, max_shares,
+    def __init__(self, config, rawdata, mode, stock_num, action_dim, tech_indicator_lst=None, max_shares=None,
                  initial_asset=1000000, reward_scaling=1, norm_method='sum', transaction_cost=0.001, slippage=0.001, 
                  seed_num=2022, extra_data=None, mkt_observer=None):
         
@@ -94,6 +98,10 @@ class StockPortfolioEnv(gym.Env):
         self.mode = mode # train, valid, test
         self.stock_num = stock_num # Number of stocks
         self.action_dim = action_dim # Number of assets
+        
+        # Handle tech_indicator_lst (optional for MAFIA, required for legacy)
+        if tech_indicator_lst is None:
+            tech_indicator_lst = []
         self.tech_indicator_lst = tech_indicator_lst
         self.tech_indicator_lst_wocov = copy.deepcopy(self.tech_indicator_lst) # without cov feature
         if 'cov' in self.tech_indicator_lst_wocov:
@@ -136,10 +144,46 @@ class StockPortfolioEnv(gym.Env):
         else:
             self.state_dim = (len(self.tech_indicator_lst_wocov) * self.stock_num) + 1 # +1: current portfolio value
         if self.config.enable_market_observer:
-            self.state_dim = self.state_dim + self.stock_num
             self.mkt_observer = mkt_observer
+            # If using MAFIA observer, override state dimension based on mode
+            try:
+                from RL_controller.mafia_observer import MAFIAObserver
+                if isinstance(self.mkt_observer, MAFIAObserver):
+                    state_mode = getattr(self.config, 'mafia_state_mode', 'compact')
+                    risk_dim = 1 if getattr(self.config, 'mafia_include_risk_boundary_in_state', False) else 0
+                    if state_mode == 'full-score':
+                        # Full-score mode: state = [market_scores_full(N), portfolio_value, (optional) risk_boundary]
+                        # Removed market_index_state - rely on Observer's learned representation
+                        self.state_dim = self.stock_num + 1 + risk_dim
+                    else:
+                        # Compact mode: state = [market_vector(K), portfolio_value, (optional) risk_boundary]
+                        # Removed market_index_state - rely on Observer's learned representation
+                        k = self.config.mafia_top_k
+                        self.state_dim = k + 1 + risk_dim
+            except Exception:
+                pass
         else:
             self.mkt_observer = None
+        
+        # Initialize market_scores_full and topk_indices for MAFIA observer (will be populated in run_mkt_observer)
+        self.market_scores_full = None
+        self.observer_topk_indices = None  # Top-K indices selected by Observer (for mode 'compact')
+        
+        # Validate MAFIA state mode if using MAFIA observer
+        if self.config.enable_market_observer and self.mkt_observer is not None:
+            try:
+                from RL_controller.mafia_observer import MAFIAObserver
+                if isinstance(self.mkt_observer, MAFIAObserver):
+                    state_mode = getattr(self.config, 'mafia_state_mode', 'compact')
+                    if state_mode not in ['compact', 'full-score']:
+                        raise ValueError(f"Invalid mafia_state_mode: {state_mode}. Must be 'compact' or 'full-score'")
+                    # Log current mode for debugging
+                    if state_mode == 'full-score':
+                        print(f"[MAFIA] State mode: FULL-SCORE (N={self.stock_num} stocks in state)")
+                    else:
+                        print(f"[MAFIA] State mode: COMPACT (K={self.config.mafia_top_k} stocks in state)")
+            except Exception:
+                pass
         
         if self.config.benchmark_algo in self.config.only_long_algo_lst:
             # Long only
@@ -163,21 +207,18 @@ class StockPortfolioEnv(gym.Env):
         self.curData.sort_values(['stock'], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
 
-        if self.config.enable_cov_features:   
-            self.covs = np.array(self.curData['cov'].values[0])
-            self.state = np.append(self.covs, np.transpose(self.curData[self.tech_indicator_lst_wocov].values), axis=0)
-        else:
-            self.state = np.transpose(self.curData[self.tech_indicator_lst_wocov].values)
-        self.state = self.state.flatten()
-        self.state = np.append(self.state, [0], axis=0)
+        # Initialize state (will be built in run_mkt_observer)
+        self.state = np.zeros(self.state_dim, dtype=np.float32)
         self.ctl_state = {k:np.array(list(self.curData[k].values)) for k in self.config.otherRef_indicator_lst}
         self.terminal = False
+        
+        # Initialize capital before running market observer (needed for state building)
+        self.cur_capital = self.initial_asset
 
         self.profit_lst = [0] # percentage of portfolio daily returns
         cur_risk_boundary, stock_ma_price = self.run_mkt_observer(stage='init') # after curData and state, before cur_risk_boundary
         if stock_ma_price is not None:
             self.ctl_state['MA-{}'.format(self.config.otherRef_indicator_ma_window)] = stock_ma_price
-        self.cur_capital = self.initial_asset
         
         self.cvar_lst = [0]
         self.cvar_raw_lst = [0]
@@ -213,7 +254,7 @@ class StockPortfolioEnv(gym.Env):
         if self.mode == 'train':
             self.exclusive_cputime = 0
             self.exclusive_systime = 0
-        # For saveing profile
+        # For saving profile
         self.profile_hist_field_lst = [            
             'ep', 'trading_days', 'annualReturn_pct', 'mdd', 'sharpeRatio', 'final_capital', 'volatility', 
             'calmarRatio', 'sterlingRatio',
@@ -230,6 +271,7 @@ class StockPortfolioEnv(gym.Env):
             'solver_solvable', 'solver_insolvable', 'cputime', 'systime', 
         ]
         self.profile_hist_ep = {k: [] for k in self.profile_hist_field_lst}
+    
 
     def step(self, actions):
         self.terminal = self.curTradeDay >= (self.totalTradeDay - 1)
@@ -250,8 +292,11 @@ class StockPortfolioEnv(gym.Env):
             self.end_cputime = time.process_time()
             self.end_systime = time.perf_counter()
             self.model_save_flag = True
+            print(f"[Profile Save] Epoch {self.epoch} complete (mode={self.mode}), calling get_results() and save_profile()...", flush=True)
             invest_profile = self.get_results()
+            print(f"[Profile Save] get_results() completed, calling save_profile()...", flush=True)
             self.save_profile(invest_profile=invest_profile)
+            print(f"[Profile Save] save_profile() completed for epoch {self.epoch}", flush=True)
 
             # Return format compatible with both gym and gymnasium
             if GYMNASIUM_AVAILABLE:
@@ -346,13 +391,8 @@ class StockPortfolioEnv(gym.Env):
                                                 self.curData.at[idx, col] = last_val[0]
                                     # If still NaN, fill with 0 (shouldn't happen with proper data)
                                     self.curData[col] = self.curData[col].fillna(0.0).infer_objects(copy=False)
-            if self.config.enable_cov_features:   
-                self.covs = np.array(self.curData['cov'].values[0])
-                self.state = np.append(self.covs, np.transpose(self.curData[self.tech_indicator_lst_wocov].values), axis=0)
-            else:
-                self.state = np.transpose(self.curData[self.tech_indicator_lst_wocov].values)
-            self.state = self.state.flatten()
-            self.ctl_state = {k:_safe_array_from_values(self.curData[k].values) for k in self.config.otherRef_indicator_lst} # State data for the controller
+            
+            self.ctl_state = {k:_safe_array_from_values(self.curData[k].values) for k in self.config.otherRef_indicator_lst}
             cur_date = self.curData['date'].unique()[0]
             self.date_memory.append(cur_date)
 
@@ -381,15 +421,13 @@ class StockPortfolioEnv(gym.Env):
                 raise ValueError("Loss the whole capital! [Day: {}, date: {}, poDayReturn: {}]".format(self.curTradeDay, self.date_memory[-1], poDayReturn))
 
             updatePoValue = self.cur_capital * (poDayReturn + 1) 
-            poDayReturn_withcost = (updatePoValue - self.cur_capital) / self.cur_capital # Include the cost in the last timestamp
-
+            poDayReturn_withcost = (updatePoValue - self.cur_capital) / self.cur_capital
             self.cur_capital = updatePoValue
-            self.state = np.append(self.state, [np.log(self.cur_capital/self.initial_asset)], axis=0) # current portfolio value observation
             
-            self.profit_lst.append(poDayReturn_withcost) # Daily return
+            self.profit_lst.append(poDayReturn_withcost)
             self.asset_lst.append(self.cur_capital)
 
-            # Receive info from the market observer
+            # Build MAFIA state via market observer
             cur_risk_boundary, stock_ma_price = self.run_mkt_observer(stage='run', rate_of_price_change=np.array([rate_of_price_change]))
             if stock_ma_price is not None:
                 self.ctl_state['MA-{}'.format(self.config.otherRef_indicator_ma_window)] = stock_ma_price
@@ -550,7 +588,14 @@ class StockPortfolioEnv(gym.Env):
             cvar_expected_raw = -expected_r_raw + expected_std_raw * cvar_Z
             self.cvar_raw_lst.append(cvar_expected_raw)
 
-            profit_part = np.log(poDayReturn_withcost+1)
+            # Ensure poDayReturn_withcost is valid before taking log
+            if np.isnan(poDayReturn_withcost) or np.isinf(poDayReturn_withcost):
+                poDayReturn_withcost = 0.0
+            # Avoid log(0) = -inf when poDayReturn_withcost = -1
+            if poDayReturn_withcost <= -1:
+                profit_part = -10.0  # Large negative value instead of -inf
+            else:
+                profit_part = np.log(poDayReturn_withcost+1)
             if (self.config.trained_best_model_type == 'js_loss') and (self.config.enable_controller):
                 # Action reward guiding mechanism
                 if self.config.trade_pattern == 1:
@@ -591,7 +636,11 @@ class StockPortfolioEnv(gym.Env):
                 profit_part = poDayReturn_withcost
                 scaled_profit_part = profit_part
                 scaled_risk_part = risk_part
-                cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
+                # Avoid division by zero
+                if scaled_risk_part == 0 or np.isnan(scaled_risk_part) or np.isinf(scaled_risk_part):
+                    cur_reward = scaled_profit_part
+                else:
+                    cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
 
             else:
                 risk_part = 0
@@ -601,6 +650,10 @@ class StockPortfolioEnv(gym.Env):
 
             self.rl_reward_risk_lst.append(scaled_risk_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)
+            # Ensure cur_reward is not NaN or inf (root cause fix)
+            if np.isnan(cur_reward) or np.isinf(cur_reward):
+                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_risk_part={scaled_risk_part}), replacing with 0.0", flush=True)
+                cur_reward = 0.0
             self.reward = cur_reward
             self.reward_lst.append(self.reward)
             self.model_save_flag = False
@@ -621,13 +674,10 @@ class StockPortfolioEnv(gym.Env):
         self.curData = copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
         self.curData.sort_values(['stock'], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
-        if self.config.enable_cov_features:   
-            self.covs = np.array(self.curData['cov'].values[0])
-            self.state = np.append(self.covs, np.transpose(self.curData[self.tech_indicator_lst_wocov].values), axis=0)
-        else:
-            self.state = np.transpose(self.curData[self.tech_indicator_lst_wocov].values)
-        self.state = self.state.flatten()
-        self.state = np.append(self.state, [0], axis=0)
+        
+        # Initialize state (will be built in run_mkt_observer)
+        self.state = np.zeros(self.state_dim, dtype=np.float32)
+        
         self.ctl_state = {k:np.array(list(self.curData[k].values)) for k in self.config.otherRef_indicator_lst} 
         self.terminal = False
 
@@ -720,8 +770,12 @@ class StockPortfolioEnv(gym.Env):
         netProfit_pct = netProfit / self.initial_asset # Rate of overall returns
 
         diffPeriodAsset = np.diff(self.asset_lst)
-        sigReturn_max = np.max(diffPeriodAsset) # Maximal returns in a single transaction.
-        sigReturn_min = np.min(diffPeriodAsset) # Minimal returns in a single transaction
+        if len(diffPeriodAsset) > 0:
+            sigReturn_max = np.max(diffPeriodAsset) # Maximal returns in a single transaction.
+            sigReturn_min = np.min(diffPeriodAsset) # Minimal returns in a single transaction
+        else:
+            sigReturn_max = 0.0
+            sigReturn_min = 0.0
 
         # Annual Returns
         annualReturn_pct = np.power((1 + netProfit_pct), (self.config.tradeDays_per_year/len(self.asset_lst))) - 1
@@ -731,35 +785,62 @@ class StockPortfolioEnv(gym.Env):
         avg_dailyReturn_pct = np.mean(self.profit_lst)
         # strategy volatility
         volatility = np.sqrt(np.sum(np.power((self.profit_lst - avg_dailyReturn_pct), 2)) * self.config.tradeDays_per_year / (len(self.profit_lst) - 1))
+        # Avoid division by zero
+        if volatility == 0 or np.isnan(volatility) or np.isinf(volatility):
+            volatility = 1e-6  # Small epsilon to avoid division by zero
 
         # SR_Vol, Long-term risk
         sharpeRatio = ((annualReturn_pct * 100) - self.config.mkt_rf[self.config.market_name])/ (volatility * 100)
+        # Handle NaN/inf
+        if np.isnan(sharpeRatio) or np.isinf(sharpeRatio):
+            sharpeRatio = 0.0
         # sharpeRatio = np.max([sharpeRatio, 0])
 
         dailyAnnualReturn_lst = np.power((1+np.array(self.profit_lst)), self.config.tradeDays_per_year) - 1
         dailyRisk_lst = np.array(self.risk_cbf_lst) * np.sqrt(self.config.tradeDays_per_year) # Daily Risk to Anuual Risk
-        dailySR = ((dailyAnnualReturn_lst[1:] * 100) - self.config.mkt_rf[self.config.market_name]) / (dailyRisk_lst[1:] * 100)
+        # Avoid division by zero
+        dailyRisk_lst_safe = np.where(dailyRisk_lst == 0, 1e-6, dailyRisk_lst)
+        dailySR = ((dailyAnnualReturn_lst[1:] * 100) - self.config.mkt_rf[self.config.market_name]) / (dailyRisk_lst_safe[1:] * 100)
+        # Handle NaN/inf
+        dailySR = np.where(np.isnan(dailySR) | np.isinf(dailySR), 0.0, dailySR)
         dailySR = np.append(0, dailySR)
         # dailySR = np.where(dailySR < 0, 0, dailySR)
         dailySR_max = np.max(dailySR)
-        dailySR_min = np.min(dailySR[dailySR!=0])
+        dailySR_nonzero = dailySR[dailySR!=0]
+        dailySR_min = np.min(dailySR_nonzero) if len(dailySR_nonzero) > 0 else 0.0
         dailySR_avg = np.mean(dailySR)
 
         # For performance analysis
-        dailyReturnRate_wocbf = np.diff(self.return_raw_lst)/np.array(self.return_raw_lst)[:-1]
+        # Avoid division by zero
+        return_raw_array = np.array(self.return_raw_lst)
+        return_raw_safe = np.where(return_raw_array == 0, 1e-6, return_raw_array)
+        dailyReturnRate_wocbf = np.diff(return_raw_array) / return_raw_safe[:-1]
         dailyReturnRate_wocbf = np.append(0, dailyReturnRate_wocbf)
+        # Handle NaN/inf
+        dailyReturnRate_wocbf = np.where(np.isnan(dailyReturnRate_wocbf) | np.isinf(dailyReturnRate_wocbf), 0.0, dailyReturnRate_wocbf)
         dailyAnnualReturn_wocbf_lst = np.power((1+dailyReturnRate_wocbf), self.config.tradeDays_per_year) - 1
-        dailyRisk_wocbf_lst = np.array(self.risk_raw_lst) * np.sqrt(self.config.tradeDays_per_year)  
-        dailySR_wocbf = ((dailyAnnualReturn_wocbf_lst[1:] * 100) - self.config.mkt_rf[self.config.market_name]) / (dailyRisk_wocbf_lst[1:] * 100)
+        dailyRisk_wocbf_lst = np.array(self.risk_raw_lst) * np.sqrt(self.config.tradeDays_per_year)
+        # Avoid division by zero
+        dailyRisk_wocbf_lst_safe = np.where(dailyRisk_wocbf_lst == 0, 1e-6, dailyRisk_wocbf_lst)
+        dailySR_wocbf = ((dailyAnnualReturn_wocbf_lst[1:] * 100) - self.config.mkt_rf[self.config.market_name]) / (dailyRisk_wocbf_lst_safe[1:] * 100)
+        # Handle NaN/inf
+        dailySR_wocbf = np.where(np.isnan(dailySR_wocbf) | np.isinf(dailySR_wocbf), 0.0, dailySR_wocbf)
         dailySR_wocbf = np.append(0, dailySR_wocbf)
         # dailySR_wocbf = np.where(dailySR_wocbf < 0, 0, dailySR_wocbf)
         dailySR_wocbf_max = np.max(dailySR_wocbf)
-        dailySR_wocbf_min = np.min(dailySR_wocbf[dailySR_wocbf!=0])
+        dailySR_wocbf_nonzero = dailySR_wocbf[dailySR_wocbf!=0]
+        dailySR_wocbf_min = np.min(dailySR_wocbf_nonzero) if len(dailySR_wocbf_nonzero) > 0 else 0.0
         dailySR_wocbf_avg = np.mean(dailySR_wocbf)
 
         annualReturn_wocbf_pct = np.power((1 + ((self.return_raw_lst[-1] - self.initial_asset) / self.initial_asset)), (self.config.tradeDays_per_year/len(self.return_raw_lst))) - 1
         volatility_wocbf = np.sqrt((np.sum(np.power((dailyReturnRate_wocbf - np.mean(dailyReturnRate_wocbf)), 2)) * self.config.tradeDays_per_year / (len(self.return_raw_lst) - 1)))
+        # Avoid division by zero
+        if volatility_wocbf == 0 or np.isnan(volatility_wocbf) or np.isinf(volatility_wocbf):
+            volatility_wocbf = 1e-6
         sharpeRatio_woCBF = ((annualReturn_wocbf_pct * 100) - self.config.mkt_rf[self.config.market_name])/ (volatility_wocbf * 100)
+        # Handle NaN/inf
+        if np.isnan(sharpeRatio_woCBF) or np.isinf(sharpeRatio_woCBF):
+            sharpeRatio_woCBF = 0.0
         sharpeRatio_woCBF = np.max([sharpeRatio_woCBF, 0])
 
         winRate = len(np.argwhere(diffPeriodAsset>0))/(len(diffPeriodAsset) + 1)
@@ -784,16 +865,22 @@ class StockPortfolioEnv(gym.Env):
         # stg_vol_lst  = np.sqrt((np.cumsum(np.power((self.profit_lst - cumsum_r), 2))/np.arange(1, self.totalTradeDay+1)) * self.config.tradeDays_per_year)
 
         vol_max = np.max(stg_vol_lst)
-        vol_min = np.min(np.array(stg_vol_lst)[np.array(stg_vol_lst)!=0])
+        stg_vol_array = np.array(stg_vol_lst)
+        stg_vol_nonzero = stg_vol_array[stg_vol_array!=0]
+        vol_min = np.min(stg_vol_nonzero) if len(stg_vol_nonzero) > 0 else 0.0
         vol_avg = np.mean(stg_vol_lst)
 
         # short-term risk
         risk_max = np.max(self.risk_cbf_lst)
-        risk_min = np.min(np.array(self.risk_cbf_lst)[np.array(self.risk_cbf_lst)!=0])
+        risk_cbf_array = np.array(self.risk_cbf_lst)
+        risk_cbf_nonzero = risk_cbf_array[risk_cbf_array!=0]
+        risk_min = np.min(risk_cbf_nonzero) if len(risk_cbf_nonzero) > 0 else 0.0
         risk_avg = np.mean(self.risk_cbf_lst)
 
         risk_raw_max = np.max(self.risk_raw_lst)
-        risk_raw_min = np.min(np.array(self.risk_raw_lst)[np.array(self.risk_raw_lst)!=0])
+        risk_raw_array = np.array(self.risk_raw_lst)
+        risk_raw_nonzero = risk_raw_array[risk_raw_array!=0]
+        risk_raw_min = np.min(risk_raw_nonzero) if len(risk_raw_nonzero) > 0 else 0.0
         risk_raw_avg = np.mean(self.risk_raw_lst)
 
         # Downside risk at volatility        
@@ -812,32 +899,59 @@ class StockPortfolioEnv(gym.Env):
 
         # CVaR curve
         cvar_max = np.max(self.cvar_lst)
-        cvar_min = np.min(np.array(self.cvar_lst)[np.array(self.cvar_lst)!=0])
+        cvar_array = np.array(self.cvar_lst)
+        cvar_nonzero = cvar_array[cvar_array!=0]
+        cvar_min = np.min(cvar_nonzero) if len(cvar_nonzero) > 0 else 0.0
         cvar_avg = np.mean(self.cvar_lst)
 
         cvar_raw_max = np.max(self.cvar_raw_lst)
-        cvar_raw_min = np.min(np.array(self.cvar_raw_lst)[np.array(self.cvar_raw_lst)!=0])
+        cvar_raw_array = np.array(self.cvar_raw_lst)
+        cvar_raw_nonzero = cvar_raw_array[cvar_raw_array!=0]
+        cvar_raw_min = np.min(cvar_raw_nonzero) if len(cvar_raw_nonzero) > 0 else 0.0
         cvar_raw_avg = np.mean(self.cvar_raw_lst)
 
         # Calmar ratio
         time_T = len(self.profit_lst)
-        avg_return = netProfit_pct / time_T
-        variance_r = np.sum(np.power((self.profit_lst - avg_dailyReturn_pct), 2)) / (len(self.profit_lst) - 1)
-        volatility_daily = np.sqrt(variance_r)
+        avg_return = netProfit_pct / time_T if time_T > 0 else 0.0
+        variance_r = np.sum(np.power((self.profit_lst - avg_dailyReturn_pct), 2)) / (len(self.profit_lst) - 1) if len(self.profit_lst) > 1 else 0.0
+        volatility_daily = np.sqrt(variance_r) if variance_r >= 0 else 0.0
+        # Avoid division by zero
+        if volatility_daily == 0:
+            volatility_daily = 1e-6
  
         if netProfit_pct > 0:
-            shrp = avg_return / volatility_daily
-            calmarRatio = (time_T * np.power(shrp, 2)) / (0.63519 + 0.5 * np.log(time_T) + np.log(shrp))
+            shrp = avg_return / volatility_daily if volatility_daily > 0 else 0.0
+            if shrp > 0 and not (np.isnan(shrp) or np.isinf(shrp)):
+                log_shrp = np.log(shrp)
+                if not (np.isnan(log_shrp) or np.isinf(log_shrp)):
+                    calmarRatio = (time_T * np.power(shrp, 2)) / (0.63519 + 0.5 * np.log(time_T) + log_shrp)
+                else:
+                    calmarRatio = 0.0
+            else:
+                calmarRatio = 0.0
         elif netProfit_pct == 0:
-            calmarRatio = (netProfit_pct) / (1.2533 * volatility_daily * np.sqrt(time_T))
+            calmarRatio = (netProfit_pct) / (1.2533 * volatility_daily * np.sqrt(time_T)) if volatility_daily > 0 and time_T > 0 else 0.0
         else:
             # netProfit_pct < 0
-            calmarRatio = (netProfit_pct) / (-(avg_return * time_T) - (variance_r / avg_return))
+            if avg_return != 0 and not (np.isnan(avg_return) or np.isinf(avg_return)):
+                calmarRatio = (netProfit_pct) / (-(avg_return * time_T) - (variance_r / avg_return))
+            else:
+                calmarRatio = 0.0
+        
+        # Final validation
+        if np.isnan(calmarRatio) or np.isinf(calmarRatio):
+            calmarRatio = 0.0
 
         # Sterling ratio
         move_mdd_mask = np.where(np.array(self.profit_lst)<0, 1, 0)
-        moving_mdd = np.sqrt(np.sum(np.power(self.profit_lst * move_mdd_mask, 2))  * self.config.tradeDays_per_year / (len(self.profit_lst) - 1))
+        moving_mdd = np.sqrt(np.sum(np.power(self.profit_lst * move_mdd_mask, 2))  * self.config.tradeDays_per_year / (len(self.profit_lst) - 1)) if len(self.profit_lst) > 1 else 0.0
+        # Avoid division by zero
+        if moving_mdd == 0 or np.isnan(moving_mdd) or np.isinf(moving_mdd):
+            moving_mdd = 1e-6
         sterlingRatio =  ((annualReturn_pct * 100) - self.config.mkt_rf[self.config.market_name]) / (moving_mdd * 100)
+        # Handle NaN/inf
+        if np.isnan(sterlingRatio) or np.isinf(sterlingRatio):
+            sterlingRatio = 0.0
 
         if self.mode == 'train':
             cputime_use = self.end_cputime - self.start_cputime - self.exclusive_cputime
@@ -878,7 +992,7 @@ class StockPortfolioEnv(gym.Env):
             'dailyReturn_pct_max': dailyReturn_pct_max, 'dailyReturn_pct_min': dailyReturn_pct_min, 'dailyReturn_pct_avg': avg_dailyReturn_pct,
             'sigReturn_max': sigReturn_max, 'sigReturn_min': sigReturn_min, 
             'mdd_high': self.mdd_high, 'mdd_low': self.mdd_low, 'mdd_high_date': self.mdd_highTimepoint, 'mdd_low_date': self.mdd_lowTimepoint, 
-            'final_capital': self.cur_capital, 'reward_sum': np.sum(self.reward_lst),
+            'final_capital': self.cur_capital, 'reward_sum': np.nansum(self.reward_lst) if len(self.reward_lst) > 0 else 0.0,
             'final_capital_wocbf': self.return_raw_lst[-1], 
             'cbf_contribution': cbf_abssum_contribution,
             'risk_downsideAtVol': risk_downsideAtVol, 'risk_downsideAtVol_daily_max': risk_downsideAtVol_daily_max, 'risk_downsideAtVol_daily_min': risk_downsideAtVol_daily_min, 'risk_downsideAtVol_daily_avg': risk_downsideAtVol_daily_avg,
@@ -901,13 +1015,30 @@ class StockPortfolioEnv(gym.Env):
 
     def save_profile(self, invest_profile):
         # basic data
+        missing_fields = []
         for fname in self.profile_hist_field_lst:
             if fname in list(invest_profile.keys()):
                 self.profile_hist_ep[fname].append(invest_profile[fname])
             else:
-                raise ValueError('Cannot find the field [{}] in invest profile..'.format(fname))
-        phist_df = pd.DataFrame(self.profile_hist_ep, columns=self.profile_hist_field_lst)
-        phist_df.to_csv(os.path.join(self.config.res_dir, '{}_profile.csv'.format(self.mode)), index=False)
+                missing_fields.append(fname)
+                # Use None as placeholder for missing fields instead of raising error
+                self.profile_hist_ep[fname].append(None)
+                print(f"Warning: Field '{fname}' not found in invest_profile, using None as placeholder", flush=True)
+        
+        if missing_fields:
+            print(f"Warning: Missing {len(missing_fields)} fields in invest_profile: {missing_fields}", flush=True)
+            print(f"Available fields in invest_profile: {list(invest_profile.keys())}", flush=True)
+        
+        try:
+            phist_df = pd.DataFrame(self.profile_hist_ep, columns=self.profile_hist_field_lst)
+            profile_path = os.path.join(self.config.res_dir, '{}_profile.csv'.format(self.mode))
+            phist_df.to_csv(profile_path, index=False)
+            print(f"Profile saved to: {profile_path} (epoch {self.epoch}, {len(phist_df)} rows)", flush=True)
+        except Exception as e:
+            print(f"Error saving profile: {e}", flush=True)
+            print(f"profile_hist_ep keys: {list(self.profile_hist_ep.keys())}", flush=True)
+            print(f"profile_hist_field_lst: {self.profile_hist_field_lst}", flush=True)
+            raise
 
         cputime_avg = np.mean(phist_df['cputime'])
         systime_avg = np.mean(phist_df['systime'])
@@ -915,41 +1046,170 @@ class StockPortfolioEnv(gym.Env):
         bestmodel_dict = {}
         if self.config.trained_best_model_type == 'max_capital':
             field_name = 'final_capital'
-            v = np.max(phist_df[field_name]) # Please noted that the maximum value will be recorded.
+            # Filter out NaN values before finding max
+            valid_values = phist_df[field_name].dropna()
+            if len(valid_values) > 0:
+                v = np.max(valid_values)
+            else:
+                v = np.nan
         elif 'loss' in self.config.trained_best_model_type:
             field_name = 'reward_sum'
-            v = np.max(phist_df[field_name]) # Please noted that the maximum value will be recorded.
+            # Filter out NaN values before finding max
+            valid_values = phist_df[field_name].dropna()
+            if len(valid_values) > 0:
+                v = np.max(valid_values)
+            else:
+                v = np.nan
         elif self.config.trained_best_model_type == 'sharpeRatio':
             field_name = 'sharpeRatio'
-            v = np.max(phist_df[field_name]) # Please noted that the maximum value will be recorded.
+            # Filter out NaN values before finding max
+            valid_values = phist_df[field_name].dropna()
+            if len(valid_values) > 0:
+                v = np.max(valid_values)
+            else:
+                v = np.nan
         elif self.config.trained_best_model_type == 'volatility':
             field_name = 'volatility'
-            v = np.min(phist_df[field_name]) # Please noted that the minimum value will be recorded.
+            # Filter out NaN values before finding min
+            valid_values = phist_df[field_name].dropna()
+            if len(valid_values) > 0:
+                v = np.min(valid_values)
+            else:
+                v = np.nan
         elif self.config.trained_best_model_type == 'mdd':
             field_name = 'mdd'
-            v = np.min(phist_df[field_name]) # Please noted that the minimum value will be recorded.
+            # Filter out NaN values before finding min
+            valid_values = phist_df[field_name].dropna()
+            if len(valid_values) > 0:
+                v = np.min(valid_values)
+            else:
+                v = np.nan
         else:
             raise ValueError('Unknown implementation with the best model type [{}]..'.format(self.config.trained_best_model_type))
-        v_ep = list(phist_df[phist_df[field_name]==v]['ep'])[0]
+        
+        # Handle NaN case: use current epoch value as fallback
+        if np.isnan(v) or v is None:
+            # Use current epoch's value as fallback
+            current_value = invest_profile.get(field_name, None)
+            if current_value is not None and not (isinstance(current_value, float) and np.isnan(current_value)):
+                v = current_value
+                v_ep = self.epoch
+                print(f"Warning: All values in {field_name} are NaN, using current epoch {v_ep} value {v} as fallback", flush=True)
+            else:
+                # Last resort: use current epoch number, value remains NaN (will be handled later)
+                v_ep = self.epoch
+                print(f"Warning: All values in {field_name} are NaN and current epoch value is also NaN, using epoch {v_ep} as fallback", flush=True)
+        else:
+            # Find epoch with the best value, handle floating point comparison and empty results
+            filtered_df = phist_df[phist_df[field_name] == v]
+            if len(filtered_df) == 0:
+                # Fallback: use approximate comparison for floating point values
+                if field_name in ['final_capital', 'reward_sum', 'sharpeRatio', 'volatility', 'mdd']:
+                    # Use np.isclose for floating point comparison
+                    tolerance = 1e-6
+                    filtered_df = phist_df[np.abs(phist_df[field_name] - v) < tolerance]
+            
+            if len(filtered_df) == 0:
+                # If still empty, use current epoch as fallback
+                v_ep = self.epoch
+                print(f"Warning: Could not find epoch with {field_name}={v}, using current epoch {v_ep} as fallback", flush=True)
+            else:
+                v_ep = filtered_df['ep'].iloc[0]
+        
+        # Ensure v is not NaN before saving (use current epoch value if still NaN)
+        if np.isnan(v) or v is None:
+            # Try to get value from current epoch
+            current_value = invest_profile.get(field_name, None)
+            if current_value is not None and not (isinstance(current_value, float) and np.isnan(current_value)):
+                v = current_value
+            else:
+                # Use 0 as absolute fallback
+                v = 0.0
+                print(f"Warning: Using 0.0 as absolute fallback for {field_name}", flush=True)
+        
         bestmodel_dict['{}_ep'.format(self.config.trained_best_model_type)] = v_ep
         bestmodel_dict[self.config.trained_best_model_type] = v
         
+        # Ensure all values in bestmodel_dict are valid (not NaN) before saving
+        for key, value in bestmodel_dict.items():
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                # Replace NaN with appropriate default
+                if 'ep' in key:
+                    bestmodel_dict[key] = self.epoch  # Use current epoch
+                else:
+                    # For value fields, try to get from current epoch
+                    field_name = key
+                    current_value = invest_profile.get(field_name, 0.0)
+                    if current_value is not None and not (isinstance(current_value, float) and np.isnan(current_value)):
+                        bestmodel_dict[key] = current_value
+                    else:
+                        bestmodel_dict[key] = 0.0  # Absolute fallback
+                print(f"Warning: Replaced NaN in bestmodel_dict['{key}'] with {bestmodel_dict[key]}", flush=True)
+        
         if True:
             print("-"*30)
-            # log_str = "Mode: {}, Ep: {}, Current epoch capital: {}, historical best captial ({} ep): {}, cputime cur: {} s, avg: {} s, system time cur: {} s/ep, avg: {} s/ep..".format(self.mode, self.epoch, self.cur_capital, v_ep, v, np.round(np.array(phist_df['cputime'])[-1], 2), np.round(cputime_avg, 2), np.round(np.array(phist_df['systime'])[-1], 2), np.round(systime_avg, 2))
-            log_str = "Mode: {}, Ep: {}, Current epoch capital: {}, historical best captial ({} ep): {} | solvable: {}, insolvable: {} | step count: {} | cputime cur: {} s, avg: {} s, system time cur: {} s/ep, avg: {} s/ep..".format(self.mode, self.epoch, self.cur_capital, v_ep, v, np.array(phist_df['solver_solvable'])[-1], np.array(phist_df['solver_insolvable'])[-1], self.stepcount, np.round(np.array(phist_df['cputime'])[-1], 2), np.round(cputime_avg, 2), np.round(np.array(phist_df['systime'])[-1], 2), np.round(systime_avg, 2))
+            # Use final_capital from invest_profile instead of self.cur_capital to avoid nan
+            current_capital = invest_profile.get('final_capital', self.cur_capital)
+            # Handle nan values
+            if current_capital is None or (isinstance(current_capital, float) and np.isnan(current_capital)):
+                current_capital = self.initial_asset  # Fallback to initial asset
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                v = current_capital  # Fallback to current capital
+            
+            log_str = "Mode: {}, Ep: {}, Current epoch capital: {:.2f}, historical best captial ({} ep): {:.2f} | solvable: {}, insolvable: {} | step count: {} | cputime cur: {} s, avg: {} s, system time cur: {} s/ep, avg: {} s/ep..".format(
+                self.mode, self.epoch, current_capital, v_ep, v, 
+                np.array(phist_df['solver_solvable'])[-1], 
+                np.array(phist_df['solver_insolvable'])[-1], 
+                self.stepcount, 
+                np.round(np.array(phist_df['cputime'])[-1], 2), 
+                np.round(cputime_avg, 2), 
+                np.round(np.array(phist_df['systime'])[-1], 2), 
+                np.round(systime_avg, 2)
+            )
             print(log_str)
-            # Print sample weights for current epoch
-            if hasattr(self, 'actions_memory') and len(self.actions_memory) > 0:
+            # Print top 10 stocks with weights for current epoch
+            if hasattr(self, 'actions_memory') and len(self.actions_memory) > 0 and hasattr(self, 'stock_lst'):
                 sample_idx = min(4, len(self.actions_memory) - 1)
                 if isinstance(self.actions_memory, list):
                     sample_weights = self.actions_memory[sample_idx]
                 else:
                     sample_weights = self.actions_memory[sample_idx]
-                if isinstance(sample_weights, np.ndarray):
-                    print("  Sample weights (day {}): {}".format(sample_idx, np.round(sample_weights, 4)))
+                if isinstance(sample_weights, np.ndarray) and len(sample_weights) == len(self.stock_lst):
+                    # Use weight_symbol_mapper if available
+                    if get_top_stocks is not None:
+                        try:
+                            top_10_stocks = get_top_stocks(sample_weights, self.stock_lst, top_k=10)
+                            print("  Top 10 stocks (day {}):".format(sample_idx))
+                            for i, (symbol, weight) in enumerate(top_10_stocks, 1):
+                                print("    {}. {}: {:.4f} ({:.2f}%)".format(i, symbol, weight, weight * 100))
+                        except Exception as e:
+                            # Fallback to simple printing if mapping fails
+                            print("  Top 10 stocks (day {}): (mapping error: {})".format(sample_idx, str(e)))
+                    else:
+                        # Fallback: print top 10 by weight manually
+                        weight_stock_pairs = list(zip(sample_weights, self.stock_lst))
+                        weight_stock_pairs.sort(key=lambda x: x[0], reverse=True)
+                        print("  Top 10 stocks (day {}):".format(sample_idx))
+                        for i, (weight, symbol) in enumerate(weight_stock_pairs[:10], 1):
+                            print("    {}. {}: {:.4f} ({:.2f}%)".format(i, symbol, weight, weight * 100))
+        # Create DataFrame and ensure no NaN values (we already handled NaN above, but double-check)
         bestmodel_df = pd.DataFrame([bestmodel_dict])
-        bestmodel_df.to_csv(os.path.join(self.config.res_dir, '{}_bestmodel.csv'.format(self.mode)), index=False)
+        # Final safety check: replace any remaining NaN
+        for col in bestmodel_df.columns:
+            if bestmodel_df[col].isna().any():
+                if 'ep' in col:
+                    bestmodel_df[col] = bestmodel_df[col].fillna(self.epoch)
+                else:
+                    # Try to get from current invest_profile
+                    field_name = col
+                    current_value = invest_profile.get(field_name, 0.0)
+                    if current_value is not None and not (isinstance(current_value, float) and np.isnan(current_value)):
+                        bestmodel_df[col] = bestmodel_df[col].fillna(current_value)
+                    else:
+                        bestmodel_df[col] = bestmodel_df[col].fillna(0.0)
+        
+        bestmodel_path = os.path.join(self.config.res_dir, '{}_bestmodel.csv'.format(self.mode))
+        bestmodel_df.to_csv(bestmodel_path, index=False)
 
         # save data of each step in 1st/best/last model
         fpath = os.path.join(self.config.res_dir, '{}_stepdata.csv'.format(self.mode))
@@ -1060,147 +1320,106 @@ class StockPortfolioEnv(gym.Env):
             if stage in ['reset', 'init'] and (self.mode == 'train'):
                 self.mkt_observer.reset()
 
-            # Check if MAFIA observer
-            from RL_controller.mafia_observer import MAFIAObserver
-            is_mafia = isinstance(self.mkt_observer, MAFIAObserver)
+            # MAFIA needs raw OCHLV data with T_w=30 window
+            raw_ochlv_data = self._extract_raw_ochlv_window(cur_date, window_size=self.config.mafia_T_w)
+            # raw_ochlv_data shape: (N, M, T_w) where M=5 (OCHLV), T_w=30
             
-            if is_mafia:
-                # MAFIA needs raw OCHLV data with T_w=30 window
-                raw_ochlv_data = self._extract_raw_ochlv_window(cur_date, window_size=self.config.mafia_T_w)
-                # raw_ochlv_data shape: (N, M, T_w) where M=5 (OCHLV), T_w=30
-                
-                # Get market price for reward calculation
-                finemkt_feat = self.extra_data['fine_market']
-                ma_close = finemkt_feat[finemkt_feat['date']==cur_date][['mkt_{}_close'.format(self.config.finefreq), 'mkt_{}_ma'.format(self.config.finefreq)]].values[-1]
-                mkt_cur_close_price = ma_close[0]
-                mkt_ma_price = ma_close[1]
-                
-                if (rate_of_price_change is not None) and (self.mode == 'train'):
-                    if mkt_cur_close_price > self.mkt_last_close_price:
-                        mkt_direction = 0
-                    elif mkt_cur_close_price < self.mkt_last_close_price:
-                        mkt_direction = 2
-                    else:
-                        mkt_direction = 1
-                    mkt_direction = np.array([mkt_direction])
-                    self.mkt_observer.update_hidden_vec_reward(mode=self.mode, rate_of_price_change=rate_of_price_change, mkt_direction=mkt_direction)
-                
-                # Get stock MA price for controller
-                finestock_feat = self.extra_data['fine_stock']
-                finestock_date_data = finestock_feat[finestock_feat['date']==cur_date]
-                
-                # Ensure stock_ma_price has same stocks and order as curData
-                stock_ma_price_dict = {}
-                if len(finestock_date_data) > 0:
-                    for _, row in finestock_date_data.iterrows():
-                        stock_ma_price_dict[row['stock']] = row['stock_{}_ma'.format(self.config.finefreq)]
-                
-                # Create stock_ma_price array aligned with curData stock order
-                stock_ma_price = np.array([
-                    stock_ma_price_dict.get(stock, self.curData[self.curData['stock']==stock]['close'].values[0] if len(self.curData[self.curData['stock']==stock]) > 0 else 1.0)
-                    for stock in self.curData['stock'].values
-                ])
-                
-                input_kwargs = {'mode': self.mode}
-                cur_hidden_vector_ay, lambda_val, sigma_val = self.mkt_observer.predict(
-                    raw_ochlv_data=raw_ochlv_data, 
-                    **input_kwargs
-                )
-                
-                # Handle continuous boundary_risk from MAFIA
-                if self.config.is_enable_dynamic_risk_bound:
-                    # boundary_risk is continuous (ℝ^+)
-                    boundary_risk_raw = float(sigma_val[-1])  # Get scalar value
-                    # Clip to reasonable range
-                    cur_risk_boundary = np.clip(
-                        boundary_risk_raw,
-                        self.config.risk_up_bound,
-                        self.config.risk_down_bound
-                    )
+            # Get market price for reward calculation
+            finemkt_feat = self.extra_data['fine_market']
+            ma_close = finemkt_feat[finemkt_feat['date']==cur_date][['mkt_{}_close'.format(self.config.finefreq), 'mkt_{}_ma'.format(self.config.finefreq)]].values[-1]
+            mkt_cur_close_price = ma_close[0]
+            mkt_ma_price = ma_close[1]
+            
+            if (rate_of_price_change is not None) and (self.mode == 'train'):
+                if mkt_cur_close_price > self.mkt_last_close_price:
+                    mkt_direction = 0
+                elif mkt_cur_close_price < self.mkt_last_close_price:
+                    mkt_direction = 2
                 else:
-                    cur_risk_boundary = self.config.risk_default
-                
-                self.state = np.append(self.state, cur_hidden_vector_ay[-1], axis=0)
-                self.mkt_last_close_price = mkt_cur_close_price
+                    mkt_direction = 1
+                mkt_direction = np.array([mkt_direction])
+                self.mkt_observer.update_hidden_vec_reward(mode=self.mode, rate_of_price_change=rate_of_price_change, mkt_direction=mkt_direction)
+            
+            # Get stock MA price for controller
+            finestock_feat = self.extra_data['fine_stock']
+            finestock_date_data = finestock_feat[finestock_feat['date']==cur_date]
+            
+            # Ensure stock_ma_price has same stocks and order as curData
+            stock_ma_price_dict = {}
+            if len(finestock_date_data) > 0:
+                for _, row in finestock_date_data.iterrows():
+                    stock_ma_price_dict[row['stock']] = row['stock_{}_ma'.format(self.config.finefreq)]
+            
+            # Create stock_ma_price array aligned with curData stock order
+            stock_ma_price = np.array([
+                stock_ma_price_dict.get(stock, self.curData[self.curData['stock']==stock]['close'].values[0] if len(self.curData[self.curData['stock']==stock]) > 0 else 1.0)
+                for stock in self.curData['stock'].values
+            ])
+            
+            input_kwargs = {'mode': self.mode, 'env': self}  # Pass environment for market-index data extraction
+            market_vector_np, lambda_val, boundary_risk_np, market_scores_full_np, gate_weights_np = self.mkt_observer.predict(
+                raw_ochlv_data=raw_ochlv_data, 
+                **input_kwargs
+            )
+            
+            # Store gate_weights for potential analysis/visualization
+            if gate_weights_np.ndim > 1:
+                self.gate_weights = gate_weights_np[-1]  # (4,)
             else:
-                # Existing logic for other observers
-                finemkt_feat = self.extra_data['fine_market']
-                ma_close = finemkt_feat[finemkt_feat['date']==cur_date][['mkt_{}_close'.format(self.config.finefreq), 'mkt_{}_ma'.format(self.config.finefreq)]].values[-1]
-                mkt_cur_close_price = ma_close[0]
-                mkt_ma_price = ma_close[1]
-                finemkt_feat = finemkt_feat[finemkt_feat['date']==cur_date][self.config.finemkt_feat_cols_lst].values
-                finemkt_feat = np.reshape(finemkt_feat, (len(self.config.use_features), self.config.fine_window_size)) # -> (features, window_size)
-                finemkt_feat = np.expand_dims(finemkt_feat, axis=0) # -> (batch=1, features, window_size)
-                if (rate_of_price_change is not None) and (self.mode == 'train'):
-                    if mkt_cur_close_price > self.mkt_last_close_price:
-                        mkt_direction = 0
-                    elif mkt_cur_close_price < self.mkt_last_close_price:
-                        mkt_direction = 2
-                    else:
-                        mkt_direction = 1
-                    mkt_direction = np.array([mkt_direction])
-                    self.mkt_observer.update_hidden_vec_reward(mode=self.mode, rate_of_price_change=rate_of_price_change, mkt_direction=mkt_direction)
-
-                finestock_feat = self.extra_data['fine_stock']
-                finestock_date_data = finestock_feat[finestock_feat['date']==cur_date]
-                
-                # Ensure stock prices have same stocks and order as curData
-                stock_cur_close_price_dict = {}
-                stock_ma_price_dict = {}
-                dc_events_dict = {}
-                if len(finestock_date_data) > 0:
-                    for _, row in finestock_date_data.iterrows():
-                        stock_cur_close_price_dict[row['stock']] = row['stock_{}_close'.format(self.config.finefreq)]
-                        stock_ma_price_dict[row['stock']] = row['stock_{}_ma'.format(self.config.finefreq)]
-                        if self.config.is_gen_dc_feat:
-                            dc_events_dict[row['stock']] = row['stock_{}_dc'.format(self.config.finefreq)]
-                
-                # Create arrays aligned with curData stock order
-                stock_cur_close_price = np.array([
-                    stock_cur_close_price_dict.get(stock, self.curData[self.curData['stock']==stock]['close'].values[0] if len(self.curData[self.curData['stock']==stock]) > 0 else 1.0)
-                    for stock in self.curData['stock'].values
-                ])
-                stock_ma_price = np.array([
-                    stock_ma_price_dict.get(stock, self.curData[self.curData['stock']==stock]['close'].values[0] if len(self.curData[self.curData['stock']==stock]) > 0 else 1.0)
-                    for stock in self.curData['stock'].values
-                ])
-                if self.config.is_gen_dc_feat:
-                    dc_events = np.array([
-                        dc_events_dict.get(stock, 0.0)
-                        for stock in self.curData['stock'].values
-                    ])
+                self.gate_weights = gate_weights_np  # (4,)
+            
+            # Store market_scores_full in environment for RL/Solver to access
+            # market_scores_full_np shape: (batch, N), extract last batch item
+            if market_scores_full_np.ndim > 1:
+                self.market_scores_full = market_scores_full_np[-1]  # (N,)
+            else:
+                self.market_scores_full = market_scores_full_np  # (N,)
+            
+            # Store topk_indices from Observer (for mode 'compact' - RL uses Observer's Top-K)
+            if hasattr(self.mkt_observer, 'last_topk_indices') and self.mkt_observer.last_topk_indices is not None:
+                # Extract last batch item if needed
+                topk_indices = self.mkt_observer.last_topk_indices
+                if topk_indices.ndim > 1:
+                    self.observer_topk_indices = topk_indices[-1]  # (K,)
                 else:
-                    dc_events = None
-                
-                # Get finestock_feat for observer (use finestock_date_data which was already filtered)
-                finestock_feat_values = finestock_date_data[self.config.finestock_feat_cols_lst].values
-                # Reshape: need to handle variable number of stocks (not just topK)
-                num_stocks_in_feat = len(finestock_date_data)
-                if num_stocks_in_feat > 0:
-                    finestock_feat = np.reshape(finestock_feat_values, (num_stocks_in_feat, len(self.config.use_features), self.config.fine_window_size)) # -> (num_of_stocks, features, window_size)
-                finestock_feat = np.transpose(finestock_feat, (1, 0, 2)) # -> (features, num_of_stocks, window_size)
-                finestock_feat = np.expand_dims(finestock_feat, axis=0) # -> (batch=1, features, num_of_stocks, window_size)
-                input_kwargs = {'mode': self.mode, 'stock_ma_price': np.array([stock_ma_price]), 'stock_cur_close_price': np.array([stock_cur_close_price]), 'dc_events': np.array([dc_events])}
-
-                cur_hidden_vector_ay, lambda_val, sigma_val = self.mkt_observer.predict(finemkt_feat=finemkt_feat, finestock_feat=finestock_feat, **input_kwargs) # lambda_val: not applicable
-                if self.config.is_enable_dynamic_risk_bound:
-                    if int(sigma_val[-1]) == 0:
-                        # up
-                        cur_risk_boundary = self.config.risk_up_bound
-                    elif int(sigma_val[-1]) == 1:
-                        # hold
-                        cur_risk_boundary = self.config.risk_hold_bound
-                    elif int(sigma_val[-1]) == 2:
-                        # down
-                        cur_risk_boundary = self.config.risk_down_bound
-                    else:
-                        raise ValueError('Unknown sigma value [{}]..'.format(sigma_val[-1]))
-
+                    self.observer_topk_indices = topk_indices  # (K,)
+                # Ensure indices are within valid range
+                if len(self.observer_topk_indices) > 0:
+                    self.observer_topk_indices = np.clip(self.observer_topk_indices, 0, self.stock_num - 1).astype(int)
+            else:
+                self.observer_topk_indices = None
+            
+            # Ensure market_scores_full has correct length (match stock_num)
+            if len(self.market_scores_full) != self.stock_num:
+                if len(self.market_scores_full) < self.stock_num:
+                    # Pad with uniform distribution
+                    padding = np.ones(self.stock_num - len(self.market_scores_full)) / self.stock_num
+                    self.market_scores_full = np.concatenate([self.market_scores_full, padding])
+                    # Renormalize
+                    self.market_scores_full = self.market_scores_full / (np.sum(self.market_scores_full) + 1e-8)
                 else:
-                    cur_risk_boundary = self.config.risk_default
-                
-                self.state = np.append(self.state, cur_hidden_vector_ay[-1], axis=0)
-                self.mkt_last_close_price = mkt_cur_close_price
+                    # Truncate
+                    self.market_scores_full = self.market_scores_full[:self.stock_num]
+                    # Renormalize
+                    self.market_scores_full = self.market_scores_full / (np.sum(self.market_scores_full) + 1e-8)
+            
+            # Handle continuous boundary_risk from MAFIA
+            if self.config.is_enable_dynamic_risk_bound:
+                # boundary_risk is continuous (ℝ^+)
+                boundary_risk_raw = float(boundary_risk_np[-1])  # Get scalar value
+                # Clip to reasonable range
+                cur_risk_boundary = np.clip(
+                    boundary_risk_raw,
+                    self.config.risk_up_bound,
+                    self.config.risk_down_bound
+                )
+            else:
+                cur_risk_boundary = self.config.risk_default
+
+            # Build compact state for MAFIA optimized: [market_vector(K), portfolio_value, (optional) risk_boundary]
+            # Removed market_index_state - rely on Observer's learned representation
+            self._build_mafia_state(market_vector_np, finemkt_feat, cur_date, cur_risk_boundary)
+            self.mkt_last_close_price = mkt_cur_close_price
         else:
             cur_risk_boundary = self.config.risk_default
             if self.config.mode == 'RLcontroller':
@@ -1297,6 +1516,146 @@ class StockPortfolioEnv(gym.Env):
             ochlv_array[i, 4, :] = merged_df['volume'].values[:window_size] # Volume
         
         return ochlv_array
+    
+    def _extract_market_index_ochlv_window(self, cur_date, window_size=30):
+        """
+        Extract raw OCHLV data for Market-index Agent (VNINDEX).
+        
+        Args:
+            cur_date: Current date
+            window_size: Window size (T_w, default 30)
+        
+        Returns:
+            ochlv_array: (1, 5, T_w) where 5 = [open, close, high, low, volume], T_w=window_size
+            Single asset (VNINDEX) OCHLV window
+        """
+        import os
+        from utils.data_validator import get_index_data_file
+        
+        # Get index data file path
+        fpath, error_msg = get_index_data_file(self.config, freq='1d')
+        if fpath is None:
+            raise ValueError(f"Cannot extract market index OCHLV: {error_msg}")
+        
+        # Load index data if not already cached
+        if not hasattr(self, '_index_data_cache') or self._index_data_cache is None:
+            index_data = pd.read_csv(fpath, header=0)
+            index_data['date'] = pd.to_datetime(index_data['date'])
+            # Normalize timezone: remove timezone info to match config dates (naive datetime)
+            if index_data['date'].dt.tz is not None:
+                index_data['date'] = index_data['date'].dt.tz_localize(None)
+            index_data = index_data.sort_values('date', ascending=True, ignore_index=True)
+            self._index_data_cache = index_data
+        
+        index_data = self._index_data_cache
+        
+        # Find current date in index data
+        date_mask = index_data['date'] == cur_date
+        if not date_mask.any():
+            # Try to find closest date
+            date_diffs = (index_data['date'] - cur_date).abs()
+            closest_idx = date_diffs.idxmin()
+            if date_diffs[closest_idx] > pd.Timedelta(days=7):
+                raise ValueError(f"Date {cur_date} not found in index data and no close date within 7 days")
+            date_idx = closest_idx
+        else:
+            date_idx = date_mask.idxmax()  # Get first occurrence
+        
+        # Get window: [date_idx - window_size + 1, date_idx]
+        start_idx = max(0, date_idx - window_size + 1)
+        end_idx = date_idx + 1
+        
+        # Extract window data
+        window_data = index_data.iloc[start_idx:end_idx].copy()
+        
+        # Required columns: open, close, high, low, volume
+        required_cols = ['open', 'close', 'high', 'low', 'volume']
+        missing_cols = [col for col in required_cols if col not in window_data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in index data: {missing_cols}")
+        
+        # Initialize output array: (1, 5, window_size)
+        ochlv_array = np.zeros((1, 5, window_size), dtype=np.float32)
+        
+        # Extract OCHLV data
+        window_values = window_data[required_cols].values  # (actual_window_size, 5)
+        
+        # Ensure we have exactly window_size data points
+        if len(window_values) > window_size:
+            # Take the last window_size rows (most recent data)
+            window_values = window_values[-window_size:]
+        elif len(window_values) < window_size:
+            # Pad with last row if needed
+            if len(window_values) > 0:
+                last_row = window_values[-1:]
+                padding = np.tile(last_row, (window_size - len(window_values), 1))
+                window_values = np.vstack([window_values, padding])
+            else:
+                # If no data, fill with zeros
+                window_values = np.zeros((window_size, 5), dtype=np.float32)
+        
+        # Transpose and assign: (5, window_size) -> (1, 5, window_size)
+        ochlv_array[0, :, :] = window_values.T
+        
+        return ochlv_array
+    
+    def _build_mafia_state(self, market_vector_np, finemkt_feat, cur_date, cur_risk_boundary):
+        """
+        Build state for MAFIA optimized architecture.
+        
+        SIMPLIFIED: Removed market_index_state, relying only on Observer's learned representation.
+        
+        Supports two modes:
+        - 'compact': [market_vector(K), portfolio_value, (optional) risk_boundary]
+        - 'full-score': [market_scores_full(N), portfolio_value, (optional) risk_boundary]
+        
+        Args:
+            market_vector_np: (batch, N) or (N,) - Market vector from MAFIA (may have zeros for non-top-K)
+            finemkt_feat: DataFrame - Fine market features (not used in simplified version)
+            cur_date: Current date (not used in simplified version)
+            cur_risk_boundary: Current risk boundary value
+        """
+        state_mode = getattr(self.config, 'mafia_state_mode', 'compact')
+        
+        if state_mode == 'full-score':
+            # Full-score mode: Use market_scores_full (all N stocks)
+            if self.market_scores_full is None:
+                # Fallback to compact mode if market_scores_full not available
+                state_mode = 'compact'
+            else:
+                market_scores = self.market_scores_full.copy()  # (N,)
+                # Ensure correct length
+                if len(market_scores) != self.stock_num:
+                    if len(market_scores) < self.stock_num:
+                        padding = np.ones(self.stock_num - len(market_scores)) / self.stock_num
+                        market_scores = np.concatenate([market_scores, padding])
+                        market_scores = market_scores / (np.sum(market_scores) + 1e-8)
+                    else:
+                        market_scores = market_scores[:self.stock_num]
+                        market_scores = market_scores / (np.sum(market_scores) + 1e-8)
+                market_vector_state = market_scores.astype(np.float32)
+        
+        if state_mode == 'compact':
+            # Compact mode: Use Top-K from market_vector (default)
+            mv = market_vector_np[-1] if market_vector_np.ndim > 1 else market_vector_np
+            k = min(self.config.mafia_top_k, len(mv))
+            # Get top-K indices (non-zero positions)
+            topk_idx = np.argpartition(mv, -k)[-k:]
+            topk_sorted = topk_idx[np.argsort(mv[topk_idx])[::-1]]
+            market_vector_state = mv[topk_sorted].astype(np.float32)
+        
+        # Portfolio value (log-normalized)
+        pv = np.log((self.cur_capital / self.initial_asset)) if self.cur_capital > 0 else 0.0
+        
+        # Compose simplified state (no market_index_state)
+        state_parts = [
+            market_vector_state,
+            np.array([pv], dtype=np.float32)
+        ]
+        if getattr(self.config, 'mafia_include_risk_boundary_in_state', False):
+            state_parts.append(np.array([cur_risk_boundary], dtype=np.float32))
+        
+        self.state = np.concatenate(state_parts, axis=0).astype(np.float32)
 
 class StockPortfolioEnv_cash(StockPortfolioEnv):
     # Considering cash item
@@ -1319,8 +1678,11 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             self.end_cputime = time.process_time()
             self.end_systime = time.perf_counter()
             self.model_save_flag = True
+            print(f"[Profile Save] Epoch {self.epoch} complete (mode={self.mode}, cash), calling get_results() and save_profile()...", flush=True)
             invest_profile = self.get_results()
+            print(f"[Profile Save] get_results() completed, calling save_profile()...", flush=True)
             self.save_profile(invest_profile=invest_profile)
+            print(f"[Profile Save] save_profile() completed for epoch {self.epoch}", flush=True)
 
             # Return format compatible with both gym and gymnasium
             if GYMNASIUM_AVAILABLE:
@@ -1376,13 +1738,8 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             self.curData = copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
             self.curData.sort_values(['stock'], ascending=True, inplace=True)
             self.curData.reset_index(drop=True, inplace=True)
-            if self.config.enable_cov_features:   
-                self.covs = np.array(self.curData['cov'].values[0])
-                self.state = np.append(self.covs, np.transpose(self.curData[self.tech_indicator_lst_wocov].values), axis=0)
-            else:
-                self.state = np.transpose(self.curData[self.tech_indicator_lst_wocov].values)
-            self.state = self.state.flatten()
-            self.ctl_state = {k:_safe_array_from_values(self.curData[k].values) for k in self.config.otherRef_indicator_lst} # State data for the controller
+            
+            self.ctl_state = {k:_safe_array_from_values(self.curData[k].values) for k in self.config.otherRef_indicator_lst}
             cur_date = self.curData['date'].unique()[0]
             self.date_memory.append(cur_date)
 
@@ -1411,16 +1768,14 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 raise ValueError("Loss the whole capital! [Day: {}, date: {}, poDayReturn: {}]".format(self.curTradeDay, self.date_memory[-1], poDayReturn))
             
             updatePoValue = self.cur_capital * ((poDayReturn + 1 - np.abs(weights[0])) + np.abs(weights[0]))
-            poDayReturn_withcost = (updatePoValue - self.cur_capital) / self.cur_capital  
-            
+            poDayReturn_withcost = (updatePoValue - self.cur_capital) / self.cur_capital
             self.cur_capital = updatePoValue
-            self.state = np.append(self.state, [np.log((self.cur_capital/self.initial_asset))], axis=0) # current portfolio value observation
             
-            self.profit_lst.append(poDayReturn_withcost) 
+            self.profit_lst.append(poDayReturn_withcost)
             self.asset_lst.append(self.cur_capital)
 
-            # Receive info from the market observer
-            rate_of_price_change_withcash = np.append([1.0], rate_of_price_change_adj, axis=0) # cash
+            # Build MAFIA state via market observer
+            rate_of_price_change_withcash = np.append([1.0], rate_of_price_change_adj, axis=0)
             cur_risk_boundary, stock_ma_price = self.run_mkt_observer(stage='run', rate_of_price_change=np.array([rate_of_price_change_withcash]))  
             if stock_ma_price is not None:
                 self.ctl_state['MA-{}'.format(self.config.otherRef_indicator_ma_window)] = stock_ma_price
@@ -1520,7 +1875,14 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             cvar_expected_raw = -expected_r_raw + expected_std_raw * cvar_Z
             self.cvar_raw_lst.append(cvar_expected_raw)
 
-            profit_part = np.log(poDayReturn_withcost+1)
+            # Ensure poDayReturn_withcost is valid before taking log
+            if np.isnan(poDayReturn_withcost) or np.isinf(poDayReturn_withcost):
+                poDayReturn_withcost = 0.0
+            # Avoid log(0) = -inf when poDayReturn_withcost = -1
+            if poDayReturn_withcost <= -1:
+                profit_part = -10.0  # Large negative value instead of -inf
+            else:
+                profit_part = np.log(poDayReturn_withcost+1)
             if (self.config.trained_best_model_type == 'js_loss') and (self.config.enable_controller):
                 # Action reward guiding mechanism
                 if self.config.trade_pattern == 1:
@@ -1561,7 +1923,11 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 profit_part = poDayReturn_withcost
                 scaled_profit_part = profit_part
                 scaled_risk_part = risk_part
-                cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
+                # Avoid division by zero
+                if scaled_risk_part == 0 or np.isnan(scaled_risk_part) or np.isinf(scaled_risk_part):
+                    cur_reward = scaled_profit_part
+                else:
+                    cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
 
             else:
                 risk_part = 0
@@ -1571,6 +1937,10 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
 
             self.rl_reward_risk_lst.append(scaled_risk_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)
+            # Ensure cur_reward is not NaN or inf (root cause fix)
+            if np.isnan(cur_reward) or np.isinf(cur_reward):
+                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_risk_part={scaled_risk_part}), replacing with 0.0", flush=True)
+                cur_reward = 0.0
             self.reward = cur_reward
             self.reward_lst.append(self.reward)
             self.model_save_flag = False

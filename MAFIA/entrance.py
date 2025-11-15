@@ -41,77 +41,17 @@ from utils.tradeEnv import StockPortfolioEnv, StockPortfolioEnv_cash
 from utils.model_pool import model_select, benchmark_algo_select
 from utils.callback_func import PoCallback
 from utils.data_validator import get_stock_data_file
-from RL_controller.market_obs import MarketObserver, MarketObserver_Algorithmic
 from RL_controller.mafia_observer import MAFIAObserver
 import timeit
 
-def RLonly(config):
-    # For running the single-agent RL-based framework (TD3-Profit, TD3-PR, TD3-SR)
-    # Get dataset
-    fpath, error_msg = get_stock_data_file(config)
-    if fpath is None:
-        raise ValueError(f"Cannot load the data file. {error_msg}")
-    print(f"Loading stock data from: {fpath}", flush=True)
-    data = pd.DataFrame(pd.read_csv(fpath, header=0))
-    
-    # Preprocess features
-    featProc = FeatureProcesser(config=config)
-    data_dict = featProc.preprocess_feat(data=data)
-    tech_indicator_lst = featProc.techIndicatorLst 
-    stock_num = data_dict['train']['stock'].nunique()
-    print("Data has been processed..")
-
-    # Initialize environment
-    trainInvest_env_para = config.invest_env_para 
-    env_train = StockPortfolioEnv(
-        config=config, rawdata=data_dict['train'], mode='train', stock_num=stock_num, action_dim=stock_num, 
-        tech_indicator_lst=tech_indicator_lst, **trainInvest_env_para
-    )
-    if (config.valid_date_start is not None) and (config.valid_date_end is not None):
-        validInvest_env_para = config.invest_env_para 
-        env_valid = StockPortfolioEnv(
-            config=config, rawdata=data_dict['valid'], mode='valid', stock_num=stock_num, action_dim=stock_num, 
-            tech_indicator_lst=tech_indicator_lst, **validInvest_env_para
-        )
-    else:
-        env_valid = None
-
-    if (config.test_date_start is not None) and (config.test_date_end is not None):
-        testInvest_env_para = config.invest_env_para 
-        env_test = StockPortfolioEnv(
-            config=config, rawdata=data_dict['test'], mode='test', stock_num=stock_num, action_dim=stock_num, 
-            tech_indicator_lst=tech_indicator_lst, **testInvest_env_para
-        )
-    else:
-        env_test = None
-
-    # Load RL model
-    ModelCls = model_select(model_name=config.rl_model_name, mode=config.mode)
-    model_para_dict = config.model_para
-    po_model = ModelCls(env=env_train, **model_para_dict) # Create instance 
-    total_timesteps = int(config.num_epochs * env_train.totalTradeDay)
-    print('Training Start', flush=True)
-    log_interval = 10
-    callback1 =PoCallback(config=config, train_env=env_train, valid_env=env_valid, test_env=env_test)
-    cpt_start = time.process_time()
-    perft_start = time.perf_counter()
-    timeit_default = timeit.default_timer()
-    my_globals = globals()
-    my_globals.update({'po_model': po_model, 'total_timesteps': total_timesteps, 'callback1': callback1, 'log_interval': log_interval})
-    t = timeit.Timer(stmt='po_model.learn(total_timesteps=total_timesteps, callback=callback1, log_interval=log_interval)', globals=my_globals)
-    time_usage = t.timeit(number=1)
-    cpt_usgae = time.process_time() - cpt_start
-    perf_usgae = time.perf_counter() - perft_start
-    timeit_usgae = timeit.default_timer() - timeit_default
-    print("Time usgae for {} epochs: {}s, cpu time: {}s, perf_couter: {}s, timeit_default: {}s".format(config.num_epochs, np.round(time_usage, 2), np.round(cpt_usgae, 2), np.round(perf_usgae, 2), np.round(timeit_usgae, 2)))
-    print("-*"*20)
-
-    del po_model
-    print("Training Done...", flush=True)
+# Legacy RLonly function removed - MAFIA-only codebase now uses RLcontroller exclusively
 
 
 def RLcontroller(config):
-    # For running the MASA framework
+    """
+    MAFIA training pipeline (MASA framework with MAFIA observer).
+    This is the only supported training mode.
+    """
     # Get dataset
     fpath, error_msg = get_stock_data_file(config)
     if fpath is None:
@@ -119,22 +59,17 @@ def RLcontroller(config):
     print(f"Loading stock data from: {fpath}", flush=True)
     data = pd.DataFrame(pd.read_csv(fpath, header=0))
 
-    # Preprocess features
-    featProc = FeatureProcesser(config=config)
-    data_dict = featProc.preprocess_feat(data=data)
-    tech_indicator_lst = featProc.techIndicatorLst
+    # MAFIA lightweight data loading 
+    from utils.mafia_data_loader import MAFIADataLoader
+    print("[MAFIA] Using lightweight data loader (no legacy preprocessing)...", flush=True)
+    mafia_loader = MAFIADataLoader(config=config)
+    data_dict = mafia_loader.load_and_split_data(data=data)
+    tech_indicator_lst = []  # MAFIA doesn't use legacy tech indicators
     stock_num = data_dict['train']['stock'].nunique()
-    print("Data has been processed..")
+    print("Data loading complete.")
 
-    if config.enable_market_observer:
-        if config.mktobs_algo == 'mafia_1':
-            mkt_observer = MAFIAObserver(config=config, action_dim=stock_num)
-        elif ('ma' in config.mktobs_algo) or ('dc' in config.mktobs_algo):
-            mkt_observer = MarketObserver_Algorithmic(config=config, action_dim=stock_num)
-        else:
-            mkt_observer = MarketObserver(config=config, action_dim=stock_num) 
-    else:
-        mkt_observer = None
+    # Initialize MAFIA observer (always enabled)
+    mkt_observer = MAFIAObserver(config=config, action_dim=stock_num)
 
     # Initialize environment
     if (config.valid_date_start is not None) and (config.valid_date_end is not None):
@@ -173,27 +108,69 @@ def RLcontroller(config):
     
     # Auto-detect latest checkpoint if auto_resume is enabled and no checkpoint specified
     checkpoint_to_resume = config.resume_from_checkpoint
+    # Ensure checkpoint_to_resume is either None or a valid string path
+    if checkpoint_to_resume is not None and not isinstance(checkpoint_to_resume, str):
+        print(f"Warning: resume_from_checkpoint is not a string (got {type(checkpoint_to_resume)}), resetting to None", flush=True)
+        checkpoint_to_resume = None
+    
     if checkpoint_to_resume is None and config.auto_resume_from_latest:
-        # Find latest checkpoint in checkpoint_dir
-        if os.path.exists(config.checkpoint_dir):
-            checkpoint_dirs = [d for d in os.listdir(config.checkpoint_dir) 
-                             if d.startswith('checkpoint_epoch_') and os.path.isdir(os.path.join(config.checkpoint_dir, d))]
-            if checkpoint_dirs:
-                # Sort by epoch number (extract number from directory name)
-                def get_epoch_num(dirname):
+        # Find latest checkpoint - search in current checkpoint_dir and all parent res directories
+        search_dirs = [config.checkpoint_dir]  # Start with current checkpoint_dir
+        
+        # Also search in parent res directories (for previous runs)
+        base_res_dir = os.path.dirname(config.checkpoint_dir)  # Remove 'checkpoints'
+        if os.path.exists(base_res_dir):
+            parent_dir = os.path.dirname(base_res_dir)  # res/RLcontroller/TD3/VNINDEX-10
+            if os.path.exists(parent_dir):
+                # Search in all timestamp directories
+                for timestamp_dir in os.listdir(parent_dir):
+                    timestamp_path = os.path.join(parent_dir, timestamp_dir)
+                    if os.path.isdir(timestamp_path):
+                        checkpoint_path = os.path.join(timestamp_path, 'checkpoints')
+                        if os.path.exists(checkpoint_path) and checkpoint_path != config.checkpoint_dir:
+                            search_dirs.append(checkpoint_path)
+        
+        checkpoint_records = []
+        for search_dir in search_dirs:
+            if not os.path.exists(search_dir):
+                continue
+            checkpoint_dirs = [
+                d for d in os.listdir(search_dir)
+                if os.path.isdir(os.path.join(search_dir, d))
+            ]
+            for dirname in checkpoint_dirs:
+                info_path = os.path.join(search_dir, dirname, 'checkpoint_info.json')
+                if os.path.exists(info_path):
                     try:
-                        return int(dirname.split('_')[-1])
-                    except:
-                        return -1
-                checkpoint_dirs.sort(key=get_epoch_num, reverse=True)
-                latest_checkpoint_dir = checkpoint_dirs[0]
-                latest_checkpoint_path = os.path.join(config.checkpoint_dir, latest_checkpoint_dir, 'checkpoint_info.json')
-                if os.path.exists(latest_checkpoint_path):
-                    checkpoint_to_resume = latest_checkpoint_path
-                    print(f"Auto-detected latest checkpoint: {latest_checkpoint_path}", flush=True)
+                        with open(info_path, 'r') as f:
+                            info = json.load(f)
+                        checkpoint_records.append({
+                            'info_path': info_path,
+                            'info': info,
+                            'mtime': os.path.getmtime(info_path)
+                        })
+                    except Exception as e:
+                        print(f"Warning: Failed to read checkpoint info from {info_path}: {e}", flush=True)
+        
+        if checkpoint_records:
+            # Sort by timesteps, then epoch, then latest modification time
+            checkpoint_records.sort(
+                key=lambda item: (
+                    item['info'].get('timesteps', 0),
+                    item['info'].get('epoch', 0),
+                    item['mtime']
+                ),
+                reverse=True
+            )
+            latest_record = checkpoint_records[0]
+            checkpoint_to_resume = latest_record['info_path']
+            print(f"Auto-detected latest checkpoint: {checkpoint_to_resume}", flush=True)
+            print(f"  Epoch: {latest_record['info'].get('epoch', 0)}, Timesteps: {latest_record['info'].get('timesteps', 0)}", flush=True)
     
     # Resume from checkpoint if specified or auto-detected
-    if checkpoint_to_resume is not None and os.path.exists(checkpoint_to_resume):
+    start_epoch = 0
+    checkpoint_timesteps = 0
+    if checkpoint_to_resume is not None and isinstance(checkpoint_to_resume, str) and os.path.exists(checkpoint_to_resume):
         print(f"Resuming training from checkpoint: {checkpoint_to_resume}", flush=True)
         
         # Load checkpoint info
@@ -204,7 +181,22 @@ def RLcontroller(config):
             with open(info_path, 'r') as f:
                 checkpoint_info = json.load(f)
             start_epoch = checkpoint_info.get('epoch', 0)
-            print(f"Resuming from epoch {start_epoch}", flush=True)
+            checkpoint_timesteps = checkpoint_info.get('timesteps', 0)
+            checkpoint_type = checkpoint_info.get('type', 'epoch')
+            day_in_epoch = checkpoint_info.get('day_in_epoch', 0)
+            
+            print(f"Checkpoint type: {checkpoint_type}", flush=True)
+            print(f"Resuming from epoch {start_epoch}, day {day_in_epoch}, timestep {checkpoint_timesteps}", flush=True)
+            
+            # Set environment epoch to match checkpoint epoch
+            # Note: When stable-baselines3 calls reset() in learn(), it will increment epoch by 1
+            # Since we're resuming from a checkpoint (even if mid-epoch), we want to start a NEW epoch
+            # So if checkpoint is epoch 1, we set env.epoch = start_epoch, and after reset() it becomes start_epoch + 1
+            if hasattr(env_train, 'epoch'):
+                # Set to start_epoch so that after reset() it becomes start_epoch + 1 (new epoch)
+                # This ensures we start a fresh epoch when resuming, not continue the old one
+                env_train.epoch = start_epoch
+                print(f"Set environment epoch to {start_epoch} (will become epoch {start_epoch + 1} after reset)", flush=True)
         
         # Load RL model from checkpoint
         rl_checkpoint_path = os.path.join(checkpoint_dir, 'rl_model.zip')
@@ -229,22 +221,58 @@ def RLcontroller(config):
     else:
         po_model = ModelCls(env=env_train, **model_para_dict)
     
-    # Calculate remaining timesteps
-    remaining_epochs = max(0, config.num_epochs - start_epoch)
-    total_timesteps = int(remaining_epochs * env_train.totalTradeDay)
-    
-    if start_epoch > 0:
-        print(f'Resuming training from epoch {start_epoch} ({remaining_epochs} epochs remaining)', flush=True)
+    # Calculate remaining timesteps and epochs
+    # If resuming from checkpoint, calculate from checkpoint timesteps
+    if checkpoint_timesteps > 0:
+        total_timesteps_for_training = int(config.num_epochs * env_train.totalTradeDay)
+        total_timesteps = max(0, total_timesteps_for_training - checkpoint_timesteps)
+        # Calculate remaining epochs from checkpoint timesteps
+        remaining_epochs = max(0, config.num_epochs - start_epoch)
+        # More accurate: calculate from timesteps
+        completed_epochs = checkpoint_timesteps // env_train.totalTradeDay
+        remaining_epochs = max(0, config.num_epochs - completed_epochs)
+        print(f"Resuming from timestep {checkpoint_timesteps}/{total_timesteps_for_training}", flush=True)
+        print(f"Completed epochs: {completed_epochs}, Remaining epochs: {remaining_epochs}", flush=True)
     else:
-        print('Training Start', flush=True)
+        remaining_epochs = max(0, config.num_epochs - start_epoch)
+        total_timesteps = int(remaining_epochs * env_train.totalTradeDay)
+    
+    # Print training information
+    print(f"\n{'='*100}")
+    print(f"{'TRAINING CONFIGURATION':^100}")
+    print(f"{'='*100}")
+    if start_epoch > 0 or checkpoint_timesteps > 0:
+        print(f'[INFO] Resuming training from epoch {start_epoch}')
+        print(f'[INFO] Remaining epochs: {remaining_epochs}/{config.num_epochs}')
+    else:
+        print(f'[INFO] Starting fresh training')
+        print(f'[INFO] Total epochs to train: {config.num_epochs}')
+    print(f'[INFO] Steps per epoch: {env_train.totalTradeDay}')
+    print(f'[INFO] Total timesteps for this run: {total_timesteps}')
+    print(f'[INFO] Batch size: {config.batch_size}')
+    print(f'[INFO] Learning rate: {config.learning_rate}')
+    print(f'[INFO] Checkpoint frequency: every {config.checkpoint_freq} epochs' if config.checkpoint_freq > 0 else '[INFO] Checkpoint saving disabled')
+    print(f'[INFO] Results directory: {config.res_dir}')
+    print(f"{'='*100}\n")
+    print('Training Start', flush=True)
     log_interval = 10
     callback1 = PoCallback(config=config, train_env=env_train, valid_env=env_valid, test_env=env_test)
     cpt_start = time.process_time()
     perft_start = time.perf_counter()
     timeit_default = timeit.default_timer()
+    
+    # Set reset_num_timesteps=False when resuming from checkpoint to preserve timestep count
+    reset_num_timesteps = (checkpoint_timesteps == 0)
+    
     my_globals = globals()
-    my_globals.update({'po_model': po_model, 'total_timesteps': total_timesteps, 'callback1': callback1, 'log_interval': log_interval})
-    t = timeit.Timer(stmt='po_model.learn(total_timesteps=total_timesteps, callback=callback1, log_interval=log_interval)', globals=my_globals)
+    my_globals.update({
+        'po_model': po_model, 
+        'total_timesteps': total_timesteps, 
+        'callback1': callback1, 
+        'log_interval': log_interval,
+        'reset_num_timesteps': reset_num_timesteps
+    })
+    t = timeit.Timer(stmt='po_model.learn(total_timesteps=total_timesteps, callback=callback1, log_interval=log_interval, reset_num_timesteps=reset_num_timesteps)', globals=my_globals)
     time_usage = t.timeit(number=1)
     cpt_usgae = time.process_time() - cpt_start
     perf_usgae = time.perf_counter() - perft_start
@@ -257,7 +285,9 @@ def RLcontroller(config):
 
 def entrance():
     """
-    Entrance function for running the MASA framework
+    Main entry point for MAFIA training.
+    Legacy models (RLonly, Benchmark) have been removed.
+    This codebase now exclusively runs MAFIA (RLcontroller with MAFIA observer).
     """
     current_date = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     rand_seed = int(time.mktime(datetime.datetime.strptime(current_date, '%Y-%m-%d-%H-%M-%S').timetuple()))
@@ -273,15 +303,15 @@ def entrance():
     start_cputime = time.process_time()
     start_systime = time.perf_counter()
     config = Config(seed_num=rand_seed, current_date=current_date) 
+    
+    print("="*60)
+    print("MAFIA - Multi-Agent Framework with Integrated Attention")
+    print("="*60)
     config.print_config()
-    if config.mode == 'RLonly':
-        RLonly(config=config)
-    elif config.mode == 'RLcontroller':
-        RLcontroller(config=config)
-    elif config.mode == 'Benchmark':
-        raise NotImplementedError("Please refer to the corresponding papers and their provided implementations.")
-    else:
-        raise ValueError('Unexpected mode {}'.format(config.mode))
+    print("="*60)
+
+    # Only MAFIA (RLcontroller mode) is supported
+    RLcontroller(config=config)
 
     end_cputime = time.process_time()
     end_systime = time.perf_counter()

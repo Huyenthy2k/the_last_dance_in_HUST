@@ -18,8 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from RL_controller.mafia_feature_processor import MAFIAFeatureProcessor
 from RL_controller.mafia_modules import (
-    CSAModule, TAModule, STFusionModule, SignalGenerator, MAFIAModel,
-    PositionalEncoding, EventDetector
+    CSAModule, TAModule, STFusionModule, DenseMoESignalGenerator, MAFIAModel,
+    PositionalEncoding, EventDetector,
+    AttentionBasedTemporalEncoder, TemporalConvolutionEncoder, BidirectionalLSTMEncoder
 )
 
 
@@ -37,6 +38,15 @@ class MockConfig:
         self.mafia_learning_rate = 1e-4
         self.mafia_weight_decay = 0.001
         self.topK = 10
+        self.mafia_top_k = 10
+        self.mafia_gumbel_temperature = 1.0
+        self.mafia_hard_topk_inference = True
+        # Dense MoE Gating Configuration
+        self.mafia_gating_encoder_type = 'attention_based_aggregation'
+        self.mafia_gating_num_heads = 4
+        self.mafia_gating_dropout = 0.1
+        self.mafia_gating_lstm_layers = 2
+        self.mafia_gating_conv_kernels = [3, 5, 7]
 
 
 def test_feature_processor_technical():
@@ -194,19 +204,29 @@ def test_st_fusion():
 
 
 def test_signal_generator():
-    """Test Signal Generator."""
-    print("Testing Signal Generator...")
+    """Test Dense MoE Signal Generator."""
+    print("Testing Dense MoE Signal Generator...")
     config = MockConfig()
     device = th.device('cpu')
     
-    signal_gen = SignalGenerator(config).to(device)
+    signal_gen = DenseMoESignalGenerator(config).to(device)
     batch_size, N, T_w, D = 1, 10, 30, config.mafia_D
     
-    # Create outputs from 4 agents (1 Tech + 3 DC)
-    agent_outputs = [th.randn(batch_size, N, 1).to(device) for _ in range(4)]
-    agent_ta_outputs = [th.randn(batch_size, T_w, D).to(device) for _ in range(4)]
+    # Create outputs from 4 stock experts (1 Tech + 3 DC)
+    expert_outputs = [th.randn(batch_size, N, 1).to(device) for _ in range(4)]
+    expert_ta_outputs = [th.randn(batch_size, T_w, D).to(device) for _ in range(4)]
     
-    market_vector, boundary_risk = signal_gen(agent_outputs, agent_ta_outputs)
+    # Create market-index TA output for gating
+    O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
+    
+    # Forward pass
+    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = signal_gen(
+        expert_outputs, expert_ta_outputs, O_mkt_TA
+    )
+    
+    # Assertions
+    assert topk_indices.shape == (batch_size, config.mafia_top_k), \
+        f"Expected topk_indices shape ({batch_size}, {config.mafia_top_k}), got {topk_indices.shape}"
     
     assert market_vector.shape == (batch_size, N), \
         f"Expected market_vector shape ({batch_size}, {N}), got {market_vector.shape}"
@@ -214,15 +234,29 @@ def test_signal_generator():
         f"Expected boundary_risk shape ({batch_size},), got {boundary_risk.shape}"
     assert (boundary_risk > 0).all(), "boundary_risk should be positive (Softplus ensures this)"
     
+    assert market_scores_full.shape == (batch_size, N), \
+        f"Expected market_scores_full shape ({batch_size}, {N}), got {market_scores_full.shape}"
+    
+    # New: Test gate_weights
+    assert gate_weights.shape == (batch_size, 4), \
+        f"Expected gate_weights shape ({batch_size}, 4), got {gate_weights.shape}"
+    assert th.allclose(gate_weights.sum(dim=-1), th.ones(batch_size)), \
+        "Gate weights should sum to 1 (softmax output)"
+    assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
+        "Gate weights should be in [0, 1]"
+    
     print(f"✓ market_vector shape: {market_vector.shape}")
     print(f"✓ boundary_risk shape: {boundary_risk.shape}")
     print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
-    print("✓ Signal Generator: PASSED\n")
+    print(f"✓ gate_weights shape: {gate_weights.shape}")
+    print(f"✓ gate_weights sum: {gate_weights.sum(dim=-1).item():.4f}")
+    print(f"✓ gate_weights values: {gate_weights[0].tolist()}")
+    print("✓ Dense MoE Signal Generator: PASSED\n")
 
 
 def test_mafia_model():
-    """Test complete MAFIA Model."""
-    print("Testing MAFIA Model...")
+    """Test complete MAFIA Model with Dense MoE."""
+    print("Testing MAFIA Model with Dense MoE...")
     config = MockConfig()
     device = th.device('cpu')
     
@@ -234,20 +268,74 @@ def test_mafia_model():
     batch_size, N, M, T_w = 1, 10, 5, 30
     ochlv_data = th.randn(batch_size, N, M, T_w).to(device) * 50 + 100  # Realistic prices
     
-    with th.no_grad():
-        market_vector, boundary_risk = mafia_model(ochlv_data)
+    # Create market-index OCHLV data: (batch=1, 1, M=5, T_w=30)
+    market_index_ochlv_data = th.randn(batch_size, 1, M, T_w).to(device) * 50 + 1000  # VNINDEX prices
     
+    with th.no_grad():
+        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = mafia_model(
+            ochlv_data, market_index_ochlv_data=market_index_ochlv_data
+        )
+    
+    # Original assertions
     assert market_vector.shape == (batch_size, N), \
         f"Expected market_vector shape ({batch_size}, {N}), got {market_vector.shape}"
     assert boundary_risk.shape == (batch_size,), \
         f"Expected boundary_risk shape ({batch_size},), got {boundary_risk.shape}"
     assert (boundary_risk > 0).all(), "boundary_risk should be positive"
+    assert topk_indices.shape == (batch_size, config.mafia_top_k), \
+        f"Expected topk_indices shape ({batch_size}, {config.mafia_top_k}), got {topk_indices.shape}"
+    
+    # New assertions for Dense MoE
+    assert market_scores_full.shape == (batch_size, N), \
+        f"Expected market_scores_full shape ({batch_size}, {N}), got {market_scores_full.shape}"
+    assert gate_weights.shape == (batch_size, 4), \
+        f"Expected gate_weights shape ({batch_size}, 4), got {gate_weights.shape}"
+    assert th.allclose(gate_weights.sum(dim=-1), th.ones(batch_size)), \
+        "Gate weights should sum to 1"
+    assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
+        "Gate weights should be in [0, 1]"
     
     print(f"✓ market_vector shape: {market_vector.shape}")
     print(f"✓ boundary_risk shape: {boundary_risk.shape}")
     print(f"✓ market_vector range: [{market_vector.min():.4f}, {market_vector.max():.4f}]")
     print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
-    print("✓ MAFIA Model: PASSED\n")
+    print(f"✓ gate_weights: {gate_weights[0].tolist()}")
+    print("✓ MAFIA Model with Dense MoE: PASSED\n")
+
+
+def test_temporal_encoders():
+    """Test all 3 temporal encoders for Dense MoE gating."""
+    print("Testing Temporal Encoders...")
+    config = MockConfig()
+    device = th.device('cpu')
+    
+    batch_size, T_w, D = 2, 30, config.mafia_D
+    O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
+    
+    encoder_types = [
+        ('attention_based_aggregation', AttentionBasedTemporalEncoder),
+        ('temporal_convolution', TemporalConvolutionEncoder),
+        ('bidirectional_lstm', BidirectionalLSTMEncoder)
+    ]
+    
+    for encoder_name, EncoderClass in encoder_types:
+        print(f"  Testing {encoder_name}...")
+        encoder = EncoderClass(config).to(device)
+        encoder.eval()
+        
+        with th.no_grad():
+            market_context, aux_output = encoder(O_mkt_TA)
+        
+        # Assertions
+        assert market_context.shape == (batch_size, D), \
+            f"Expected market_context shape ({batch_size}, {D}), got {market_context.shape}"
+        assert not th.isnan(market_context).any(), f"{encoder_name}: market_context contains NaN"
+        assert not th.isinf(market_context).any(), f"{encoder_name}: market_context contains Inf"
+        
+        print(f"    ✓ {encoder_name}: market_context shape {market_context.shape}")
+        print(f"    ✓ {encoder_name}: No NaN or Inf values")
+    
+    print("✓ All Temporal Encoders: PASSED\n")
 
 
 def run_all_tests():
@@ -262,6 +350,7 @@ def run_all_tests():
         test_csa_module()
         test_ta_module()
         test_st_fusion()
+        test_temporal_encoders()
         test_signal_generator()
         test_mafia_model()
         
