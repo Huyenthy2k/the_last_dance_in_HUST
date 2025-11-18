@@ -172,6 +172,9 @@ def RLcontroller(config):
     # Resume from checkpoint if specified or auto-detected
     start_epoch = 0
     checkpoint_timesteps = 0
+    checkpoint_dir = None
+    resume_loaded = False
+    incompatible_checkpoint = False
     if checkpoint_to_resume is not None and isinstance(checkpoint_to_resume, str) and os.path.exists(checkpoint_to_resume):
         print(f"Resuming training from checkpoint: {checkpoint_to_resume}", flush=True)
         
@@ -243,27 +246,51 @@ def RLcontroller(config):
         # Load RL model from checkpoint
         rl_checkpoint_path = os.path.join(checkpoint_dir, 'rl_model.zip')
         if os.path.exists(rl_checkpoint_path):
-            po_model = ModelCls.load(rl_checkpoint_path, env=env_train)
-            po_model.mafia_config = config
-            po_model.verbose = 1
-            print(f"RL model loaded from {rl_checkpoint_path}", flush=True)
+            try:
+                po_model = ModelCls.load(rl_checkpoint_path, env=env_train)
+                po_model.mafia_config = config
+                po_model.verbose = 1
+                resume_loaded = True
+                print(f"RL model loaded from {rl_checkpoint_path}", flush=True)
+            except ValueError as e:
+                msg = str(e)
+                mismatch_signatures = [
+                    "Action spaces do not match",
+                    "Observation spaces do not match",
+                ]
+                if any(signature in msg for signature in mismatch_signatures):
+                    incompatible_checkpoint = True
+                    print(f"Warning: Checkpoint at {rl_checkpoint_path} is incompatible with current environment ({msg}). Starting fresh training.", flush=True)
+                else:
+                    raise
         else:
+            print(f"Warning: RL checkpoint not found at {rl_checkpoint_path}, starting fresh", flush=True)
+
+        if not resume_loaded:
             po_model = ModelCls(env=env_train, **model_para_dict)
             po_model.mafia_config = config
             po_model.verbose = 1
-            print(f"Warning: RL checkpoint not found, starting fresh", flush=True)
-        
-        # Load MAFIA observer from checkpoint if exists
-        if (config.enable_market_observer and 
-            hasattr(env_train, 'mkt_observer') and 
-            env_train.mkt_observer is not None and
-            hasattr(env_train.mkt_observer, 'load_checkpoint')):
-            mafia_checkpoint_path = os.path.join(checkpoint_dir, 'mafia_observer.pth')
-            if os.path.exists(mafia_checkpoint_path):
-                loaded_epoch = env_train.mkt_observer.load_checkpoint(mafia_checkpoint_path)
-                print(f"MAFIA observer loaded from {mafia_checkpoint_path} (epoch {loaded_epoch})", flush=True)
-            else:
-                print(f"Warning: MAFIA observer checkpoint not found, starting fresh", flush=True)
+            # Reset resume-specific metadata when checkpoint cannot be loaded
+            start_epoch = 0
+            checkpoint_timesteps = 0
+            checkpoint_dir = None
+            checkpoint_to_resume = None
+            if hasattr(env_train, '_resume_env_state_path'):
+                delattr(env_train, '_resume_env_state_path')
+            if hasattr(env_train, 'epoch'):
+                env_train.epoch = 0
+        else:
+            # Load MAFIA observer from checkpoint if exists
+            if (config.enable_market_observer and 
+                hasattr(env_train, 'mkt_observer') and 
+                env_train.mkt_observer is not None and
+                hasattr(env_train.mkt_observer, 'load_checkpoint')):
+                mafia_checkpoint_path = os.path.join(checkpoint_dir, 'mafia_observer.pth')
+                if os.path.exists(mafia_checkpoint_path):
+                    loaded_epoch = env_train.mkt_observer.load_checkpoint(mafia_checkpoint_path)
+                    print(f"MAFIA observer loaded from {mafia_checkpoint_path} (epoch {loaded_epoch})", flush=True)
+                else:
+                    print(f"Warning: MAFIA observer checkpoint not found, starting fresh", flush=True)
     else:
         po_model = ModelCls(env=env_train, **model_para_dict)
         po_model.mafia_config = config
