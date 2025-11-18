@@ -356,6 +356,11 @@ class TD3Controller(OffPolicyAlgorithm):
         self.critic_target = self.policy.critic_target
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+        # Log that train() was called (ALWAYS log, not just when verbose)
+        n_updates_before = getattr(self, '_n_updates', 0)
+        buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+        print(f"[TRAIN] ⚡ train() method CALLED! | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+        
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
 
@@ -364,15 +369,19 @@ class TD3Controller(OffPolicyAlgorithm):
 
         # Log training start (always log first few times, then every 100)
         if self.verbose >= 1 and (self._n_updates < 10 or self._n_updates % 100 == 0):
-            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
             print(f"[TRAIN] Starting gradient updates | Total updates: {self._n_updates} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
 
         actor_losses, critic_losses = [], []
+        sampled_rewards = []
         for _ in range(gradient_steps):
 
             self._n_updates += 1
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            try:
+                sampled_rewards.append(replay_data.rewards.mean().item())
+            except Exception:
+                pass
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
@@ -420,11 +429,22 @@ class TD3Controller(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         
         # Log training completion with loss values (always log first few times, then every 100)
-        if self.verbose >= 1 and (self._n_updates < 10 or self._n_updates % 100 == 0):
-            mean_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
-            mean_critic_loss = np.mean(critic_losses)
-            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-            print(f"[TRAIN] Completed | Updates: {self._n_updates} | Actor loss: {mean_actor_loss:.6f} | Critic loss: {mean_critic_loss:.6f} | Buffer size: {buffer_size}", flush=True)
+        n_updates_after = getattr(self, '_n_updates', 0)
+        mean_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
+        mean_critic_loss = np.mean(critic_losses)
+        mean_sample_reward = np.mean(sampled_rewards) if len(sampled_rewards) > 0 else 0.0
+        config_ref = getattr(self, 'mafia_config', None)
+        if config_ref is not None:
+            config_ref.last_td3_actor_loss = mean_actor_loss
+            config_ref.last_td3_critic_loss = mean_critic_loss
+            config_ref.last_td3_mean_reward = mean_sample_reward
+            config_ref.last_td3_updates = n_updates_after
+
+        buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+        print(f"[TRAIN] Completed | Updates: {n_updates_after} (was {n_updates_before}) | Actor loss: {mean_actor_loss:.6f} | Critic loss: {mean_critic_loss:.6f} | Sample reward: {mean_sample_reward:.6f} | Buffer size: {buffer_size}", flush=True)
+        
+        # Always log when training completes (for debugging)
+        print(f"[TRAIN] ✅ train() method COMPLETED! | _n_updates: {n_updates_before} → {n_updates_after} (increased by {n_updates_after - n_updates_before})", flush=True)
 
     def learn(
         self: SelfTD3,
@@ -435,6 +455,12 @@ class TD3Controller(OffPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfTD3:
+        """
+        Copy of OffPolicyAlgorithm.learn with the single change that training starts
+        as soon as ``num_timesteps >= learning_starts`` (instead of strictly greater).
+        This matches our expectation that once the replay buffer reaches the
+        warm-up threshold, TD3 should begin updating immediately.
+        """
         # Log initial state
         if self.verbose >= 1:
             buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
@@ -442,14 +468,42 @@ class TD3Controller(OffPolicyAlgorithm):
             print(f"[LEARN] Starting training | Buffer size: {buffer_size} | learning_starts: {learning_starts} | Total timesteps: {total_timesteps}", flush=True)
             print(f"[LEARN] train_freq: {self.train_freq} | gradient_steps: {self.gradient_steps}", flush=True)
 
-        return super().learn(
-            total_timesteps=total_timesteps,
-            callback=callback,
-            log_interval=log_interval,
-            tb_log_name=tb_log_name,
-            reset_num_timesteps=reset_num_timesteps,
-            progress_bar=progress_bar,
+        total_timesteps, callback = self._setup_learn(
+            total_timesteps,
+            callback,
+            reset_num_timesteps,
+            tb_log_name,
+            progress_bar,
         )
+
+        callback.on_training_start(locals(), globals())
+
+        assert self.env is not None, "You must set the environment before calling learn()"
+        assert isinstance(self.train_freq, TrainFreq)
+
+        while self.num_timesteps < total_timesteps:
+            rollout = self.collect_rollouts(
+                self.env,
+                train_freq=self.train_freq,
+                action_noise=self.action_noise,
+                callback=callback,
+                learning_starts=self.learning_starts,
+                replay_buffer=self.replay_buffer,
+                log_interval=log_interval,
+            )
+
+            if not rollout.continue_training:
+                break
+
+            # FIX: allow training as soon as we reach learning_starts
+            if self.num_timesteps > 0 and self.num_timesteps >= self.learning_starts:
+                gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+                if gradient_steps > 0:
+                    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
+
+        callback.on_training_end()
+
+        return self
 
     def _excluded_save_params(self) -> List[str]:
         return super()._excluded_save_params() + ["actor", "critic", "actor_target", "critic_target"]
@@ -513,6 +567,13 @@ class TD3Controller(OffPolicyAlgorithm):
         continue_training = True
 
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
+            # Check if we've reached total timesteps - stop collecting to prevent extra steps
+            if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
+                if self.num_timesteps >= self._total_timesteps:
+                    if self.verbose >= 1:
+                        print(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping collection", flush=True)
+                    continue_training = False
+                    break
             if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
@@ -554,6 +615,24 @@ class TD3Controller(OffPolicyAlgorithm):
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
 
+            # Debug: Log dones to track episode end detection
+            dones_has_true = any(dones) if hasattr(dones, '__iter__') else bool(dones)
+            if self.verbose >= 1 and dones_has_true:
+                print(f"[ROLLOUT] Episode end detected! dones={dones}, type={type(dones)}, shape={dones.shape if hasattr(dones, 'shape') else 'no shape'}, num_collected_episodes before={num_collected_episodes}, timesteps={self.num_timesteps}", flush=True)
+                # Log individual done flags
+                if hasattr(dones, '__iter__') and not isinstance(dones, (str, bytes)):
+                    for i, done_flag in enumerate(dones):
+                        print(f"[ROLLOUT]   dones[{i}] = {done_flag}", flush=True)
+                else:
+                    print(f"[ROLLOUT]   dones value = {dones}", flush=True)
+
+            # Check if we've reached total timesteps - stop immediately to prevent extra steps
+            if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
+                if self.num_timesteps >= self._total_timesteps:
+                    if self.verbose >= 1:
+                        print(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping immediately", flush=True)
+                    return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
+
             # Give access to local variables
             callback.update_locals(locals())
             # Only stop training if return value is False, not when it is None.
@@ -570,7 +649,11 @@ class TD3Controller(OffPolicyAlgorithm):
             if self.verbose >= 1 and num_collected_steps % 100 == 0:
                 buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
                 learning_starts = getattr(self, 'learning_starts', 100)
-                print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{learning_starts} | Timesteps: {self.num_timesteps}", flush=True)
+                max_buffer_size = getattr(replay_buffer, 'max_size', None)
+                if max_buffer_size is not None:
+                    print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{max_buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}", flush=True)
+                else:
+                    print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}", flush=True)
 
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 
@@ -580,11 +663,16 @@ class TD3Controller(OffPolicyAlgorithm):
             # see https://github.com/hill-a/stable-baselines/issues/900
             self._on_step()
 
+            episodes_ended = 0
             for idx, done in enumerate(dones):
-                if done:
+                if bool(done):  # Convert numpy boolean to Python boolean
                     # Update stats
                     num_collected_episodes += 1
                     self._episode_num += 1
+                    episodes_ended += 1
+
+                    if self.verbose >= 1:
+                        print(f"[ROLLOUT] Episode {self._episode_num} completed! num_collected_episodes={num_collected_episodes}, train_freq={train_freq}, done_idx={idx}", flush=True)
 
                     if action_noise is not None:
                         kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
@@ -593,15 +681,28 @@ class TD3Controller(OffPolicyAlgorithm):
                     # Log training infos
                     if log_interval is not None and self._episode_num % log_interval == 0:
                         self._dump_logs()
+
+            # Additional debug: Check if episodes were collected
+            if self.verbose >= 1 and episodes_ended > 0:
+                print(f"[ROLLOUT] Total episodes ended this step: {episodes_ended}, total collected: {num_collected_episodes}", flush=True)
         callback.on_rollout_end()
         
-        # Log rollout completion with buffer info
-        if self.verbose >= 1 and num_collected_episodes > 0:
-            buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
-            learning_starts = getattr(self, 'learning_starts', 100)
+        # Log rollout completion with buffer info - ALWAYS log, not just when num_collected_episodes > 0
+        buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
+        learning_starts = getattr(self, 'learning_starts', 100)
+        if self.verbose >= 1:
             print(f"[ROLLOUT] Completed | Collected steps: {num_collected_steps * env.num_envs} | Episodes: {num_collected_episodes}", flush=True)
             print(f"[ROLLOUT] Buffer size: {buffer_size} | learning_starts: {learning_starts} | Training enabled: {buffer_size >= learning_starts}", flush=True)
             print(f"[ROLLOUT] Current _n_updates: {getattr(self, '_n_updates', 0)}", flush=True)
+            if train_freq.unit == TrainFrequencyUnit.EPISODE:
+                should_train_flag = num_collected_episodes > 0
+                print(f"[ROLLOUT] train_freq: {train_freq} | Episodes collected: {num_collected_episodes} | Should train: {should_train_flag}", flush=True)
+                if not should_train_flag:
+                    print(f"[ROLLOUT] ❌ No episodes collected → Training will NOT be triggered!", flush=True)
+            else:
+                collected_steps = num_collected_steps * env.num_envs
+                should_train_flag = collected_steps >= train_freq.frequency
+                print(f"[ROLLOUT] train_freq: {train_freq} | Steps collected: {collected_steps} | Should train: {should_train_flag}", flush=True)
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
         

@@ -244,6 +244,8 @@ def _boost_topk_weights(a_final, market_scores_full, config, rl_selected_mask=No
     else:
         a_final_boosted = np.ones(len(a_final)) / len(a_final)
     
+    if env is not None and hasattr(env, 'is_last_ctrl_solvable'):
+        print(f"[SOLVER] Boost result | solvable={env.is_last_ctrl_solvable} | action_sum={np.sum(a_final_boosted):.4f}", flush=True)
     return a_final_boosted
 
 def RL_withoutController(a_rl, env=None):

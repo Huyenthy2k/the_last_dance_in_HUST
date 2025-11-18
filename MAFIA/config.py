@@ -32,7 +32,7 @@ class Config():
         self.benchmark_algo = 'MASA-mafia'  # Only supported algorithm
         self.market_name = 'VNINDEX'  # Financial Index: 'DJIA', 'SP500', 'CSI300'
         self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
-        self.num_epochs = 1  # episode. (TEST: 2 epochs for validation)
+        self.num_epochs = 20  # episode. (TEST: 2 epochs for validation)
 
         # MAFIA configuration (fixed)
         self.rl_model_name = 'TD3'  # RL agent implemented by TD3
@@ -77,7 +77,7 @@ class Config():
         self.trade_pattern = 1 # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
         self.lambda_1 = 1000.0 # return reward weight
         self.lambda_2 = 10.0 # action reward weight
-        self.train_freq = [1, 'episode'] 
+        self.train_freq = [100, 'step'] 
         self.risk_default = 0.017
         self.risk_up_bound = 0.012 # Decided by the observation of the training data set.  
         self.risk_hold_bound = 0.014 
@@ -97,6 +97,7 @@ class Config():
         self.pricePredModel = 'MA'
         self.cov_lookback = 5 
         self.norm_method = 'sum'
+        self.max_zero_volume_days = 100  # Drop stocks with > this number of zero-volume days
 
         if self.mode == 'Benchmark':
             self.trained_best_model_type = 'max_capital'
@@ -110,8 +111,14 @@ class Config():
         self.reward_scaling = 1 
         self.learning_rate = 0.0001 
         self.batch_size = 32
-        self.gradient_steps = -1 
+        # Number of mini-batches the TD3 learner runs after each train_freq chunk.
+        # Higher value ensures TD3 actually updates parameters frequently.
+        self.gradient_steps = 10 
         self.ars_trial = 10
+        self.last_td3_actor_loss = None
+        self.last_td3_critic_loss = None
+        self.last_td3_mean_reward = None
+        self.last_td3_updates = 0
 
         if current_date is None:
             self.cur_datetime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
@@ -128,6 +135,7 @@ class Config():
         self.checkpoint_dir = os.path.join(self.res_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.checkpoint_freq = 1  # Save checkpoint every N epochs (0 to disable)
+        self.validation_freq = 10  # Run validation/test every N epochs (final epoch always runs)
         # Step-based checkpointing (0 to disable, >0 saves every N timesteps)
         # Recommended: 500-1000 for frequent saves, or 0 to disable
         self.partial_checkpoint_steps = 200  # Save checkpoint every 50 timesteps (0 to disable)
@@ -139,7 +147,7 @@ class Config():
         date_split_dict = {            
             1: {'train_date_start': '2017-01-03 00:00:00',
                 'train_date_end': '2020-12-31 23:59:59',
-                'valid_date_start': '2022-01-01 00:00:00',
+                'valid_date_start': '2021-01-01 00:00:00',
                 'valid_date_end': '2023-12-31 23:59:59',
                 'test_date_start': '2024-01-01 00:00:00',
                 'test_date_end': '2025-11-06 23:59:59'},
@@ -388,5 +396,3 @@ class Config():
         log_str = log_str + '=' * 30 + '\n'
 
         print(log_str, flush=True)
-
-

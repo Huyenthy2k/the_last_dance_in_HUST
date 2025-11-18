@@ -98,6 +98,7 @@ class StockPortfolioEnv(gym.Env):
         self.mode = mode # train, valid, test
         self.stock_num = stock_num # Number of stocks
         self.action_dim = action_dim # Number of assets
+        self.validation_mode = False # Flag to indicate if environment is in validation mode
         
         # Handle tech_indicator_lst (optional for MAFIA, required for legacy)
         if tech_indicator_lst is None:
@@ -214,6 +215,8 @@ class StockPortfolioEnv(gym.Env):
         
         # Initialize capital before running market observer (needed for state building)
         self.cur_capital = self.initial_asset
+        self.last_valid_capital = self.cur_capital
+        self.last_valid_capital = self.cur_capital
 
         self.profit_lst = [0] # percentage of portfolio daily returns
         cur_risk_boundary, stock_ma_price = self.run_mkt_observer(stage='init') # after curData and state, before cur_risk_boundary
@@ -244,6 +247,9 @@ class StockPortfolioEnv(gym.Env):
 
         self.rl_reward_risk_lst = []
         self.rl_reward_profit_lst = []
+        self.latest_invest_profile = None
+        # Persist last completed epoch profile even after reset so callbacks can log correctly
+        self.last_epoch_profile = None
         self.cnt1 = 0
         self.cnt2 = 0
         self.stepcount = 0
@@ -275,6 +281,9 @@ class StockPortfolioEnv(gym.Env):
 
     def step(self, actions):
         self.terminal = self.curTradeDay >= (self.totalTradeDay - 1)
+        # Debug: Log when episode ends
+        if self.terminal:
+            print(f"[ENV] ⚠️ Episode end detected! curTradeDay={self.curTradeDay}, totalTradeDay={self.totalTradeDay}, terminal={self.terminal}, epoch={self.epoch}", flush=True)
         if self.terminal:
             self.cur_capital = self.cur_capital * (1 - self.transaction_cost)
             self.asset_lst[-1] = self.cur_capital
@@ -292,26 +301,108 @@ class StockPortfolioEnv(gym.Env):
             self.end_cputime = time.process_time()
             self.end_systime = time.perf_counter()
             self.model_save_flag = True
-            print(f"[Profile Save] Epoch {self.epoch} complete (mode={self.mode}), calling get_results() and save_profile()...", flush=True)
-            invest_profile = self.get_results()
-            print(f"[Profile Save] get_results() completed, calling save_profile()...", flush=True)
-            self.save_profile(invest_profile=invest_profile)
-            print(f"[Profile Save] save_profile() completed for epoch {self.epoch}", flush=True)
+
+            # Skip save_profile during validation to prevent array length conflicts
+            if not self.validation_mode:
+                print(f"[Profile Save] Epoch {self.epoch} complete (mode={self.mode}), calling get_results() and save_profile()...", flush=True)
+                invest_profile = self.get_results()
+                print(f"[Profile Save] get_results() completed, calling save_profile()...", flush=True)
+                self.save_profile(invest_profile=invest_profile)
+                print(f"[Profile Save] save_profile() completed for epoch {self.epoch}", flush=True)
+                self.latest_invest_profile = invest_profile
+                if self.latest_invest_profile is not None:
+                    self.last_epoch_profile = self.latest_invest_profile
+            else:
+                try:
+                    self.latest_invest_profile = self.get_results()
+                    if self.latest_invest_profile is not None:
+                        self.last_epoch_profile = self.latest_invest_profile
+                except Exception:
+                    self.latest_invest_profile = None
 
             # Return format compatible with both gym and gymnasium
-            if GYMNASIUM_AVAILABLE:
-                return self.state, self.reward, self.terminal, False, {}
-            else:
-                return self.state, self.reward, self.terminal, {}
+            # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
+            # Debug: Log return value
+            print(f"[ENV] Returning terminal={self.terminal} (will be converted to dones array by VecEnv)", flush=True)
+            return self.state, self.reward, self.terminal, False, {}
         else:
             actions = np.reshape(actions, (-1)) # [1, num_of_stocks] or [num_of_stocks, ]
-            weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights 
+            weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights
             self.actions_memory.append(weights)
             if self.curTradeDay == 0:
                 self.cur_capital = self.cur_capital * (1 - self.transaction_cost)
             else:
-                cur_p = np.array(self.curData['close'].values) * (1 + self.cur_slippage_drift)
-                last_p = np.array(self.lastDayData['close'].values) * (1 + self.last_slippage_drift)
+                # Ensure curData and lastDayData prices are aligned with stock_lst
+                cur_close_prices = np.zeros(self.stock_num)
+                last_close_prices = np.zeros(self.stock_num)
+                for i, stock in enumerate(self.stock_lst):
+                    if stock in self.curData['stock'].values:
+                        close_val = self.curData[self.curData['stock'] == stock]['close'].values[0]
+                        # Validate and sanitize NaN/inf/<=0 to prevent NaN propagation
+                        if pd.isna(close_val) or np.isinf(close_val) or close_val <= 0:
+                            self.nan_stats['cur_close_nan'] += 1
+                            cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                            fallback_used = None
+                            # Fallback: use last known price or 1.0
+                            if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
+                                last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                                if not (pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0):
+                                    cur_close_prices[i] = last_close_val
+                                    fallback_used = f'last_known_price({last_close_val:.4f})'
+                                else:
+                                    cur_close_prices[i] = 1.0
+                                    fallback_used = '1.0_default'
+                            else:
+                                cur_close_prices[i] = 1.0
+                                fallback_used = '1.0_default'
+                            # Log details (limit to first 10 per epoch to avoid spam)
+                            if len(self.nan_stats['cur_close_details']) < 10:
+                                self.nan_stats['cur_close_details'].append({
+                                    'day': self.curTradeDay,
+                                    'date': cur_date,
+                                    'stock': stock,
+                                    'value': close_val,
+                                    'fallback': fallback_used
+                                })
+                        else:
+                            cur_close_prices[i] = close_val
+                    else:
+                        cur_close_prices[i] = 1.0  # Default to no change if missing
+                    
+                    if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
+                        last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                        # Validate and sanitize NaN/inf/<=0
+                        if pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0:
+                            self.nan_stats['last_close_nan'] += 1
+                            cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                            fallback_used = None
+                            # Fallback: use current price or 1.0
+                            if not (pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0):
+                                last_close_prices[i] = cur_close_prices[i]
+                                fallback_used = f'current_price({cur_close_prices[i]:.4f})'
+                            else:
+                                last_close_prices[i] = 1.0
+                                fallback_used = '1.0_default'
+                            # Log details (limit to first 10 per epoch to avoid spam)
+                            if len(self.nan_stats['last_close_details']) < 10:
+                                self.nan_stats['last_close_details'].append({
+                                    'day': self.curTradeDay,
+                                    'date': cur_date,
+                                    'stock': stock,
+                                    'value': last_close_val,
+                                    'fallback': fallback_used
+                                })
+                        else:
+                            last_close_prices[i] = last_close_val
+                    else:
+                        # Validate cur_close_prices before using
+                        if pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0:
+                            last_close_prices[i] = 1.0
+                        else:
+                            last_close_prices[i] = cur_close_prices[i]  # Use current if last not available
+                
+                cur_p = cur_close_prices * (1 + self.cur_slippage_drift)
+                last_p = last_close_prices * (1 + self.last_slippage_drift)
                 x_p = cur_p / last_p
                 last_action = np.array(self.actions_memory[-2])
                 x_p_adj = np.where((x_p>=2)&(last_action<0), 2, x_p)
@@ -403,13 +494,69 @@ class StockPortfolioEnv(gym.Env):
             last_close_prices = np.zeros(self.stock_num)
             for i, stock in enumerate(self.stock_lst):
                 if stock in self.curData['stock'].values:
-                    cur_close_prices[i] = self.curData[self.curData['stock'] == stock]['close'].values[0]
+                    close_val = self.curData[self.curData['stock'] == stock]['close'].values[0]
+                    # Validate and sanitize NaN/inf/<=0 to prevent NaN propagation
+                    if pd.isna(close_val) or np.isinf(close_val) or close_val <= 0:
+                        self.nan_stats['cur_close_nan'] += 1
+                        cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                        fallback_used = None
+                        # Fallback: use last known price or 1.0
+                        if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
+                            last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                            if not (pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0):
+                                cur_close_prices[i] = last_close_val
+                                fallback_used = f'last_known_price({last_close_val:.4f})'
+                            else:
+                                cur_close_prices[i] = 1.0
+                                fallback_used = '1.0_default'
+                        else:
+                            cur_close_prices[i] = 1.0
+                            fallback_used = '1.0_default'
+                        # Log details (limit to first 10 per epoch to avoid spam)
+                        if len(self.nan_stats['cur_close_details']) < 10:
+                            self.nan_stats['cur_close_details'].append({
+                                'day': self.curTradeDay,
+                                'date': cur_date,
+                                'stock': stock,
+                                'value': close_val,
+                                'fallback': fallback_used
+                            })
+                    else:
+                        cur_close_prices[i] = close_val
                 else:
                     cur_close_prices[i] = 1.0  # Default to no change if missing
+                
                 if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
-                    last_close_prices[i] = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                    last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                    # Validate and sanitize NaN/inf/<=0
+                    if pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0:
+                        self.nan_stats['last_close_nan'] += 1
+                        cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                        fallback_used = None
+                        # Fallback: use current price or 1.0
+                        if not (pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0):
+                            last_close_prices[i] = cur_close_prices[i]
+                            fallback_used = f'current_price({cur_close_prices[i]:.4f})'
+                        else:
+                            last_close_prices[i] = 1.0
+                            fallback_used = '1.0_default'
+                        # Log details (limit to first 10 per epoch to avoid spam)
+                        if len(self.nan_stats['last_close_details']) < 10:
+                            self.nan_stats['last_close_details'].append({
+                                'day': self.curTradeDay,
+                                'date': cur_date,
+                                'stock': stock,
+                                'value': last_close_val,
+                                'fallback': fallback_used
+                            })
+                    else:
+                        last_close_prices[i] = last_close_val
                 else:
-                    last_close_prices[i] = cur_close_prices[i]  # Use current if last not available
+                    # Validate cur_close_prices before using
+                    if pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0:
+                        last_close_prices[i] = 1.0
+                    else:
+                        last_close_prices[i] = cur_close_prices[i]  # Use current if last not available
             
             curDay_ClosePrice_withSlippage = cur_close_prices * (1 + self.cur_slippage_drift)
             lastDay_ClosePrice_withSlippage = last_close_prices * (1 + self.last_slippage_drift)
@@ -417,12 +564,47 @@ class StockPortfolioEnv(gym.Env):
             rate_of_price_change_adj = np.where((rate_of_price_change>=2)&(weights<0), 2, rate_of_price_change)
             sigDayReturn = (rate_of_price_change_adj - 1) * weights # [s1_pct, s2_pct, .., px_pct_returns]
             poDayReturn = np.sum(sigDayReturn)
+            
+            # Validate poDayReturn to prevent NaN propagation
+            if np.isnan(poDayReturn) or np.isinf(poDayReturn):
+                self.nan_stats['poDayReturn_nan'] += 1
+                cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                print(f"Warning: poDayReturn is {poDayReturn}, using 0.0 as fallback (Day: {self.curTradeDay}, date: {cur_date})", flush=True)
+                # Log details (limit to first 10 per epoch to avoid spam)
+                if len(self.nan_stats['poDayReturn_details']) < 10:
+                    self.nan_stats['poDayReturn_details'].append({
+                        'day': self.curTradeDay,
+                        'date': cur_date,
+                        'value': poDayReturn
+                    })
+                poDayReturn = 0.0
+            
             if poDayReturn <= (-1):
                 raise ValueError("Loss the whole capital! [Day: {}, date: {}, poDayReturn: {}]".format(self.curTradeDay, self.date_memory[-1], poDayReturn))
 
-            updatePoValue = self.cur_capital * (poDayReturn + 1) 
-            poDayReturn_withcost = (updatePoValue - self.cur_capital) / self.cur_capital
+            prev_cur_capital = self.cur_capital  # Save previous value for poDayReturn_withcost calculation
+            updatePoValue = self.cur_capital * (poDayReturn + 1)
+            # Validate updatePoValue to prevent NaN propagation
+            if np.isnan(updatePoValue) or np.isinf(updatePoValue) or updatePoValue <= 0:
+                self.nan_stats['updatePoValue_nan'] += 1
+                cur_date = self.date_memory[-1] if len(self.date_memory) > 0 else 'N/A'
+                fallback_cap = self.last_valid_capital if np.isfinite(self.last_valid_capital) else self.initial_asset
+                print(f"Warning: updatePoValue is {updatePoValue}, using fallback capital {fallback_cap} (Day: {self.curTradeDay}, date: {cur_date})", flush=True)
+                # Log details (limit to first 10 per epoch to avoid spam)
+                if len(self.nan_stats['updatePoValue_details']) < 10:
+                    self.nan_stats['updatePoValue_details'].append({
+                        'day': self.curTradeDay,
+                        'date': cur_date,
+                        'value': updatePoValue,
+                        'prev_capital': prev_cur_capital,
+                        'poDayReturn': poDayReturn
+                    })
+                updatePoValue = fallback_cap  # Keep previous valid value
+            
             self.cur_capital = updatePoValue
+            if np.isfinite(self.cur_capital):
+                self.last_valid_capital = self.cur_capital
+            poDayReturn_withcost = (updatePoValue - prev_cur_capital) / (prev_cur_capital + 1e-8)  # Avoid division by zero
             
             self.profit_lst.append(poDayReturn_withcost)
             self.asset_lst.append(self.cur_capital)
@@ -658,10 +840,8 @@ class StockPortfolioEnv(gym.Env):
             self.reward_lst.append(self.reward)
             self.model_save_flag = False
             # Return format compatible with both gym and gymnasium
-            if GYMNASIUM_AVAILABLE:
-                return self.state, self.reward, self.terminal, False, {}
-            else:
-                return self.state, self.reward, self.terminal, {}
+            # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
+            return self.state, self.reward, self.terminal, False, {}
 
     def reset(self, seed=None, options=None):
         # Handle gymnasium compatibility (seed and options parameters)
@@ -670,6 +850,18 @@ class StockPortfolioEnv(gym.Env):
             np.random.seed(seed)
         self.epoch = self.epoch + 1
         self.curTradeDay = 0
+        
+        # Reset NaN statistics for new epoch
+        self.nan_stats = {
+            'cur_close_nan': 0,
+            'last_close_nan': 0,
+            'poDayReturn_nan': 0,
+            'updatePoValue_nan': 0,
+            'cur_close_details': [],
+            'last_close_details': [],
+            'poDayReturn_details': [],
+            'updatePoValue_details': []
+        }
 
         self.curData = copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
         self.curData.sort_values(['stock'], ascending=True, inplace=True)
@@ -687,6 +879,7 @@ class StockPortfolioEnv(gym.Env):
             self.ctl_state['MA-{}'.format(self.config.otherRef_indicator_ma_window)] = stock_ma_price
 
         self.cur_capital = self.initial_asset
+        self.last_valid_capital = self.cur_capital
 
 
         self.cvar_lst = [0]
@@ -716,10 +909,14 @@ class StockPortfolioEnv(gym.Env):
         self.cnt1 = 0
         self.cnt2 = 0
         self.stepcount = 0
+        self.latest_invest_profile = None
 
         self.start_cputime = time.process_time()
         self.start_systime = time.perf_counter()
-        
+
+        # Reset resuming flag after reset (normal training state)
+        self._is_resuming = False
+
         # Return format compatible with both gym and gymnasium
         # gymnasium: (obs, info)
         # gym: obs
@@ -733,22 +930,43 @@ class StockPortfolioEnv(gym.Env):
     
 
     def softmax_normalization(self, actions):
-        if np.sum(np.abs(actions)) == 0:  
+        if np.sum(np.abs(actions)) == 0:
             norm_weights = np.array([1/len(actions)]*len(actions)) * self.bound_flag
         else:
-            norm_weights = np.exp(actions)/np.sum(np.abs(np.exp(actions)))
+            # Proper softmax: exp(x_i) / sum(exp(x_j))
+            # For short positions (bound_flag = -1), negate actions first
+            if self.bound_flag < 0:
+                actions = -actions  # Flip actions for short positions
+            exp_actions = np.exp(actions - np.max(actions))  # Subtract max for numerical stability
+            norm_weights = exp_actions / np.sum(exp_actions)
+            norm_weights = norm_weights * self.bound_flag
         return norm_weights
     
     def sum_normalization(self, actions):
         if np.sum(np.abs(actions)) == 0:
             norm_weights = np.array([1/len(actions)]*len(actions)) * self.bound_flag
         else:
+            # Normalize by sum of absolute values, then apply bound_flag
+            # For long positions: actions / sum(|actions|) -> sums to 1
+            # For short positions: -actions / sum(|actions|) -> sums to -1
+            if self.bound_flag < 0:
+                actions = -actions  # Flip actions for short positions
             norm_weights = actions / np.sum(np.abs(actions))
+            # Ensure the result has the correct sign and magnitude
+            norm_weights = norm_weights * abs(self.bound_flag)
         return norm_weights
 
     def save_action_memory(self):
 
-        action_pd = pd.DataFrame(np.array(self.actions_memory), columns=self.stock_lst)
+        action_arr = np.array(self.actions_memory)
+        columns = list(self.stock_lst)
+        if len(columns) != action_arr.shape[1]:
+            if len(columns) > action_arr.shape[1]:
+                columns = columns[:action_arr.shape[1]]
+            else:
+                columns = columns + [f'UNNAMED_{i}' for i in range(action_arr.shape[1] - len(columns))]
+            print(f"[SAVE_PROFILE] Warning: stock list length mismatch (actions: {action_arr.shape[1]}, columns: {len(self.stock_lst)}). Adjusting columns for consistency.", flush=True)
+        action_pd = pd.DataFrame(action_arr, columns=columns)
         action_pd['date'] = self.date_memory
         return action_pd
 
@@ -761,15 +979,126 @@ class StockPortfolioEnv(gym.Env):
         obs = e.reset()
         return e, obs
 
+    def save_state(self, filepath):
+        """
+        Save environment state to file for checkpoint resume.
+        This allows resuming from mid-epoch checkpoints.
+        """
+        import pickle
+        state = {
+            'epoch': self.epoch,
+            'curTradeDay': self.curTradeDay,
+            'cur_capital': self.cur_capital,
+            'curData': self.curData.copy() if hasattr(self, 'curData') and self.curData is not None else None,
+            'lastDayData': self.lastDayData.copy() if hasattr(self, 'lastDayData') and self.lastDayData is not None else None,
+            'cur_slippage_drift': self.cur_slippage_drift.copy() if hasattr(self, 'cur_slippage_drift') else None,
+            'last_slippage_drift': self.last_slippage_drift.copy() if hasattr(self, 'last_slippage_drift') else None,
+            'state': self.state.copy() if hasattr(self, 'state') and self.state is not None else None,
+            'ctl_state': {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in self.ctl_state.items()} if hasattr(self, 'ctl_state') else None,
+            'terminal': self.terminal if hasattr(self, 'terminal') else False,
+            'profit_lst': self.profit_lst.copy() if hasattr(self, 'profit_lst') else None,
+            'asset_lst': self.asset_lst.copy() if hasattr(self, 'asset_lst') else None,
+            'actions_memory': [a.copy() if isinstance(a, np.ndarray) else a for a in self.actions_memory] if hasattr(self, 'actions_memory') else None,
+            'date_memory': self.date_memory.copy() if hasattr(self, 'date_memory') else None,
+            'reward_lst': self.reward_lst.copy() if hasattr(self, 'reward_lst') else None,
+            'action_cbf_memeory': [a.copy() if isinstance(a, np.ndarray) else a for a in self.action_cbf_memeory] if hasattr(self, 'action_cbf_memeory') else None,
+            'action_rl_memory': [a.copy() if isinstance(a, np.ndarray) else a for a in self.action_rl_memory] if hasattr(self, 'action_rl_memory') else None,
+            'risk_adj_lst': self.risk_adj_lst.copy() if hasattr(self, 'risk_adj_lst') else None,
+            'risk_raw_lst': self.risk_raw_lst.copy() if hasattr(self, 'risk_raw_lst') else None,
+            'risk_cbf_lst': self.risk_cbf_lst.copy() if hasattr(self, 'risk_cbf_lst') else None,
+            'return_raw_lst': self.return_raw_lst.copy() if hasattr(self, 'return_raw_lst') else None,
+            'cvar_lst': self.cvar_lst.copy() if hasattr(self, 'cvar_lst') else None,
+            'cvar_raw_lst': self.cvar_raw_lst.copy() if hasattr(self, 'cvar_raw_lst') else None,
+            'rl_reward_risk_lst': self.rl_reward_risk_lst.copy() if hasattr(self, 'rl_reward_risk_lst') else None,
+            'rl_reward_profit_lst': self.rl_reward_profit_lst.copy() if hasattr(self, 'rl_reward_profit_lst') else None,
+            'is_last_ctrl_solvable': self.is_last_ctrl_solvable if hasattr(self, 'is_last_ctrl_solvable') else False,
+            'nan_stats': self.nan_stats.copy() if hasattr(self, 'nan_stats') else None,
+            'latest_invest_profile': self.latest_invest_profile,
+            'last_epoch_profile': self.last_epoch_profile
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"[ENV STATE] Saved environment state to {filepath}", flush=True)
+
+    def restore_state(self, filepath):
+        """
+        Restore environment state from file for checkpoint resume.
+        This allows resuming from mid-epoch checkpoints.
+        """
+        import pickle
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+        
+        self.epoch = state.get('epoch', 0)
+        self.curTradeDay = state.get('curTradeDay', 0)
+        self.cur_capital = state.get('cur_capital', self.initial_asset)
+        self.last_valid_capital = self.cur_capital if np.isfinite(self.cur_capital) else self.initial_asset
+        
+        if state.get('curData') is not None:
+            self.curData = state['curData'].copy()
+        if state.get('lastDayData') is not None:
+            self.lastDayData = state['lastDayData'].copy()
+        if state.get('cur_slippage_drift') is not None:
+            self.cur_slippage_drift = state['cur_slippage_drift'].copy()
+        if state.get('last_slippage_drift') is not None:
+            self.last_slippage_drift = state['last_slippage_drift'].copy()
+        if state.get('state') is not None:
+            self.state = state['state'].copy()
+        if state.get('ctl_state') is not None:
+            self.ctl_state = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in state['ctl_state'].items()}
+        if state.get('terminal') is not None:
+            self.terminal = state['terminal']
+        if state.get('profit_lst') is not None:
+            self.profit_lst = state['profit_lst'].copy()
+        if state.get('asset_lst') is not None:
+            self.asset_lst = state['asset_lst'].copy()
+        if state.get('actions_memory') is not None:
+            self.actions_memory = [a.copy() if isinstance(a, np.ndarray) else a for a in state['actions_memory']]
+        if state.get('date_memory') is not None:
+            self.date_memory = state['date_memory'].copy()
+        if state.get('reward_lst') is not None:
+            self.reward_lst = state['reward_lst'].copy()
+        if state.get('action_cbf_memeory') is not None:
+            self.action_cbf_memeory = [a.copy() if isinstance(a, np.ndarray) else a for a in state['action_cbf_memeory']]
+        if state.get('action_rl_memory') is not None:
+            self.action_rl_memory = [a.copy() if isinstance(a, np.ndarray) else a for a in state['action_rl_memory']]
+        if state.get('risk_adj_lst') is not None:
+            self.risk_adj_lst = state['risk_adj_lst'].copy()
+        if state.get('risk_raw_lst') is not None:
+            self.risk_raw_lst = state['risk_raw_lst'].copy()
+        if state.get('risk_cbf_lst') is not None:
+            self.risk_cbf_lst = state['risk_cbf_lst'].copy()
+        if state.get('return_raw_lst') is not None:
+            self.return_raw_lst = state['return_raw_lst'].copy()
+        if state.get('cvar_lst') is not None:
+            self.cvar_lst = state['cvar_lst'].copy()
+        if state.get('cvar_raw_lst') is not None:
+            self.cvar_raw_lst = state['cvar_raw_lst'].copy()
+        if state.get('rl_reward_risk_lst') is not None:
+            self.rl_reward_risk_lst = state['rl_reward_risk_lst'].copy()
+        if state.get('rl_reward_profit_lst') is not None:
+            self.rl_reward_profit_lst = state['rl_reward_profit_lst'].copy()
+        if state.get('is_last_ctrl_solvable') is not None:
+            self.is_last_ctrl_solvable = state['is_last_ctrl_solvable']
+        if state.get('nan_stats') is not None:
+            self.nan_stats = state['nan_stats'].copy()
+        self.latest_invest_profile = state.get('latest_invest_profile', None)
+        self.last_epoch_profile = state.get('last_epoch_profile', self.latest_invest_profile)
+
+        # Set flag to indicate we're resuming from checkpoint (affects save_profile logic)
+        self._is_resuming = True
+
+        print(f"[ENV STATE] Restored environment state from {filepath} | epoch={self.epoch}, day={self.curTradeDay}, capital={self.cur_capital:.2f}", flush=True)
 
     def get_results(self):
-        self.profit_lst = np.array(self.profit_lst)
-        self.asset_lst = np.array(self.asset_lst)
+        # Create copies to avoid modifying original lists during ongoing episodes
+        profit_lst = np.array(self.profit_lst)
+        asset_lst = np.array(self.asset_lst)
 
         netProfit = self.cur_capital - self.initial_asset # Profits
         netProfit_pct = netProfit / self.initial_asset # Rate of overall returns
 
-        diffPeriodAsset = np.diff(self.asset_lst)
+        diffPeriodAsset = np.diff(asset_lst)
         if len(diffPeriodAsset) > 0:
             sigReturn_max = np.max(diffPeriodAsset) # Maximal returns in a single transaction.
             sigReturn_min = np.min(diffPeriodAsset) # Minimal returns in a single transaction
@@ -778,13 +1107,13 @@ class StockPortfolioEnv(gym.Env):
             sigReturn_min = 0.0
 
         # Annual Returns
-        annualReturn_pct = np.power((1 + netProfit_pct), (self.config.tradeDays_per_year/len(self.asset_lst))) - 1
+        annualReturn_pct = np.power((1 + netProfit_pct), (self.config.tradeDays_per_year/len(asset_lst))) - 1
 
-        dailyReturn_pct_max = np.max(self.profit_lst)
-        dailyReturn_pct_min = np.min(self.profit_lst)
-        avg_dailyReturn_pct = np.mean(self.profit_lst)
+        dailyReturn_pct_max = np.max(profit_lst)
+        dailyReturn_pct_min = np.min(profit_lst)
+        avg_dailyReturn_pct = np.mean(profit_lst)
         # strategy volatility
-        volatility = np.sqrt(np.sum(np.power((self.profit_lst - avg_dailyReturn_pct), 2)) * self.config.tradeDays_per_year / (len(self.profit_lst) - 1))
+        volatility = np.sqrt(np.sum(np.power((profit_lst - avg_dailyReturn_pct), 2)) * self.config.tradeDays_per_year / (len(profit_lst) - 1))
         # Avoid division by zero
         if volatility == 0 or np.isnan(volatility) or np.isinf(volatility):
             volatility = 1e-6  # Small epsilon to avoid division by zero
@@ -796,7 +1125,7 @@ class StockPortfolioEnv(gym.Env):
             sharpeRatio = 0.0
         # sharpeRatio = np.max([sharpeRatio, 0])
 
-        dailyAnnualReturn_lst = np.power((1+np.array(self.profit_lst)), self.config.tradeDays_per_year) - 1
+        dailyAnnualReturn_lst = np.power((1+profit_lst), self.config.tradeDays_per_year) - 1
         dailyRisk_lst = np.array(self.risk_cbf_lst) * np.sqrt(self.config.tradeDays_per_year) # Daily Risk to Anuual Risk
         # Avoid division by zero
         dailyRisk_lst_safe = np.where(dailyRisk_lst == 0, 1e-6, dailyRisk_lst)
@@ -846,20 +1175,20 @@ class StockPortfolioEnv(gym.Env):
         winRate = len(np.argwhere(diffPeriodAsset>0))/(len(diffPeriodAsset) + 1)
 
         # MDD
-        repeat_asset_lst = np.tile(self.asset_lst, (len(self.asset_lst), 1))
-        mdd_mtix = np.triu(1 - repeat_asset_lst / np.reshape(self.asset_lst, (-1, 1)), k=1)
+        repeat_asset_lst = np.tile(asset_lst, (len(asset_lst), 1))
+        mdd_mtix = np.triu(1 - repeat_asset_lst / np.reshape(asset_lst, (-1, 1)), k=1)
         mddmaxidx = np.argmax(mdd_mtix)
-        mdd_highidx = mddmaxidx // len(self.asset_lst)
-        mdd_lowidx = mddmaxidx % len(self.asset_lst)
+        mdd_highidx = mddmaxidx // len(asset_lst)
+        mdd_lowidx = mddmaxidx % len(asset_lst)
         self.mdd = np.max(mdd_mtix)
-        self.mdd_high = self.asset_lst[mdd_highidx]
-        self.mdd_low = self.asset_lst[mdd_lowidx]
+        self.mdd_high = asset_lst[mdd_highidx]
+        self.mdd_low = asset_lst[mdd_lowidx]
         self.mdd_highTimepoint = self.date_memory[mdd_highidx]
         self.mdd_lowTimepoint = self.date_memory[mdd_lowidx]
 
         # Strategy volatility during trading
-        cumsum_r = np.cumsum(self.profit_lst)/np.arange(1, self.totalTradeDay+1) # average cumulative returns rate
-        repeat_profit_lst = np.tile(self.profit_lst, (len(self.profit_lst), 1))
+        cumsum_r = np.cumsum(profit_lst)/np.arange(1, self.totalTradeDay+1) # average cumulative returns rate
+        repeat_profit_lst = np.tile(profit_lst, (len(profit_lst), 1))
         stg_vol_lst = np.sqrt(np.sum(np.power(np.tril(repeat_profit_lst - np.reshape(cumsum_r, (-1,1)), k=0), 2), axis=1)[1:] / np.arange(1, len(repeat_profit_lst)) * self.config.tradeDays_per_year)
         stg_vol_lst = np.append([0], stg_vol_lst, axis=0)
         # stg_vol_lst  = np.sqrt((np.cumsum(np.power((self.profit_lst - cumsum_r), 2))/np.arange(1, self.totalTradeDay+1)) * self.config.tradeDays_per_year)
@@ -883,7 +1212,7 @@ class StockPortfolioEnv(gym.Env):
         risk_raw_min = np.min(risk_raw_nonzero) if len(risk_raw_nonzero) > 0 else 0.0
         risk_raw_avg = np.mean(self.risk_raw_lst)
 
-        # Downside risk at volatility        
+        # Downside risk at volatility
         risk_downsideAtVol_daily = np.sqrt(np.sum(np.power(np.tril((repeat_profit_lst - np.reshape(cumsum_r, (-1,1))) * (repeat_profit_lst<np.reshape(cumsum_r, (-1,1))), k=0), 2), axis=1)[1:] / np.arange(1, len(repeat_profit_lst)) * self.config.tradeDays_per_year)
         risk_downsideAtVol_daily = np.append([0], risk_downsideAtVol_daily, axis=0)
         risk_downsideAtVol = risk_downsideAtVol_daily[-1]
@@ -892,7 +1221,7 @@ class StockPortfolioEnv(gym.Env):
         risk_downsideAtVol_daily_avg = np.mean(risk_downsideAtVol_daily)
 
         # Downside risk at value against initial capital
-        risk_downsideAtValue_daily = (self.asset_lst / self.initial_asset) - 1
+        risk_downsideAtValue_daily = (asset_lst / self.initial_asset) - 1
         risk_downsideAtValue_daily_max = np.max(risk_downsideAtValue_daily)
         risk_downsideAtValue_daily_min = np.min(risk_downsideAtValue_daily)
         risk_downsideAtValue_daily_avg = np.mean(risk_downsideAtValue_daily)
@@ -911,9 +1240,9 @@ class StockPortfolioEnv(gym.Env):
         cvar_raw_avg = np.mean(self.cvar_raw_lst)
 
         # Calmar ratio
-        time_T = len(self.profit_lst)
+        time_T = len(profit_lst)
         avg_return = netProfit_pct / time_T if time_T > 0 else 0.0
-        variance_r = np.sum(np.power((self.profit_lst - avg_dailyReturn_pct), 2)) / (len(self.profit_lst) - 1) if len(self.profit_lst) > 1 else 0.0
+        variance_r = np.sum(np.power((profit_lst - avg_dailyReturn_pct), 2)) / (len(profit_lst) - 1) if len(profit_lst) > 1 else 0.0
         volatility_daily = np.sqrt(variance_r) if variance_r >= 0 else 0.0
         # Avoid division by zero
         if volatility_daily == 0:
@@ -943,8 +1272,8 @@ class StockPortfolioEnv(gym.Env):
             calmarRatio = 0.0
 
         # Sterling ratio
-        move_mdd_mask = np.where(np.array(self.profit_lst)<0, 1, 0)
-        moving_mdd = np.sqrt(np.sum(np.power(self.profit_lst * move_mdd_mask, 2))  * self.config.tradeDays_per_year / (len(self.profit_lst) - 1)) if len(self.profit_lst) > 1 else 0.0
+        move_mdd_mask = np.where(profit_lst<0, 1, 0)
+        moving_mdd = np.sqrt(np.sum(np.power(profit_lst * move_mdd_mask, 2))  * self.config.tradeDays_per_year / (len(profit_lst) - 1)) if len(profit_lst) > 1 else 0.0
         # Avoid division by zero
         if moving_mdd == 0 or np.isnan(moving_mdd) or np.isinf(moving_mdd):
             moving_mdd = 1e-6
@@ -976,11 +1305,32 @@ class StockPortfolioEnv(gym.Env):
             else:
                 self.action_cbf_memeory = np.zeros((self.totalTradeDay+1, self.stock_num))
         if len(self.solvable_flag) == 0:
-            self.solvable_flag = np.zeros(len(self.asset_lst))
+            self.solvable_flag = np.zeros(len(asset_lst))
         if len(self.risk_pred_lst) == 0:
-            self.risk_pred_lst = np.zeros(len(self.asset_lst))
+            self.risk_pred_lst = np.zeros(len(asset_lst))
   
         cbf_abssum_contribution = np.sum(np.abs(self.action_cbf_memeory[:-1]))
+
+        target_len = len(asset_lst)
+        def _align_array(arr, fill_value=0.0, target=target_len):
+            if isinstance(arr, list):
+                arr = np.array(arr)
+            if arr is None:
+                return np.full(target, fill_value, dtype=float)
+            arr = np.asarray(arr)
+            if arr.ndim == 0:
+                return np.full(target, float(arr), dtype=float)
+            if len(arr) > target:
+                return arr[:target]
+            if len(arr) < target:
+                pad_shape = (target - len(arr),) + arr.shape[1:]
+                pad = np.full(pad_shape, fill_value, dtype=arr.dtype)
+                return np.concatenate([arr, pad], axis=0)
+            return arr
+
+        final_action_abs = _align_array(np.sum(np.abs(np.array(self.actions_memory)), axis=1))
+        rl_action_abs = _align_array(np.sum(np.abs(np.array(self.action_rl_memory)), axis=1))
+        cbf_action_abs = _align_array(np.sum(np.abs(np.array(self.action_cbf_memeory)), axis=1))
 
         info_dict = {
             'ep': self.epoch, 'trading_days': self.totalTradeDay, 'annualReturn_pct': annualReturn_pct, 'volatility': volatility, 'sharpeRatio': sharpeRatio, 'sharpeRatio_wocbf': sharpeRatio_woCBF,
@@ -999,16 +1349,26 @@ class StockPortfolioEnv(gym.Env):
             'risk_downsideAtValue_daily_max': risk_downsideAtValue_daily_max, 'risk_downsideAtValue_daily_min': risk_downsideAtValue_daily_min, 'risk_downsideAtValue_daily_avg': risk_downsideAtValue_daily_avg,
             'cvar_max': cvar_max, 'cvar_min': cvar_min, 'cvar_avg': cvar_avg, 'cvar_raw_max': cvar_raw_max, 'cvar_raw_min': cvar_raw_min, 'cvar_raw_avg': cvar_raw_avg,
             'solver_solvable': self.solver_stat['solvable'], 'solver_insolvable': self.solver_stat['insolvable'], 'cputime': cputime_use, 'systime': systime_use,
-            'asset_lst': copy.deepcopy(self.asset_lst), 'daily_return_lst': copy.deepcopy(self.profit_lst), 'reward_lst': copy.deepcopy(self.reward_lst), 
-            'stg_vol_lst': copy.deepcopy(stg_vol_lst), 'risk_lst': copy.deepcopy(self.risk_cbf_lst), 'risk_wocbf_lst': copy.deepcopy(self.risk_raw_lst),
-            'capital_wocbf_lst': copy.deepcopy(self.return_raw_lst), 'daily_sr_lst': copy.deepcopy(dailySR), 'daily_sr_wocbf_lst': copy.deepcopy(dailySR_wocbf),
-            'risk_adj_lst': copy.deepcopy(self.risk_adj_lst), 'ctrl_weight_lst': copy.deepcopy(self.ctrl_weight_lst), 
-            'solvable_flag': copy.deepcopy(self.solvable_flag), 'risk_pred_lst': copy.deepcopy(self.risk_pred_lst),
-            'final_action_abssum_lst': copy.deepcopy(np.sum(np.abs(np.array(self.actions_memory)), axis=1)), 
-            'rl_action_abssum_lst': copy.deepcopy(np.sum(np.abs(np.array(self.action_rl_memory)), axis=1)[:-1]), 
-            'cbf_action_abssum_lst': copy.deepcopy(np.sum(np.abs(np.array(self.action_cbf_memeory)), axis=1)[:-1]), 
-            'daily_downsideAtVol_risk_lst': copy.deepcopy(risk_downsideAtVol_daily), 'daily_downsideAtValue_risk_lst': copy.deepcopy(risk_downsideAtValue_daily),
-            'cvar_lst': copy.deepcopy(self.cvar_lst), 'cvar_raw_lst': copy.deepcopy(self.cvar_raw_lst),
+            'asset_lst': asset_lst.copy(),
+            'daily_return_lst': profit_lst.copy(), 
+            'reward_lst': np.array(self.reward_lst).copy() if isinstance(self.reward_lst, list) else self.reward_lst.copy(), 
+            'stg_vol_lst': stg_vol_lst.copy() if isinstance(stg_vol_lst, np.ndarray) else np.array(stg_vol_lst).copy(), 
+            'risk_lst': np.array(self.risk_cbf_lst).copy() if isinstance(self.risk_cbf_lst, list) else self.risk_cbf_lst.copy(), 
+            'risk_wocbf_lst': np.array(self.risk_raw_lst).copy() if isinstance(self.risk_raw_lst, list) else self.risk_raw_lst.copy(),
+            'capital_wocbf_lst': np.array(self.return_raw_lst).copy() if isinstance(self.return_raw_lst, list) else self.return_raw_lst.copy(), 
+            'daily_sr_lst': dailySR.copy() if isinstance(dailySR, np.ndarray) else np.array(dailySR).copy(), 
+            'daily_sr_wocbf_lst': dailySR_wocbf.copy() if isinstance(dailySR_wocbf, np.ndarray) else np.array(dailySR_wocbf).copy(),
+            'risk_adj_lst': np.array(self.risk_adj_lst).copy() if isinstance(self.risk_adj_lst, list) else self.risk_adj_lst.copy(), 
+            'ctrl_weight_lst': np.array(self.ctrl_weight_lst).copy() if isinstance(self.ctrl_weight_lst, list) else self.ctrl_weight_lst.copy(), 
+            'solvable_flag': self.solvable_flag.copy() if isinstance(self.solvable_flag, np.ndarray) else np.array(self.solvable_flag).copy(), 
+            'risk_pred_lst': np.array(self.risk_pred_lst).copy() if isinstance(self.risk_pred_lst, list) else self.risk_pred_lst.copy(),
+            'final_action_abssum_lst': final_action_abs.copy(),
+            'rl_action_abssum_lst': rl_action_abs.copy(),
+            'cbf_action_abssum_lst': cbf_action_abs.copy(), 
+            'daily_downsideAtVol_risk_lst': risk_downsideAtVol_daily.copy() if isinstance(risk_downsideAtVol_daily, np.ndarray) else np.array(risk_downsideAtVol_daily).copy(), 
+            'daily_downsideAtValue_risk_lst': risk_downsideAtValue_daily.copy() if isinstance(risk_downsideAtValue_daily, np.ndarray) else np.array(risk_downsideAtValue_daily).copy(),
+            'cvar_lst': np.array(self.cvar_lst).copy() if isinstance(self.cvar_lst, list) else self.cvar_lst.copy(), 
+            'cvar_raw_lst': np.array(self.cvar_raw_lst).copy() if isinstance(self.cvar_raw_lst, list) else self.cvar_raw_lst.copy(),
         }
 
         return info_dict
@@ -1156,8 +1516,44 @@ class StockPortfolioEnv(gym.Env):
             if v is None or (isinstance(v, float) and np.isnan(v)):
                 v = current_capital  # Fallback to current capital
             
-            log_str = "Mode: {}, Ep: {}, Current epoch capital: {:.2f}, historical best captial ({} ep): {:.2f} | solvable: {}, insolvable: {} | step count: {} | cputime cur: {} s, avg: {} s, system time cur: {} s/ep, avg: {} s/ep..".format(
-                self.mode, self.epoch, current_capital, v_ep, v, 
+            # Map trained_best_model_type to display name for log message
+            field_display_name = {
+                'max_capital': 'capital',
+                'js_loss': 'reward_sum',
+                'pr_loss': 'reward_sum', 
+                'sr_loss': 'reward_sum',
+                'sharpeRatio': 'sharpeRatio',
+                'volatility': 'volatility',
+                'mdd': 'mdd'
+            }.get(self.config.trained_best_model_type, self.config.trained_best_model_type)
+            
+            # Print NaN statistics summary
+            total_nan_events = (self.nan_stats['cur_close_nan'] + self.nan_stats['last_close_nan'] + 
+                              self.nan_stats['poDayReturn_nan'] + self.nan_stats['updatePoValue_nan'])
+            if total_nan_events > 0:
+                print(f"\n[NaN Statistics] Epoch {self.epoch} - Total NaN events: {total_nan_events}", flush=True)
+                print(f"  - cur_close_price NaN/inf/<=0: {self.nan_stats['cur_close_nan']} times", flush=True)
+                print(f"  - last_close_price NaN/inf/<=0: {self.nan_stats['last_close_nan']} times", flush=True)
+                print(f"  - poDayReturn NaN/inf: {self.nan_stats['poDayReturn_nan']} times", flush=True)
+                print(f"  - updatePoValue NaN/inf/<=0: {self.nan_stats['updatePoValue_nan']} times", flush=True)
+                
+                # Print sample details (first few occurrences)
+                if len(self.nan_stats['cur_close_details']) > 0:
+                    print(f"  Sample cur_close NaN events (showing first {min(3, len(self.nan_stats['cur_close_details']))}):", flush=True)
+                    for detail in self.nan_stats['cur_close_details'][:3]:
+                        print(f"    Day {detail['day']} ({detail['date']}): stock={detail['stock']}, value={detail['value']}, fallback={detail['fallback']}", flush=True)
+                if len(self.nan_stats['poDayReturn_details']) > 0:
+                    print(f"  Sample poDayReturn NaN events (showing first {min(3, len(self.nan_stats['poDayReturn_details']))}):", flush=True)
+                    for detail in self.nan_stats['poDayReturn_details'][:3]:
+                        print(f"    Day {detail['day']} ({detail['date']}): value={detail['value']}", flush=True)
+                if len(self.nan_stats['updatePoValue_details']) > 0:
+                    print(f"  Sample updatePoValue NaN events (showing first {min(3, len(self.nan_stats['updatePoValue_details']))}):", flush=True)
+                    for detail in self.nan_stats['updatePoValue_details'][:3]:
+                        print(f"    Day {detail['day']} ({detail['date']}): value={detail['value']}, prev_capital={detail['prev_capital']:.2f}, poDayReturn={detail['poDayReturn']}", flush=True)
+                print("", flush=True)
+            
+            log_str = "Mode: {}, Ep: {}, Current epoch capital: {:.2f}, historical best {} ({} ep): {:.2f} | solvable: {}, insolvable: {} | step count: {} | cputime cur: {} s, avg: {} s, system time cur: {} s/ep, avg: {} s/ep..".format(
+                self.mode, self.epoch, current_capital, field_display_name, v_ep, v, 
                 np.array(phist_df['solver_solvable'])[-1], 
                 np.array(phist_df['solver_insolvable'])[-1], 
                 self.stepcount, 
@@ -1213,47 +1609,106 @@ class StockPortfolioEnv(gym.Env):
 
         # save data of each step in 1st/best/last model
         fpath = os.path.join(self.config.res_dir, '{}_stepdata.csv'.format(self.mode))
+        target_len = len(invest_profile['asset_lst']) if 'asset_lst' in invest_profile else len(self.asset_lst)
+
+        def _align_profile_array(arr, fill_value=0.0):
+            if arr is None:
+                return np.full(target_len, fill_value)
+            if isinstance(arr, list):
+                arr = np.asarray(arr)
+            elif not isinstance(arr, np.ndarray):
+                arr = np.full(target_len, arr)
+            arr = np.asarray(arr)
+            if arr.ndim == 0:
+                return np.full(target_len, float(arr))
+            if len(arr) > target_len:
+                return arr[:target_len]
+            if len(arr) < target_len:
+                pad = np.full(target_len - len(arr), fill_value)
+                return np.concatenate([arr, pad], axis=0)
+            return arr
         if not os.path.exists(fpath):
-            step_data = {'capital_policy_1': invest_profile['asset_lst'], 'dailyReturn_policy_1': invest_profile['daily_return_lst'],
-                        'reward_policy_1': invest_profile['reward_lst'], 'strategyVolatility_policy_1': invest_profile['stg_vol_lst'],
-                        'risk_policy_1': invest_profile['risk_lst'], 'risk_wocbf_policy_1': invest_profile['risk_wocbf_lst'], 'capital_wocbf_policy_1': invest_profile['capital_wocbf_lst'],
-                        'dailySR_policy_1': invest_profile['daily_sr_lst'], 'dailySR_wocbf_policy_1': invest_profile['daily_sr_wocbf_lst'], 
-                        'riskAccepted_policy_1': invest_profile['risk_adj_lst'],
-                        'ctrlWeight_policy_1': invest_profile['ctrl_weight_lst'],
-                        'solvable_flag_policy_1': invest_profile['solvable_flag'],
-                        'risk_pred_policy_1': invest_profile['risk_pred_lst'],
-                        'final_action_abssum_policy_1': invest_profile['final_action_abssum_lst'],
-                        'rl_action_abssum_policy_1': invest_profile['rl_action_abssum_lst'],
-                        'cbf_action_abssum_policy_1': invest_profile['cbf_action_abssum_lst'],
-                        'downsideAtVol_risk_policy_1': invest_profile['daily_downsideAtVol_risk_lst'],
-                        'downsideAtValue_risk_policy_1': invest_profile['daily_downsideAtValue_risk_lst'],
-                        'cvar_policy_1': invest_profile['cvar_lst'], 'cvar_raw_policy_1': invest_profile['cvar_raw_lst'],
-                        }
-            step_data = pd.DataFrame(step_data)
+            # Check if we're resuming from a checkpoint (arrays may have inconsistent lengths)
+            is_resuming = hasattr(self, '_is_resuming') and self._is_resuming
+            if is_resuming:
+                print(f"[SAVE_PROFILE] Skipping stepdata.csv creation during resume (arrays may have inconsistent lengths)")
+                # Create empty DataFrame with correct columns for future appends
+                step_data = pd.DataFrame(columns=[
+                    'date', 'capital_policy_1', 'dailyReturn_policy_1', 'reward_policy_1',
+                    'strategyVolatility_policy_1', 'risk_policy_1', 'risk_wocbf_policy_1', 'capital_wocbf_policy_1',
+                    'dailySR_policy_1', 'dailySR_wocbf_policy_1', 'riskAccepted_policy_1', 'ctrlWeight_policy_1',
+                    'solvable_flag_policy_1', 'risk_pred_policy_1', 'final_action_abssum_policy_1',
+                    'rl_action_abssum_policy_1', 'cbf_action_abssum_policy_1', 'downsideAtVol_risk_policy_1',
+                    'downsideAtValue_risk_policy_1', 'cvar_policy_1', 'cvar_raw_policy_1'
+                ])
+                step_data.to_csv(fpath, index=False)
+            else:
+                # Ensure all arrays have the same length for fresh training
+                array_length = len(invest_profile['asset_lst'])
+                print(f"[SAVE_PROFILE] Creating new stepdata.csv with {array_length} rows")
+
+                step_data = {
+                    'date': self.date_memory[:array_length] if len(self.date_memory) >= array_length else self.date_memory + [''] * (array_length - len(self.date_memory)),
+                    'capital_policy_1': _align_profile_array(invest_profile['asset_lst']).tolist(),
+                    'dailyReturn_policy_1': _align_profile_array(invest_profile['daily_return_lst']).tolist(),
+                    'reward_policy_1': _align_profile_array(invest_profile['reward_lst']).tolist(),
+                    'strategyVolatility_policy_1': _align_profile_array(invest_profile['stg_vol_lst']).tolist(),
+                    'risk_policy_1': _align_profile_array(invest_profile['risk_lst']).tolist(),
+                    'risk_wocbf_policy_1': _align_profile_array(invest_profile['risk_wocbf_lst']).tolist(),
+                    'capital_wocbf_policy_1': _align_profile_array(invest_profile['capital_wocbf_lst']).tolist(),
+                    'dailySR_policy_1': _align_profile_array(invest_profile['daily_sr_lst']).tolist(),
+                    'dailySR_wocbf_policy_1': _align_profile_array(invest_profile['daily_sr_wocbf_lst']).tolist(),
+                    'riskAccepted_policy_1': _align_profile_array(invest_profile['risk_adj_lst']).tolist(),
+                    'ctrlWeight_policy_1': _align_profile_array(invest_profile['ctrl_weight_lst']).tolist(),
+                    'solvable_flag_policy_1': _align_profile_array(invest_profile['solvable_flag']).tolist(),
+                    'risk_pred_policy_1': _align_profile_array(invest_profile['risk_pred_lst']).tolist(),
+                    'final_action_abssum_policy_1': _align_profile_array(invest_profile['final_action_abssum_lst']).tolist(),
+                    'rl_action_abssum_policy_1': _align_profile_array(invest_profile['rl_action_abssum_lst']).tolist(),
+                    'cbf_action_abssum_policy_1': _align_profile_array(invest_profile['cbf_action_abssum_lst']).tolist(),
+                    'downsideAtVol_risk_policy_1': _align_profile_array(invest_profile['daily_downsideAtVol_risk_lst']).tolist(),
+                    'downsideAtValue_risk_policy_1': _align_profile_array(invest_profile['daily_downsideAtValue_risk_lst']).tolist(),
+                    'cvar_policy_1': _align_profile_array(invest_profile['cvar_lst']).tolist(),
+                    'cvar_raw_policy_1': _align_profile_array(invest_profile['cvar_raw_lst']).tolist(),
+                }
+
+                # Verify all arrays have same length
+                lengths = [len(v) for v in step_data.values()]
+                if len(set(lengths)) != 1:
+                    print(f"[SAVE_PROFILE] ERROR: Arrays have different lengths: {dict(zip(step_data.keys(), lengths))}")
+                    raise ValueError("Cannot create stepdata.csv: arrays have inconsistent lengths")
+
+                step_data = pd.DataFrame(step_data)
         else:
             step_data = pd.DataFrame(pd.read_csv(fpath, header=0))
-            
+
+        # Only update best model columns if this is the best model and arrays have consistent length
         if bestmodel_dict['{}_ep'.format(self.config.trained_best_model_type)] == invest_profile['ep']:
-            step_data['capital_policy_best'] = invest_profile['asset_lst']
-            step_data['dailyReturn_policy_best'] = invest_profile['daily_return_lst']
-            step_data['reward_policy_best'] = invest_profile['reward_lst']
-            step_data['strategyVolatility_policy_best'] = invest_profile['stg_vol_lst']  
-            step_data['risk_policy_best'] = invest_profile['risk_lst']
-            step_data['risk_wocbf_policy_best'] = invest_profile['risk_wocbf_lst']
-            step_data['capital_wocbf_policy_best'] = invest_profile['capital_wocbf_lst']
-            step_data['dailySR_policy_best'] = invest_profile['daily_sr_lst']
-            step_data['dailySR_wocbf_policy_best'] = invest_profile['daily_sr_wocbf_lst']
-            step_data['riskAccepted_policy_best'] = invest_profile['risk_adj_lst']
-            step_data['ctrlWeight_policy_best'] = invest_profile['ctrl_weight_lst']
-            step_data['solvable_flag_policy_best'] = invest_profile['solvable_flag']
-            step_data['risk_pred_policy_best'] = invest_profile['risk_pred_lst']
-            step_data['final_action_abssum_policy_best'] = invest_profile['final_action_abssum_lst']
-            step_data['rl_action_abssum_policy_best'] = invest_profile['rl_action_abssum_lst']
-            step_data['cbf_action_abssum_policy_best'] = invest_profile['cbf_action_abssum_lst']
-            step_data['downsideAtVol_risk_policy_best'] = invest_profile['daily_downsideAtVol_risk_lst']
-            step_data['downsideAtValue_risk_policy_best'] = invest_profile['daily_downsideAtValue_risk_lst']
-            step_data['cvar_policy_best'] = invest_profile['cvar_lst']
-            step_data['cvar_raw_policy_best'] = invest_profile['cvar_raw_lst']
+            # Check if step_data is empty (resume case) or has matching length
+            if len(step_data) == 0:
+                print(f"[SAVE_PROFILE] Skipping best model update for resume case (empty step_data)")
+            elif len(step_data) == len(invest_profile['asset_lst']):
+                step_data['capital_policy_best'] = _align_profile_array(invest_profile['asset_lst']).tolist()
+                step_data['dailyReturn_policy_best'] = _align_profile_array(invest_profile['daily_return_lst']).tolist()
+                step_data['reward_policy_best'] = _align_profile_array(invest_profile['reward_lst']).tolist()
+                step_data['strategyVolatility_policy_best'] = _align_profile_array(invest_profile['stg_vol_lst']).tolist()
+                step_data['risk_policy_best'] = _align_profile_array(invest_profile['risk_lst']).tolist()
+                step_data['risk_wocbf_policy_best'] = _align_profile_array(invest_profile['risk_wocbf_lst']).tolist()
+                step_data['capital_wocbf_policy_best'] = _align_profile_array(invest_profile['capital_wocbf_lst']).tolist()
+                step_data['dailySR_policy_best'] = _align_profile_array(invest_profile['daily_sr_lst']).tolist()
+                step_data['dailySR_wocbf_policy_best'] = _align_profile_array(invest_profile['daily_sr_wocbf_lst']).tolist()
+                step_data['riskAccepted_policy_best'] = _align_profile_array(invest_profile['risk_adj_lst']).tolist()
+                step_data['ctrlWeight_policy_best'] = _align_profile_array(invest_profile['ctrl_weight_lst']).tolist()
+                step_data['solvable_flag_policy_best'] = _align_profile_array(invest_profile['solvable_flag']).tolist()
+                step_data['risk_pred_policy_best'] = _align_profile_array(invest_profile['risk_pred_lst']).tolist()
+                step_data['final_action_abssum_policy_best'] = _align_profile_array(invest_profile['final_action_abssum_lst']).tolist()
+                step_data['rl_action_abssum_policy_best'] = _align_profile_array(invest_profile['rl_action_abssum_lst']).tolist()
+                step_data['cbf_action_abssum_policy_best'] = _align_profile_array(invest_profile['cbf_action_abssum_lst']).tolist()
+                step_data['downsideAtVol_risk_policy_best'] = _align_profile_array(invest_profile['daily_downsideAtVol_risk_lst']).tolist()
+                step_data['downsideAtValue_risk_policy_best'] = _align_profile_array(invest_profile['daily_downsideAtValue_risk_lst']).tolist()
+                step_data['cvar_policy_best'] = _align_profile_array(invest_profile['cvar_lst']).tolist()
+                step_data['cvar_raw_policy_best'] = _align_profile_array(invest_profile['cvar_raw_lst']).tolist()
+            else:
+                print(f"[SAVE_PROFILE] Skipping best model update: step_data length ({len(step_data)}) != invest_profile arrays length ({len(invest_profile['asset_lst'])})")
         # Record the test set performance on valid_best_policy
         if self.mode == 'test':
             valid_fpath = os.path.join(self.config.res_dir, 'valid_bestmodel.csv')
@@ -1285,26 +1740,26 @@ class StockPortfolioEnv(gym.Env):
                 print(log_str)
 
         if invest_profile['ep'] == self.config.num_epochs:
-            step_data['capital_policy_last'] = invest_profile['asset_lst']
-            step_data['dailyReturn_policy_last'] = invest_profile['daily_return_lst']
-            step_data['reward_policy_last'] = invest_profile['reward_lst']
-            step_data['strategyVolatility_policy_last'] = invest_profile['stg_vol_lst']
-            step_data['risk_policy_last'] = invest_profile['risk_lst']
-            step_data['risk_wocbf_policy_last'] = invest_profile['risk_wocbf_lst']
-            step_data['capital_wocbf_policy_last'] = invest_profile['capital_wocbf_lst']
-            step_data['dailySR_policy_last'] = invest_profile['daily_sr_lst']
-            step_data['dailySR_wocbf_policy_last'] = invest_profile['daily_sr_wocbf_lst']
-            step_data['riskAccepted_policy_last'] = invest_profile['risk_adj_lst']  
-            step_data['ctrlWeight_policy_last'] = invest_profile['ctrl_weight_lst']   
-            step_data['solvable_flag_policy_last'] = invest_profile['solvable_flag'] 
-            step_data['risk_pred_policy_last'] = invest_profile['risk_pred_lst']
-            step_data['final_action_abssum_policy_last'] = invest_profile['final_action_abssum_lst']
-            step_data['rl_action_abssum_policy_last'] = invest_profile['rl_action_abssum_lst']
-            step_data['cbf_action_abssum_policy_last'] = invest_profile['cbf_action_abssum_lst']   
-            step_data['downsideAtVol_risk_policy_last'] = invest_profile['daily_downsideAtVol_risk_lst']
-            step_data['downsideAtValue_risk_policy_last'] = invest_profile['daily_downsideAtValue_risk_lst']
-            step_data['cvar_policy_last'] = invest_profile['cvar_lst']
-            step_data['cvar_raw_policy_last'] = invest_profile['cvar_raw_lst']
+            step_data['capital_policy_last'] = _align_profile_array(invest_profile['asset_lst']).tolist()
+            step_data['dailyReturn_policy_last'] = _align_profile_array(invest_profile['daily_return_lst']).tolist()
+            step_data['reward_policy_last'] = _align_profile_array(invest_profile['reward_lst']).tolist()
+            step_data['strategyVolatility_policy_last'] = _align_profile_array(invest_profile['stg_vol_lst']).tolist()
+            step_data['risk_policy_last'] = _align_profile_array(invest_profile['risk_lst']).tolist()
+            step_data['risk_wocbf_policy_last'] = _align_profile_array(invest_profile['risk_wocbf_lst']).tolist()
+            step_data['capital_wocbf_policy_last'] = _align_profile_array(invest_profile['capital_wocbf_lst']).tolist()
+            step_data['dailySR_policy_last'] = _align_profile_array(invest_profile['daily_sr_lst']).tolist()
+            step_data['dailySR_wocbf_policy_last'] = _align_profile_array(invest_profile['daily_sr_wocbf_lst']).tolist()
+            step_data['riskAccepted_policy_last'] = _align_profile_array(invest_profile['risk_adj_lst']).tolist()  
+            step_data['ctrlWeight_policy_last'] = _align_profile_array(invest_profile['ctrl_weight_lst']).tolist()   
+            step_data['solvable_flag_policy_last'] = _align_profile_array(invest_profile['solvable_flag']).tolist() 
+            step_data['risk_pred_policy_last'] = _align_profile_array(invest_profile['risk_pred_lst']).tolist()
+            step_data['final_action_abssum_policy_last'] = _align_profile_array(invest_profile['final_action_abssum_lst']).tolist()
+            step_data['rl_action_abssum_policy_last'] = _align_profile_array(invest_profile['rl_action_abssum_lst']).tolist()
+            step_data['cbf_action_abssum_policy_last'] = _align_profile_array(invest_profile['cbf_action_abssum_lst']).tolist()   
+            step_data['downsideAtVol_risk_policy_last'] = _align_profile_array(invest_profile['daily_downsideAtVol_risk_lst']).tolist()
+            step_data['downsideAtValue_risk_policy_last'] = _align_profile_array(invest_profile['daily_downsideAtValue_risk_lst']).tolist()
+            step_data['cvar_policy_last'] = _align_profile_array(invest_profile['cvar_lst']).tolist()
+            step_data['cvar_raw_policy_last'] = _align_profile_array(invest_profile['cvar_raw_lst']).tolist()
         step_data.to_csv(fpath, index=False)
         
         # Save detailed portfolio weights (actions) to separate file
@@ -1685,10 +2140,8 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             print(f"[Profile Save] save_profile() completed for epoch {self.epoch}", flush=True)
 
             # Return format compatible with both gym and gymnasium
-            if GYMNASIUM_AVAILABLE:
-                return self.state, self.reward, self.terminal, False, {}
-            else:
-                return self.state, self.reward, self.terminal, {}
+            # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
+            return self.state, self.reward, self.terminal, False, {}
         else:
             actions = np.reshape(actions, (-1)) # [1, num_of_stocks] or [num_of_stocks, ]
             weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights 
@@ -1696,8 +2149,48 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             if self.curTradeDay == 0:
                 self.cur_capital = self.cur_capital * (1 - (1-1/len(weights)) * self.transaction_cost)
             else:
-                cur_p = np.array(self.curData['close'].values) * (1 + self.cur_slippage_drift)
-                last_p = np.array(self.lastDayData['close'].values) * (1 + self.last_slippage_drift)
+                # Ensure curData and lastDayData prices are aligned with stock_lst
+                cur_close_prices = np.zeros(self.stock_num)
+                last_close_prices = np.zeros(self.stock_num)
+                for i, stock in enumerate(self.stock_lst):
+                    if stock in self.curData['stock'].values:
+                        close_val = self.curData[self.curData['stock'] == stock]['close'].values[0]
+                        # Validate and sanitize NaN/inf/<=0 to prevent NaN propagation
+                        if pd.isna(close_val) or np.isinf(close_val) or close_val <= 0:
+                            # Fallback: use last known price or 1.0
+                            if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
+                                last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                                if not (pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0):
+                                    cur_close_prices[i] = last_close_val
+                                else:
+                                    cur_close_prices[i] = 1.0
+                            else:
+                                cur_close_prices[i] = 1.0
+                        else:
+                            cur_close_prices[i] = close_val
+                    else:
+                        cur_close_prices[i] = 1.0  # Default to no change if missing
+                    
+                    if self.lastDayData is not None and stock in self.lastDayData['stock'].values:
+                        last_close_val = self.lastDayData[self.lastDayData['stock'] == stock]['close'].values[0]
+                        # Validate and sanitize NaN/inf/<=0
+                        if pd.isna(last_close_val) or np.isinf(last_close_val) or last_close_val <= 0:
+                            # Fallback: use current price or 1.0
+                            if not (pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0):
+                                last_close_prices[i] = cur_close_prices[i]
+                            else:
+                                last_close_prices[i] = 1.0
+                        else:
+                            last_close_prices[i] = last_close_val
+                    else:
+                        # Validate cur_close_prices before using
+                        if pd.isna(cur_close_prices[i]) or np.isinf(cur_close_prices[i]) or cur_close_prices[i] <= 0:
+                            last_close_prices[i] = 1.0
+                        else:
+                            last_close_prices[i] = cur_close_prices[i]  # Use current if last not available
+                
+                cur_p = cur_close_prices * (1 + self.cur_slippage_drift)
+                last_p = last_close_prices * (1 + self.last_slippage_drift)
                 x_p = cur_p / last_p
                 last_action = np.array(self.actions_memory[-2])
                 last_action = np.append([1.0 - np.sum(np.abs(last_action))], last_action, axis=0) # cash
@@ -1946,7 +2439,5 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             self.model_save_flag = False
 
             # Return format compatible with both gym and gymnasium
-            if GYMNASIUM_AVAILABLE:
-                return self.state, self.reward, self.terminal, False, {}
-            else:
-                return self.state, self.reward, self.terminal, {}
+            # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
+            return self.state, self.reward, self.terminal, False, {}

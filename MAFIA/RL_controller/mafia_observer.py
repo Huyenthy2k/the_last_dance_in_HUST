@@ -360,17 +360,28 @@ class MAFIAObserver:
         # Gradient clipping (optional but recommended)
         th.nn.utils.clip_grad_norm_(self.mafia_model.parameters(), max_norm=1.0)
         
-        if th.cuda.is_available():
-            th.cuda.synchronize()
-        
         self.optimizer.step()
         self.lr_scheduler.step()
         
         # Logging
-        disp_str = '{} | Loss(MAFIA): {} |'.format(
+        if th.cuda.is_available():
+            th.cuda.synchronize()
+        disp_str = '[MAFIA] Mode: {} | Loss(MAFIA): {:.6f}'.format(
             mode, 
             total_loss.detach().cpu().item()
         )
+        td3_actor = getattr(self.config, 'last_td3_actor_loss', None)
+        td3_critic = getattr(self.config, 'last_td3_critic_loss', None)
+        td3_reward = getattr(self.config, 'last_td3_mean_reward', None)
+        td3_updates = getattr(self.config, 'last_td3_updates', None)
+        if td3_actor is not None and td3_critic is not None:
+            disp_str += " | [TD3] updates={} actor_loss={:.6f} critic_loss={:.6f}".format(
+                td3_updates if td3_updates is not None else 'N/A',
+                td3_actor,
+                td3_critic
+            )
+            if td3_reward is not None:
+                disp_str += " reward={:.6f}".format(td3_reward)
         print(disp_str)
         
         # Reset buffers
@@ -486,4 +497,3 @@ class MAFIAObserver:
         print(f"MAFIA Observer checkpoint loaded from {checkpoint_path} (epoch {epoch})", flush=True)
         
         return epoch
-

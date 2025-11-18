@@ -66,6 +66,64 @@ class MAFIADataLoader:
         # MAFIA computes change features on-the-fly, no need for pre-computed columns
         base_data = data[required_cols].copy()
         
+        # Remove rows with invalid price values (<=0 or NaN)
+        price_cols = ['open', 'high', 'low', 'close']
+        price_mask = np.ones(len(base_data), dtype=bool)
+        for col in price_cols:
+            price_mask &= base_data[col] > 0
+        invalid_price_rows = len(base_data) - price_mask.sum()
+        if invalid_price_rows > 0:
+            print(f"[MAFIA] Filtering out {invalid_price_rows} rows with non-positive price values", flush=True)
+        base_data = base_data[price_mask].copy()
+        base_data.reset_index(drop=True, inplace=True)
+        
+        # Remove rows with negative volume (allow zero volume for inactive days)
+        vol_mask = base_data['volume'] >= 0
+        invalid_vol_rows = len(base_data) - vol_mask.sum()
+        if invalid_vol_rows > 0:
+            print(f"[MAFIA] Filtering out {invalid_vol_rows} rows with negative volume", flush=True)
+        base_data = base_data[vol_mask].copy()
+        base_data.reset_index(drop=True, inplace=True)
+        
+        # Drop stocks that have excessive zero-volume days
+        zero_volume_counts = base_data[base_data['volume'] == 0].groupby('stock').size()
+        zero_threshold = getattr(self.config, 'max_zero_volume_days', 100)
+        drop_stocks = zero_volume_counts[zero_volume_counts > zero_threshold].index.tolist()
+        if drop_stocks:
+            print(f"[MAFIA] Removing {len(drop_stocks)} stocks with more than {zero_threshold} zero-volume days", flush=True)
+            base_data = base_data[~base_data['stock'].isin(drop_stocks)].copy()
+            base_data.reset_index(drop=True, inplace=True)
+
+        # Pre-compute date masks for splits
+        train_mask = (base_data['date'] >= self.config.train_date_start) & (base_data['date'] <= self.config.train_date_end)
+        valid_mask_dates = None
+        test_mask_dates = None
+        if (self.config.valid_date_start is not None) and (self.config.valid_date_end is not None):
+            valid_mask_dates = (base_data['date'] >= self.config.valid_date_start) & (base_data['date'] <= self.config.valid_date_end)
+        if (self.config.test_date_start is not None) and (self.config.test_date_end is not None):
+            test_mask_dates = (base_data['date'] >= self.config.test_date_start) & (base_data['date'] <= self.config.test_date_end)
+        
+        # Ensure we only keep stocks available in every split
+        common_stocks = set(base_data.loc[train_mask, 'stock'])
+        if valid_mask_dates is not None:
+            common_stocks &= set(base_data.loc[valid_mask_dates, 'stock'])
+        if test_mask_dates is not None:
+            common_stocks &= set(base_data.loc[test_mask_dates, 'stock'])
+        if not common_stocks:
+            raise ValueError("No common stocks found across train/valid/test splits. Check data availability.")
+        total_before = base_data['stock'].nunique()
+        if len(common_stocks) < total_before:
+            print(f"[MAFIA] Using {len(common_stocks)} common stocks across splits (dropped {total_before - len(common_stocks)})", flush=True)
+        base_data = base_data[base_data['stock'].isin(common_stocks)].copy()
+        base_data.reset_index(drop=True, inplace=True)
+        
+        # Recompute masks after filtering
+        train_mask = (base_data['date'] >= self.config.train_date_start) & (base_data['date'] <= self.config.train_date_end)
+        if valid_mask_dates is not None:
+            valid_mask_dates = (base_data['date'] >= self.config.valid_date_start) & (base_data['date'] <= self.config.valid_date_end)
+        if test_mask_dates is not None:
+            test_mask_dates = (base_data['date'] >= self.config.test_date_start) & (base_data['date'] <= self.config.test_date_end)
+        
         # Compute DAILYRETURNS for compatibility with environment (used in reward calc)
         # This is a lightweight computation compared to full preprocessing
         lookback = getattr(self.config, 'dailyRetun_lookback', 5)
@@ -117,13 +175,13 @@ class MAFIADataLoader:
         # Process fine-grained features (for extra_data)
         # This is lightweight windowed data needed by MAFIAObserver
         print("[MAFIA] Processing fine-grained features for extra_data...", flush=True)
-        dataset_dict['extra_train'] = self._process_fine_data(data, 'train')
+        dataset_dict['extra_train'] = self._process_fine_data(base_data, 'train')
         if dataset_dict['valid'] is not None:
-            dataset_dict['extra_valid'] = self._process_fine_data(data, 'valid')
+            dataset_dict['extra_valid'] = self._process_fine_data(base_data, 'valid')
         else:
             dataset_dict['extra_valid'] = None
         if dataset_dict['test'] is not None:
-            dataset_dict['extra_test'] = self._process_fine_data(data, 'test')
+            dataset_dict['extra_test'] = self._process_fine_data(base_data, 'test')
         else:
             dataset_dict['extra_test'] = None
         
@@ -361,4 +419,3 @@ class MAFIADataLoader:
         
         result_data = pd.concat(result_lst, ignore_index=True)
         return result_data
-

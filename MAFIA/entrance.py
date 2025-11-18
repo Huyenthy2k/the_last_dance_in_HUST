@@ -16,6 +16,7 @@ import numpy as np
 import torch as th
 import datetime
 import copy
+DEFAULT_RUN_SEED = 2022
 
 # Set CUDA device if available, otherwise use CPU
 if th.cuda.is_available():
@@ -35,6 +36,7 @@ import pandas as pd
 import time
 import json
 import os
+import pickle
 from config import Config
 from utils.featGen import FeatureProcesser
 from utils.tradeEnv import StockPortfolioEnv, StockPortfolioEnv_cash
@@ -188,23 +190,67 @@ def RLcontroller(config):
             print(f"Checkpoint type: {checkpoint_type}", flush=True)
             print(f"Resuming from epoch {start_epoch}, day {day_in_epoch}, timestep {checkpoint_timesteps}", flush=True)
             
-            # Set environment epoch to match checkpoint epoch
-            # Note: When stable-baselines3 calls reset() in learn(), it will increment epoch by 1
-            # Since we're resuming from a checkpoint (even if mid-epoch), we want to start a NEW epoch
-            # So if checkpoint is epoch 1, we set env.epoch = start_epoch, and after reset() it becomes start_epoch + 1
-            if hasattr(env_train, 'epoch'):
-                # Set to start_epoch so that after reset() it becomes start_epoch + 1 (new epoch)
-                # This ensures we start a fresh epoch when resuming, not continue the old one
-                env_train.epoch = start_epoch
-                print(f"Set environment epoch to {start_epoch} (will become epoch {start_epoch + 1} after reset)", flush=True)
+            # Check if this is a mid-epoch resume (day_in_epoch > 0 means we're in the middle of an epoch)
+            env_state_path = checkpoint_info.get('env_state_path', None)
+            is_mid_epoch_resume = (day_in_epoch > 0) and (env_state_path is not None) and os.path.exists(env_state_path)
+            
+            if is_mid_epoch_resume:
+                # For mid-epoch resume: set epoch to start_epoch - 1 so after reset() it becomes start_epoch
+                # Then we'll restore the full state (including curTradeDay) after reset()
+                if hasattr(env_train, 'epoch'):
+                    env_train.epoch = start_epoch - 1
+                    print(f"Mid-epoch resume detected: set env.epoch to {start_epoch - 1} (will become {start_epoch} after reset)", flush=True)
+                    print(f"Will restore environment state from {env_state_path} after reset()", flush=True)
+                # Store env_state_path in environment for callback to restore after reset()
+                env_train._resume_env_state_path = env_state_path
+            else:
+                # For epoch-end resume: set epoch to start_epoch so after reset() it becomes start_epoch + 1 (new epoch)
+                if hasattr(env_train, 'epoch'):
+                    env_train.epoch = start_epoch
+                    print(f"Epoch-end resume: set env.epoch to {start_epoch} (will become {start_epoch + 1} after reset)", flush=True)
+                # Clear any previous resume state path
+                if hasattr(env_train, '_resume_env_state_path'):
+                    delattr(env_train, '_resume_env_state_path')
+            
+            # Restore RNG state if available
+            rng_state_path = checkpoint_info.get('rng_state_path', None)
+            if rng_state_path and os.path.exists(rng_state_path):
+                try:
+                    with open(rng_state_path, 'rb') as f:
+                        rng_state = pickle.load(f)
+                    seed_from_rng = rng_state.get('seed_num', None)
+                    if seed_from_rng is not None:
+                        config.seed_num = seed_from_rng
+                    py_state = rng_state.get('python_random')
+                    if py_state is not None:
+                        random.setstate(py_state)
+                    np_state = rng_state.get('numpy_random')
+                    if np_state is not None:
+                        np.random.set_state(np_state)
+                    torch_state = rng_state.get('torch_cpu')
+                    if torch_state is not None:
+                        th.set_rng_state(torch_state)
+                    torch_cuda_state = rng_state.get('torch_cuda')
+                    if torch_cuda_state is not None and th.cuda.is_available():
+                        th.cuda.set_rng_state_all(torch_cuda_state)
+                    print(f"[RESUME] RNG state restored from {rng_state_path}", flush=True)
+                except Exception as e:
+                    print(f"[RESUME] Warning: Failed to restore RNG state: {e}", flush=True)
+            else:
+                if rng_state_path:
+                    print(f"[RESUME] RNG state file not found at {rng_state_path}", flush=True)
         
         # Load RL model from checkpoint
         rl_checkpoint_path = os.path.join(checkpoint_dir, 'rl_model.zip')
         if os.path.exists(rl_checkpoint_path):
             po_model = ModelCls.load(rl_checkpoint_path, env=env_train)
+            po_model.mafia_config = config
+            po_model.verbose = 1
             print(f"RL model loaded from {rl_checkpoint_path}", flush=True)
         else:
             po_model = ModelCls(env=env_train, **model_para_dict)
+            po_model.mafia_config = config
+            po_model.verbose = 1
             print(f"Warning: RL checkpoint not found, starting fresh", flush=True)
         
         # Load MAFIA observer from checkpoint if exists
@@ -220,6 +266,8 @@ def RLcontroller(config):
                 print(f"Warning: MAFIA observer checkpoint not found, starting fresh", flush=True)
     else:
         po_model = ModelCls(env=env_train, **model_para_dict)
+        po_model.mafia_config = config
+        po_model.verbose = 1
     
     # Calculate remaining timesteps and epochs
     # If resuming from checkpoint, calculate from checkpoint timesteps
@@ -290,7 +338,11 @@ def entrance():
     This codebase now exclusively runs MAFIA (RLcontroller with MAFIA observer).
     """
     current_date = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-    rand_seed = int(time.mktime(datetime.datetime.strptime(current_date, '%Y-%m-%d-%H-%M-%S').timetuple()))
+    seed_env = os.environ.get('MAFIA_SEED')
+    try:
+        rand_seed = int(seed_env) if seed_env is not None else DEFAULT_RUN_SEED
+    except ValueError:
+        rand_seed = DEFAULT_RUN_SEED
 
     random.seed(rand_seed)
     os.environ['PYTHONHASHSEED'] = str(rand_seed)
