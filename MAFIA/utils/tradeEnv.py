@@ -30,6 +30,7 @@ except ImportError:
     GYM_SEEDING_AVAILABLE = False
 from stable_baselines3.common.vec_env import DummyVecEnv
 from scipy.stats import entropy
+from scipy.spatial.distance import jensenshannon
 import scipy.stats as spstats
 try:
     from utils.weight_symbol_mapper import get_top_stocks
@@ -86,6 +87,74 @@ def _safe_array_from_values(values):
             else:
                 result.append(float(v) if isinstance(v, (int, float, np.number)) else 0.0)
         return np.array(result)
+
+def _fillna_infer(series, value=0.0):
+    """
+    Fill NaN values and infer numeric dtypes without triggering pandas FutureWarning.
+    """
+    if hasattr(series, "infer_objects"):
+        series = series.infer_objects(copy=False)
+    filled = series.fillna(value)
+    if hasattr(filled, "infer_objects"):
+        filled = filled.infer_objects(copy=False)
+    return filled
+
+def _normalize_prob(vec):
+    vec = np.array(vec, dtype=float).flatten()
+    if vec.size == 0:
+        return vec
+    vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+    vec = np.clip(vec, 1e-12, None)
+    total = np.sum(vec)
+    if total <= 1e-12:
+        return np.ones_like(vec) / len(vec)
+    return vec / total
+
+def _build_cov_from_indicator(values, target_size, fallback):
+    """
+    Build a covariance matrix compatible with target_size based on indicator values.
+    Falls back to scaled identity when insufficient data.
+    """
+    arr = _safe_array_from_values(values)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    elif arr.ndim > 1:
+        arr = arr.flatten()
+
+    if arr.size < 2:
+        return np.eye(target_size) * fallback
+
+    try:
+        cov = np.cov(arr)
+    except Exception:
+        cov = np.array([[np.var(arr)]])
+
+    cov = np.nan_to_num(cov, nan=fallback, posinf=fallback, neginf=fallback)
+    if cov.ndim == 0:
+        cov = np.eye(target_size) * float(cov)
+    elif cov.ndim == 1:
+        cov = np.diag(cov)
+
+    if cov.shape[0] != target_size or cov.shape[1] != target_size:
+        if cov.size == 1:
+            cov = np.eye(target_size) * float(cov.flat[0])
+        else:
+            if cov.shape[0] < target_size:
+                pad = target_size - cov.shape[0]
+                cov = np.pad(
+                    cov,
+                    ((0, pad), (0, pad)),
+                    mode='constant',
+                    constant_values=fallback
+                )
+                np.fill_diagonal(cov[-pad:, -pad:], fallback)
+            else:
+                cov = cov[:target_size, :target_size]
+
+    cov = 0.5 * (cov + cov.T)
+    cov += np.eye(target_size) * 1e-9
+    return cov
 
 class StockPortfolioEnv(gym.Env):
 
@@ -481,7 +550,7 @@ class StockPortfolioEnv(gym.Env):
                                             if len(last_val) > 0:
                                                 self.curData.at[idx, col] = last_val[0]
                                     # If still NaN, fill with 0 (shouldn't happen with proper data)
-                                    self.curData[col] = self.curData[col].fillna(0.0).infer_objects(copy=False)
+                                    self.curData[col] = _fillna_infer(self.curData[col], value=0.0)
             
             self.ctl_state = {k:_safe_array_from_values(self.curData[k].values) for k in self.config.otherRef_indicator_lst}
             cur_date = self.curData['date'].unique()[0]
@@ -616,40 +685,12 @@ class StockPortfolioEnv(gym.Env):
             self.risk_adj_lst.append(cur_risk_boundary)
             self.ctrl_weight_lst.append(1.0)       
 
-            daily_return_ay = _safe_array_from_values(self.curData['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)].values)
-            # Ensure daily_return_ay is 1D and has enough elements for covariance
-            if daily_return_ay.ndim == 0:
-                daily_return_ay = daily_return_ay.reshape(1)
-            elif daily_return_ay.ndim > 1:
-                daily_return_ay = daily_return_ay.flatten()
-            
-            # Calculate covariance, handle edge cases
-            if len(daily_return_ay) < 2:
-                # Not enough data for covariance, use identity matrix scaled by risk_market
-                cur_cov = np.eye(len(weights)) * self.config.risk_market
-            else:
-                cur_cov = np.cov(daily_return_ay)
-                # Ensure cur_cov is 2D
-                if cur_cov.ndim == 0:
-                    cur_cov = np.array([[cur_cov]])
-                elif cur_cov.ndim == 1:
-                    cur_cov = np.diag(cur_cov)
-                # Ensure cur_cov matches weights shape
-                if cur_cov.shape[0] != len(weights) or cur_cov.shape[1] != len(weights):
-                    # Resize to match weights
-                    if cur_cov.size == 1:
-                        cur_cov = np.eye(len(weights)) * float(cur_cov.flat[0])
-                    else:
-                        # Take first len(weights) x len(weights) or pad/truncate
-                        target_size = len(weights)
-                        if cur_cov.shape[0] < target_size:
-                            # Pad with identity
-                            pad_size = target_size - cur_cov.shape[0]
-                            cur_cov = np.pad(cur_cov, ((0, pad_size), (0, pad_size)), mode='constant', constant_values=self.config.risk_market)
-                            np.fill_diagonal(cur_cov[-pad_size:, -pad_size:], self.config.risk_market)
-                        elif cur_cov.shape[0] > target_size:
-                            # Truncate
-                            cur_cov = cur_cov[:target_size, :target_size]
+            daily_return_ay = self.curData['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)].values
+            cur_cov = _build_cov_from_indicator(
+                daily_return_ay,
+                target_size=len(weights),
+                fallback=self.config.risk_market
+            )
             
             # Calculate risk with safe matmul
             try:
@@ -778,63 +819,26 @@ class StockPortfolioEnv(gym.Env):
                 profit_part = -10.0  # Large negative value instead of -inf
             else:
                 profit_part = np.log(poDayReturn_withcost+1)
-            if (self.config.trained_best_model_type == 'js_loss') and (self.config.enable_controller):
-                # Action reward guiding mechanism
-                if self.config.trade_pattern == 1:
-                    weights_norm = weights
-                    w_rl_norm = w_rl
-                elif self.config.trade_pattern == 2:
-                    # [-1, 1] -> [0, 1]
-                    weights_norm = (weights + 1) / 2
-                    w_rl_norm = (w_rl + 1) / 2
-                elif self.config.trade_pattern == 3:
-                    # [-1, 0] -> [0, 1]
-                    weights_norm  = -weights
-                    w_rl_norm = -w_rl
-                else:
-                    raise ValueError("Unexpected trade pattern: {}".format(self.config.trade_pattern))
-                
-                js_m = 0.5 * (w_rl_norm + weights_norm)
-                js_divergence = (0.5 * entropy(pk=w_rl_norm, qk=js_m, base=2)) + (0.5 * entropy(pk=weights_norm, qk=js_m, base=2))
-                js_divergence = np.clip(js_divergence, 0, 1)
-                risk_part = (-1) * js_divergence
-
-                scaled_profit_part = self.config.lambda_1 * profit_part               
-                scaled_risk_part = self.config.lambda_2 * risk_part
-                cur_reward = scaled_profit_part + scaled_risk_part
-
-            elif (self.config.mode == 'RLonly') and (self.config.trained_best_model_type == 'pr_loss'):
-                # overall return maximisation + risk minimisation
-                cov_r_t0 = np.cov(self.ctl_state['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)])
-                risk_part = np.sqrt(np.matmul(np.matmul(np.array([weights]), cov_r_t0), np.array([weights]).T)[0][0])
-                scaled_risk_part = (-1) * risk_part * 50
-                scaled_profit_part = profit_part * self.config.lambda_1
-                cur_reward = scaled_profit_part + scaled_risk_part
-
-            elif (self.config.mode == 'RLonly') and (self.config.trained_best_model_type == 'sr_loss'):
-                # Sharpe ratio maximisation
-                cov_r_t0 = np.cov(self.ctl_state['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)])
-                risk_part = np.sqrt(np.matmul(np.matmul(np.array([weights]), cov_r_t0), np.array([weights]).T)[0][0])
-                profit_part = poDayReturn_withcost
-                scaled_profit_part = profit_part
-                scaled_risk_part = risk_part
-                # Avoid division by zero
-                if scaled_risk_part == 0 or np.isnan(scaled_risk_part) or np.isinf(scaled_risk_part):
-                    cur_reward = scaled_profit_part
-                else:
-                    cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
-
+            # Unified reward: log-return + Jensen-Shannon diversity
+            if len(self.action_rl_memory) > 0:
+                w_rl_latest = self.action_rl_memory[-1]
             else:
-                risk_part = 0
-                scaled_risk_part = 0
-                scaled_profit_part = profit_part * self.config.lambda_1
-                cur_reward = scaled_profit_part + scaled_risk_part
+                w_rl_latest = weights
+            weights_norm = _normalize_prob(weights)
+            w_rl_norm = _normalize_prob(w_rl_latest)
+            js_distance = jensenshannon(w_rl_norm, weights_norm, base=2) ** 2
+            if np.isnan(js_distance) or np.isinf(js_distance):
+                js_distance = 0.0
+            j_return = profit_part  # log-return at current step
+            scaled_profit_part = self.config.lambda_1 * j_return
+            scaled_js_part = self.config.lambda_2 * js_distance
+            cur_reward = scaled_profit_part + scaled_js_part
 
-            self.rl_reward_risk_lst.append(scaled_risk_part)
+            self.rl_reward_risk_lst.append(scaled_js_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)
             # Ensure cur_reward is not NaN or inf (root cause fix)
             if np.isnan(cur_reward) or np.isinf(cur_reward):
-                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_risk_part={scaled_risk_part}), replacing with 0.0", flush=True)
+                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_js_part={scaled_js_part}), replacing with 0.0", flush=True)
                 cur_reward = 0.0
             self.reward = cur_reward
             self.reward_lst.append(self.reward)
@@ -1520,8 +1524,6 @@ class StockPortfolioEnv(gym.Env):
             field_display_name = {
                 'max_capital': 'capital',
                 'js_loss': 'reward_sum',
-                'pr_loss': 'reward_sum', 
-                'sr_loss': 'reward_sum',
                 'sharpeRatio': 'sharpeRatio',
                 'volatility': 'volatility',
                 'mdd': 'mdd'
@@ -1948,7 +1950,7 @@ class StockPortfolioEnv(gym.Env):
                 # Backward fill (use next value for leading NaNs)
                 merged_df[col] = merged_df[col].bfill()
                 # If still NaN (shouldn't happen with proper data), use 0
-                merged_df[col] = merged_df[col].fillna(0.0).infer_objects(copy=False)
+                merged_df[col] = _fillna_infer(merged_df[col], value=0.0)
             
             # Ensure we have exactly window_size data points
             # Take the last window_size rows (most recent data)
@@ -2376,63 +2378,25 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 profit_part = -10.0  # Large negative value instead of -inf
             else:
                 profit_part = np.log(poDayReturn_withcost+1)
-            if (self.config.trained_best_model_type == 'js_loss') and (self.config.enable_controller):
-                # Action reward guiding mechanism
-                if self.config.trade_pattern == 1:
-                    weights_norm = weights
-                    w_rl_norm = w_rl
-                elif self.config.trade_pattern == 2:
-                    # [-1, 1] -> [0, 1]
-                    weights_norm = (weights + 1) / 2
-                    w_rl_norm = (w_rl + 1) / 2
-                elif self.config.trade_pattern == 3:
-                    # [-1, 0] -> [0, 1]
-                    weights_norm  = -weights
-                    w_rl_norm = -w_rl
-                else:
-                    raise ValueError("Unexpected trade pattern: {}".format(self.config.trade_pattern))
-                
-                js_m = 0.5 * (w_rl_norm + weights_norm[1:])
-                js_divergence = (0.5 * entropy(pk=w_rl_norm, qk=js_m, base=2)) + (0.5 * entropy(pk=weights_norm[1:], qk=js_m, base=2))
-                js_divergence = np.clip(js_divergence, 0, 1)
-                risk_part = (-1) * js_divergence
-
-                scaled_risk_part = self.config.lambda_2 * risk_part
-                scaled_profit_part = self.config.lambda_1 * profit_part         
-                cur_reward = scaled_profit_part + scaled_risk_part      
-
-            elif (self.config.mode == 'RLonly') and (self.config.trained_best_model_type == 'pr_loss'):
-                # overall return maximisation + risk minimisation
-                cov_r_t0 = np.cov(self.ctl_state['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)])
-                risk_part = np.sqrt(np.matmul(np.matmul(np.array([weights[1:]]), cov_r_t0), np.array([weights[1:]]).T)[0][0])
-                scaled_risk_part = (-1) * risk_part * 50
-                scaled_profit_part = profit_part * self.config.lambda_1
-                cur_reward = scaled_profit_part + scaled_risk_part
-
-            elif (self.config.mode == 'RLonly') and (self.config.trained_best_model_type == 'sr_loss'):
-                # Sharpe ratio maximisation                
-                cov_r_t0 = np.cov(self.ctl_state['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)])
-                risk_part = np.sqrt(np.matmul(np.matmul(np.array([weights[1:]]), cov_r_t0), np.array([weights[1:]]).T)[0][0])
-                profit_part = poDayReturn_withcost
-                scaled_profit_part = profit_part
-                scaled_risk_part = risk_part
-                # Avoid division by zero
-                if scaled_risk_part == 0 or np.isnan(scaled_risk_part) or np.isinf(scaled_risk_part):
-                    cur_reward = scaled_profit_part
-                else:
-                    cur_reward = (scaled_profit_part - (self.config.mkt_rf[self.config.market_name] * 0.01)) / scaled_risk_part
-
+            if len(self.action_rl_memory) > 0:
+                w_rl_latest = self.action_rl_memory[-1]
             else:
-                risk_part = 0
-                scaled_risk_part = 0
-                scaled_profit_part = profit_part * self.config.lambda_1
-                cur_reward = scaled_profit_part + scaled_risk_part
+                w_rl_latest = weights
+            weights_norm = _normalize_prob(weights)
+            w_rl_norm = _normalize_prob(w_rl_latest)
+            js_distance = jensenshannon(w_rl_norm, weights_norm, base=2) ** 2
+            if np.isnan(js_distance) or np.isinf(js_distance):
+                js_distance = 0.0
+            j_return = profit_part
+            scaled_profit_part = self.config.lambda_1 * j_return
+            scaled_js_part = self.config.lambda_2 * js_distance
+            cur_reward = scaled_profit_part + scaled_js_part
 
-            self.rl_reward_risk_lst.append(scaled_risk_part)
+            self.rl_reward_risk_lst.append(scaled_js_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)
             # Ensure cur_reward is not NaN or inf (root cause fix)
             if np.isnan(cur_reward) or np.isinf(cur_reward):
-                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_risk_part={scaled_risk_part}), replacing with 0.0", flush=True)
+                print(f"Warning: cur_reward is {cur_reward} (profit_part={profit_part}, scaled_js_part={scaled_js_part}), replacing with 0.0", flush=True)
                 cur_reward = 0.0
             self.reward = cur_reward
             self.reward_lst.append(self.reward)

@@ -29,10 +29,10 @@ class Config():
         self.notes = 'MAFIA Implementation - MAFIA-only (Legacy models removed)'
 
         # MAFIA-only configuration (Legacy TD3-only and old MASA variants removed)
-        self.benchmark_algo = 'MASA-mafia'  # Only supported algorithm
+        self.benchmark_algo = 'TD3-PR'  # TD3 Profit-Risk optimization
         self.market_name = 'VNINDEX'  # Financial Index: 'DJIA', 'SP500', 'CSI300'
         self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
-        self.num_epochs = 20  # episode. (TEST: 2 epochs for validation)
+        self.num_epochs = 200  # episodes for convergence
 
         # MAFIA configuration (fixed)
         self.rl_model_name = 'TD3'  # RL agent implemented by TD3
@@ -41,10 +41,10 @@ class Config():
         self.trained_best_model_type = 'js_loss'
 
         self.is_enable_dynamic_risk_bound = True # True if enabling that the market observer sends info to solver-based agents. 
-        self.enable_controller = True # True if enabling the solver-based agent.
+        self.enable_controller = True # Enable solver-based agent for risk correction
         self.enable_market_observer = True # True if enabling the market observer.
         # Optimized MAFIA toggles / hyperparameters
-        self.mafia_use_gumbel_topk = True
+        self.mafia_use_gumbel_topk = False  # Disable Gumbel-TopK, pass raw market vector to RL
         self.mafia_top_k = 10
         self.mafia_gumbel_temperature = 1.0
         self.mafia_hard_topk_inference = True  # use hard Top-K at eval
@@ -52,7 +52,7 @@ class Config():
         # MAFIA state mode: 'compact' (Top-K market_vector) or 'full-score' (full market_scores_full)
         # 'compact': Observer chọn Top-K → State có Top-K → RL tự động nhận Top-K từ Observer (state)
         # 'full-score': Observer đưa ra Full N stocks → State có market_scores_full → RL tự động tự quyết Top-K từ market_scores_full
-        self.mafia_state_mode = 'compact'  # Options: 'compact' or 'full-score'
+        self.mafia_state_mode = 'full-score'  # Pass full market scores directly to RL agent
         
         # RL Top-K selection method (only used in 'full-score' mode)
         # In 'compact' mode: RL automatically uses Top-K from Observer (no selection needed)
@@ -75,13 +75,15 @@ class Config():
         self.mafia_attention_agg = 'weighted'  # Aggregation method for ST-Fusion embeddings in attention: 'mean', 'weighted', 'max'
 
         self.trade_pattern = 1 # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
-        self.lambda_1 = 1000.0 # return reward weight
-        self.lambda_2 = 10.0 # action reward weight
-        self.train_freq = [100, 'step'] 
-        self.risk_default = 0.017
-        self.risk_up_bound = 0.012 # Decided by the observation of the training data set.  
-        self.risk_hold_bound = 0.014 
-        self.risk_down_bound = 0.017
+        self.lambda_1 = 0.99 # return reward weight
+        self.lambda_2 = 0.01 # JSD reward weight (encourage diversity)
+        self.controller_reg_lambda = 1.0  # λ_reg: controller regularization weight ||x - a_RL||^2
+        self.controller_observer_bias_weight = 0.3  # α: scales observer signal when forming linear bias q
+        self.train_freq = [1, 'step']  # Update every trading step
+        self.risk_default     = 0.015
+        self.risk_up_bound    = 0.025   # bull market
+        self.risk_down_bound  = 0.009  # bear market
+        self.risk_hold_bound  = 0.013  # sideways
 
 
         self.period_mode = 1 
@@ -95,25 +97,29 @@ class Config():
         self.stock_data_file = 'stock_prices_all_20251108_234851.csv'  # Set to None for auto-detection
         self.index_data_file = 'VNINDEX_1d_index.csv'  # Optional: 'DJIA_1d_index.csv' or None. If None, market features will be generated from stock data
         self.pricePredModel = 'MA'
-        self.cov_lookback = 5 
+        self.cov_lookback = 30 
         self.norm_method = 'sum'
         self.max_zero_volume_days = 100  # Drop stocks with > this number of zero-volume days
 
         if self.mode == 'Benchmark':
             self.trained_best_model_type = 'max_capital'
         if self.mode == 'RLonly':
-            if self.trained_best_model_type not in ['max_capital', 'pr_loss', 'sr_loss']:
-                raise ValueError("The trained_best_model_type[{}] of {} should be in [\'max_capital\', \'pr_loss\', \'sr_loss\']".format(self.trained_best_model_type, self.mode))
+            if self.trained_best_model_type not in ['max_capital', 'js_loss']:
+                raise ValueError("The trained_best_model_type[{}] of {} should be in ['max_capital', 'js_loss'].".format(self.trained_best_model_type, self.mode))
 
-        self.risk_market = 0.001 # \Sigma_beta
+        self.default_risk_market = 0.001  # Default fallback for market risk (\Sigma_beta)
+        self.risk_market = self._compute_market_risk()  # Dynamic market risk based on benchmark index
+        self._calibrate_risk_bounds()
         self.cbf_gamma = 0.7
         # TD3 config
         self.reward_scaling = 1 
         self.learning_rate = 0.0001 
-        self.batch_size = 32
+        self.learning_starts = 1000
+        self.batch_size = 256
         # Number of mini-batches the TD3 learner runs after each train_freq chunk.
         # Higher value ensures TD3 actually updates parameters frequently.
-        self.gradient_steps = 10 
+        self.gradient_steps = 1 
+        self.action_noise_sigma = 0.1  # Std-dev for Gaussian action noise
         self.ars_trial = 10
         self.last_td3_actor_loss = None
         self.last_td3_critic_loss = None
@@ -130,6 +136,8 @@ class Config():
         os.makedirs(self.res_model_dir, exist_ok=True)
         self.res_img_dir = os.path.join(self.res_dir, 'graph')
         os.makedirs(self.res_img_dir, exist_ok=True)
+        self.metrics_history_path = os.path.join(self.res_dir, 'metrics_history.csv')
+        self.run_manifest_path = os.path.join(self.res_dir, 'run_manifest.json')
         
         # Checkpoint configuration
         self.checkpoint_dir = os.path.join(self.res_dir, 'checkpoints')
@@ -138,9 +146,14 @@ class Config():
         self.validation_freq = 10  # Run validation/test every N epochs (final epoch always runs)
         # Step-based checkpointing (0 to disable, >0 saves every N timesteps)
         # Recommended: 500-1000 for frequent saves, or 0 to disable
-        self.partial_checkpoint_steps = 200  # Save checkpoint every 50 timesteps (0 to disable)
+        # Checkpoint/save configuration
+        self.partial_checkpoint_steps = 1000  # Save checkpoint every 1000 timesteps (0 to disable)
         self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh or use auto_resume)
         self.auto_resume_from_latest = True  # Auto-resume from latest checkpoint if exists (when resume_from_checkpoint is None)
+        self.enable_checkpoint_cleanup = True  # Automatically delete old checkpoints to control disk usage
+        self.max_checkpoints_to_keep = 1  # Applies to both epoch and step checkpoints when cleanup enabled
+        self.save_replay_buffer_on_step_checkpoints = False  # Skip 3GB+ replay buffer for frequent step checkpoints
+        self.save_replay_buffer_on_epoch_checkpoints = True   # Keep replay buffer for less frequent epoch checkpoints
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21
         self.seed_num = seed_num
@@ -168,12 +181,12 @@ class Config():
             self.test_date_start = None
             self.test_date_end = None        
 
-        self.tech_indicator_talib_lst = []
+        self.tech_indicator_talib_lst = ['SMA', 'RSI', 'ATR']
         self.tech_indicator_extra_lst = ['CHANGE']
         self.tech_indicator_input_lst = self.tech_indicator_talib_lst + self.tech_indicator_extra_lst
         self.dailyRetun_lookback = self.cov_lookback 
         self.otherRef_indicator_ma_window = 5 
-        self.enable_cov_features = False # enable using the cov features in RL-based agent
+        self.enable_cov_features = True # enable using the cov features in RL-based agent
 
         self.otherRef_indicator_lst = ['MA-{}'.format(self.otherRef_indicator_ma_window), 'DAILYRETURNS-{}'.format(self.dailyRetun_lookback)]
 
@@ -194,9 +207,6 @@ class Config():
         self.use_cash_algo_lst = []   # Removed legacy algorithms
         # MAFIA always uses RLcontroller mode with controller enabled
         # (removed legacy branching that disabled controller)
-
-        if self.risk_default <= self.risk_market:
-            raise ValueError("The boundary of safe risk[{}] should not be less than/ equal to the market risk[{}].".format(self.risk_default, self.risk_market))
 
         # MAFIA uses its own DC feature generation
         if self.mktobs_algo == 'mafia_1':
@@ -331,9 +341,10 @@ class Config():
                     policy_name = "MlpPolicy"
         base_para = {
             'policy': policy_name, 'learning_rate': self.learning_rate, 'buffer_size': 1000000,
-            'learning_starts': 100, 'batch_size': self.batch_size, 'tau': 0.005, 'gamma': 0.99, 'train_freq': (self.train_freq[0], self.train_freq[1]), 'verbose': 1,
+            'learning_starts': self.learning_starts, 'batch_size': self.batch_size, 'tau': 0.005, 'gamma': 0.99,
+            'train_freq': (self.train_freq[0], self.train_freq[1]), 'verbose': 1,
             'gradient_steps': self.gradient_steps, 'action_noise': None,  'replay_buffer_class': None, 'replay_buffer_kwargs': None, 
-            'optimize_memory_usage': False, 'tensorboard_log': None, 'policy_kwargs': None, 
+            'optimize_memory_usage': False, 'tensorboard_log': './tb_logs', 'policy_kwargs': None, 
             'verbose': 1, 'seed': self.seed_num, 'device': 'auto', '_init_setup_model': True,
         }
         algo_para = {
@@ -356,6 +367,89 @@ class Config():
             for rm_field in algo_para_rm_from_base[self.rl_model_name]:
                 del self.model_para[rm_field]
 
+
+    def _compute_market_risk(self):
+        """
+        Estimate market-wide risk (sigma_beta) from benchmark index daily returns
+        using the latest self.cov_lookback window. Falls back to default value if
+        data is missing or invalid.
+        """
+        fallback = getattr(self, 'default_risk_market', 0.001)
+        index_file = self.index_data_file
+        if index_file is None:
+            return fallback
+
+        # Resolve candidate paths
+        candidate_paths = []
+        if os.path.isabs(index_file):
+            candidate_paths.append(index_file)
+        else:
+            # Primary: relative to configured data directory
+            candidate_paths.append(os.path.join(self.dataDir, index_file))
+            # Secondary: alongside this config file (agents/MAFIA/data)
+            config_dir = os.path.dirname(os.path.abspath(__file__))
+            candidate_paths.append(os.path.join(config_dir, 'data', index_file))
+
+        data_path = None
+        for path in candidate_paths:
+            if os.path.exists(path):
+                data_path = path
+                break
+
+        if data_path is None:
+            print(f"[Config] Warning: Cannot locate index data file {index_file}, using default risk_market={fallback}", flush=True)
+            return fallback
+
+        try:
+            index_df = pd.read_csv(data_path)
+            if 'close' not in index_df.columns:
+                raise ValueError("close column missing")
+            index_df = index_df.dropna(subset=['close'])
+            if 'date' in index_df.columns:
+                index_df['date'] = pd.to_datetime(index_df['date'], errors='coerce')
+                index_df = index_df.sort_values('date')
+            closes = pd.to_numeric(index_df['close'], errors='coerce').dropna()
+            if len(closes) < 2:
+                raise ValueError("Not enough close prices for returns")
+            returns = closes.pct_change().dropna()
+            if len(returns) == 0:
+                raise ValueError("Empty returns series")
+            window = int(max(2, self.cov_lookback))
+            recent_returns = returns.iloc[-window:]
+            market_risk = recent_returns.std(ddof=1)
+            if np.isnan(market_risk) or np.isinf(market_risk):
+                raise ValueError("Invalid market risk value")
+            return float(market_risk)
+        except Exception as e:
+            print(f"[Config] Warning: Failed to compute market risk from {data_path}: {e}. Using default {fallback}", flush=True)
+            return fallback
+
+    def _calibrate_risk_bounds(self):
+        """
+        Ensure risk boundaries remain ordered relative to dynamic market risk.
+        Automatically nudges values instead of raising hard errors.
+        """
+        margin = max(0.001, self.risk_market * 0.15)
+
+        if self.risk_default <= self.risk_market:
+            new_value = self.risk_market + margin
+            print(f"[Config] Adjusting risk_default from {self.risk_default} to {new_value} (market risk={self.risk_market})", flush=True)
+            self.risk_default = new_value
+
+        if self.risk_hold_bound >= self.risk_default:
+            new_value = max(self.risk_market, self.risk_default - margin * 0.5)
+            print(f"[Config] Adjusting risk_hold_bound from {self.risk_hold_bound} to {new_value} to keep below risk_default", flush=True)
+            self.risk_hold_bound = new_value
+
+        if self.risk_down_bound >= self.risk_hold_bound:
+            new_value = max(self.risk_market * 0.8, self.risk_hold_bound - margin * 0.5)
+            print(f"[Config] Adjusting risk_down_bound from {self.risk_down_bound} to {new_value} to keep ordering", flush=True)
+            self.risk_down_bound = new_value
+
+        if self.risk_up_bound <= self.risk_default:
+            new_value = self.risk_default + margin * 0.5
+            print(f"[Config] Adjusting risk_up_bound from {self.risk_up_bound} to {new_value} (above risk_default)", flush=True)
+            self.risk_up_bound = new_value
 
     def print_config(self):
         log_str = '=' * 30 + '\n'

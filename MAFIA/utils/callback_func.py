@@ -16,6 +16,7 @@ from matplotlib import pyplot as plt
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.type_aliases import TrainFrequencyUnit
 from .model_pool import model_select
+from . import run_tracker
 import sys
 import json
 import shutil
@@ -49,11 +50,21 @@ class PoCallback(BaseCallback):
         self.step_counter = 0
         self.start_time = time.time()
         self.last_known_portfolio = None
-        # Checkpoint cleanup: keep all checkpoints (disable cleanup)
-        self.enable_checkpoint_cleanup = False  # Set to False to keep all checkpoints
-        self.max_checkpoints_to_keep = 2  # Only used if cleanup is enabled
+        # Checkpoint / replay-buffer housekeeping configuration
+        self.enable_checkpoint_cleanup = getattr(config, 'enable_checkpoint_cleanup', False)
+        self.max_checkpoints_to_keep = getattr(config, 'max_checkpoints_to_keep', 2)
+        self.save_replay_buffer_on_step_checkpoints = getattr(
+            config, 'save_replay_buffer_on_step_checkpoints', False
+        )
+        self.save_replay_buffer_on_epoch_checkpoints = getattr(
+            config, 'save_replay_buffer_on_epoch_checkpoints', True
+        )
         # Metrics logging
-        self.metrics_file = os.path.join(self.config.res_dir, 'metrics_history.csv')
+        default_metrics_path = getattr(self.config, 'metrics_history_path', None)
+        if not default_metrics_path:
+            default_metrics_path = os.path.join(self.config.res_dir, 'metrics_history.csv')
+        self.metrics_file = default_metrics_path
+        self.manifest_path = getattr(self.config, 'run_manifest_path', None)
         self.metric_fields = [
             'reward_sum',
             'final_capital',
@@ -63,6 +74,9 @@ class PoCallback(BaseCallback):
             'volatility',
             'mdd'
         ]
+        self._rollout_debug_logged = False
+        self._training_ready = False
+        self._warmup_notice_printed = False
     def _cleanup_old_checkpoints(self):
         """
         Remove old checkpoints, keeping only the N most recent ones (based on timesteps).
@@ -168,6 +182,25 @@ class PoCallback(BaseCallback):
         rl_checkpoint_path = os.path.join(checkpoint_dir, 'rl_model.zip')
         self.model.save(rl_checkpoint_path)
 
+        replay_buffer_path = None
+        should_save_replay_buffer = True
+        if checkpoint_type == 'step' and not self.save_replay_buffer_on_step_checkpoints:
+            should_save_replay_buffer = False
+        elif checkpoint_type == 'epoch' and not self.save_replay_buffer_on_epoch_checkpoints:
+            should_save_replay_buffer = False
+
+        if (should_save_replay_buffer and
+            hasattr(self.model, 'replay_buffer') and
+            getattr(self.model, 'replay_buffer', None) is not None):
+            replay_buffer_path = os.path.join(checkpoint_dir, 'replay_buffer.pkl')
+            try:
+                self.model.save_replay_buffer(replay_buffer_path)
+            except Exception as e:
+                print(f"Warning: Failed to save replay buffer: {e}", flush=True)
+                replay_buffer_path = None
+        elif not should_save_replay_buffer:
+            print(f"[Checkpoint Storage] Skipping replay buffer save for {checkpoint_type} checkpoint", flush=True)
+
         mafia_checkpoint_path = None
         if (hasattr(self.train_env, 'mkt_observer') and
             self.train_env.mkt_observer is not None and
@@ -215,6 +248,7 @@ class PoCallback(BaseCallback):
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'rl_model_path': rl_checkpoint_path,
             'mafia_observer_path': mafia_checkpoint_path,
+            'replay_buffer_path': replay_buffer_path,
             'env_state_path': env_state_path,
             'rng_state_path': rng_state_path,
             'seed_num': getattr(self.config, 'seed_num', None),
@@ -222,6 +256,7 @@ class PoCallback(BaseCallback):
         info_path = os.path.join(checkpoint_dir, 'checkpoint_info.json')
         with open(info_path, 'w') as f:
             json.dump(checkpoint_info, f, indent=2)
+        run_tracker.record_checkpoint_save(self.manifest_path, checkpoint_name, checkpoint_info)
 
         # Clean up old checkpoints after saving new one
         self._cleanup_old_checkpoints()
@@ -235,6 +270,9 @@ class PoCallback(BaseCallback):
         # Clean up old checkpoints at training start (in case there are old checkpoints from previous runs)
         print(f"[Checkpoint Cleanup] Starting cleanup at training start...", flush=True)
         self._cleanup_old_checkpoints()
+        run_tracker.print_manifest_summary(self.manifest_path, heading="RUN STATE SNAPSHOT")
+        # Refresh metric visualization immediately so reruns always regenerate the PNG
+        self._update_metric_plot()
 
     def _on_rollout_start(self) -> None:
         """
@@ -300,9 +338,34 @@ class PoCallback(BaseCallback):
             progress_pct = (self.num_timesteps / total_timesteps_for_training * 100.0) if total_timesteps_for_training > 0 else 0.0
             progress_pct = min(progress_pct, 100.0)
             display_timesteps = self.num_timesteps
+
+        # Determine whether warm-up (buffer filling) is still happening
+        learning_starts = getattr(self.model, 'learning_starts', 0)
+        buffer_size = None
+        replay_buffer = getattr(self.model, 'replay_buffer', None)
+        if replay_buffer is not None:
+            buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
+
+        training_ready = self._training_ready
+        if learning_starts is None or learning_starts <= 0:
+            training_ready = True
+        elif buffer_size is not None:
+            training_ready = buffer_size >= learning_starts
+
+        if training_ready and not self._training_ready and learning_starts:
+            print(f"[WARM-UP COMPLETE] Replay buffer reached learning_starts ({buffer_size}/{learning_starts}). Enabling epoch progress + checkpoints.", flush=True)
+        elif (not training_ready and not self._warmup_notice_printed and
+              learning_starts and buffer_size is not None):
+            print(f"[WARM-UP] Collecting experience | Buffer: {buffer_size}/{learning_starts} | Epoch/Checkpoint logs will start after warm-up.", flush=True)
+            self._warmup_notice_printed = True
+
+        if training_ready:
+            self._warmup_notice_printed = False
+
+        self._training_ready = training_ready
         
         # Log at the start of each new epoch
-        if current_epoch_global != self.last_logged_epoch:
+        if self._training_ready and current_epoch_global != self.last_logged_epoch:
             self.last_logged_epoch = current_epoch_global
             elapsed = time.time() - self.start_time
             print(f"\n{'='*100}", flush=True)
@@ -358,7 +421,12 @@ class PoCallback(BaseCallback):
             # Show both global timesteps and local day in epoch
             # Use display_timesteps to avoid showing values > total when resuming
             display_timesteps = min(self.num_timesteps, total_timesteps_for_training) if self.num_timesteps > total_timesteps_for_training else self.num_timesteps
-            print(f"   🔄 Step {display_timesteps:4d}/{total_timesteps_for_training} | Epoch {current_epoch_global}/{self.config.num_epochs} Day {day_in_epoch_display:4d}/{total_days} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_seconds/60:.1f}m", flush=True)
+            if self._training_ready:
+                print(f"   🔄 Step {display_timesteps:4d}/{total_timesteps_for_training} | Epoch {current_epoch_global}/{self.config.num_epochs} Day {day_in_epoch_display:4d}/{total_days} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_seconds/60:.1f}m", flush=True)
+            else:
+                warmup_target = learning_starts if isinstance(learning_starts, (int, float)) else '?'
+                buffer_display = buffer_size if buffer_size is not None else '?'
+                print(f"   [WARM-UP] Global step {display_timesteps:4d} | Buffer {buffer_display}/{warmup_target} | Speed: {steps_per_sec:.2f} steps/s", flush=True)
             sys.stdout.flush()
 
         # Step-based checkpointing
@@ -367,7 +435,8 @@ class PoCallback(BaseCallback):
         if (self.partial_checkpoint_steps and
             self.num_timesteps > 0 and
             self.num_timesteps % self.partial_checkpoint_steps == 0 and
-            self.num_timesteps != self.last_step_checkpoint):
+            self.num_timesteps != self.last_step_checkpoint and
+            self._training_ready):
             checkpoint_name = f'checkpoint_step_{self.num_timesteps}'
             checkpoint_dir = self._save_checkpoint(
                 checkpoint_name=checkpoint_name,
@@ -554,7 +623,8 @@ class PoCallback(BaseCallback):
             n_updates_before = getattr(self.model, '_n_updates', 0)
             train_freq = getattr(self.model, 'train_freq', None)
 
-            print(f"[ROLLOUT_END] Before training check | Buffer: {buffer_size}/{learning_starts} | _n_updates: {n_updates_before} | train_freq: {train_freq}", flush=True)
+            if not self._rollout_debug_logged:
+                print(f"[ROLLOUT_END] Before training check | Buffer: {buffer_size}/{learning_starts} | _n_updates: {n_updates_before} | train_freq: {train_freq}", flush=True)
 
             # Check if training should happen (base class will check this)
             if train_freq is not None:
@@ -566,16 +636,19 @@ class PoCallback(BaseCallback):
                 else:
                     train_freq_unit = None
 
-                if train_freq_unit and hasattr(train_freq_unit, 'name'):
-                    print(f"[ROLLOUT_END] train_freq unit: {train_freq_unit.name}", flush=True)
-                else:
-                    print(f"[ROLLOUT_END] train_freq unit: {train_freq_unit}", flush=True)
+                if not self._rollout_debug_logged:
+                    if train_freq_unit and hasattr(train_freq_unit, 'name'):
+                        print(f"[ROLLOUT_END] train_freq unit: {train_freq_unit.name}", flush=True)
+                    else:
+                        print(f"[ROLLOUT_END] train_freq unit: {train_freq_unit}", flush=True)
 
                 # Check the actual conditions for training
                 should_train = (buffer_size >= learning_starts and
                               ((train_freq_unit == TrainFrequencyUnit.EPISODE and hasattr(self.model, '_episode_num') and self.model._episode_num > 0) or
                                (train_freq_unit == TrainFrequencyUnit.STEP and self.num_timesteps % train_freq.frequency == 0)))
-                print(f"[ROLLOUT_END] Should train: {should_train} (buffer_size >= learning_starts: {buffer_size >= learning_starts}, train_freq_unit: {train_freq_unit})", flush=True)
+                if not self._rollout_debug_logged:
+                    print(f"[ROLLOUT_END] Should train: {should_train} (buffer_size >= learning_starts: {buffer_size >= learning_starts}, train_freq_unit: {train_freq_unit})", flush=True)
+                    self._rollout_debug_logged = True
 
     def _on_training_end(self) -> None:
         """
@@ -594,6 +667,7 @@ class PoCallback(BaseCallback):
         df = pd.DataFrame(rows)
         header = not os.path.exists(self.metrics_file)
         df.to_csv(self.metrics_file, mode='a', header=header, index=False)
+        run_tracker.record_metrics_update(self.manifest_path, epoch, df['phase'].tolist())
         print(f"[VISUALIZER] Logged metrics for epoch {epoch} phases: {', '.join(df['phase'].tolist())}", flush=True)
         self._update_metric_plot()
 
@@ -617,6 +691,9 @@ class PoCallback(BaseCallback):
         if df.empty:
             return
         metrics = self.metric_fields
+        epoch_offset = int(df['epoch'].min()) if 'epoch' in df.columns else 0
+        relative_epoch = df['epoch'] - epoch_offset + 1 if epoch_offset else df.get('epoch')
+        rel_max = relative_epoch.max() if relative_epoch is not None else None
         phases = sorted(df['phase'].unique())
         n = len(metrics)
         cols = 2 if n > 1 else 1
@@ -630,10 +707,18 @@ class PoCallback(BaseCallback):
                 continue
             for phase in phases:
                 subset = df[df['phase'] == phase]
-                ax.plot(subset['epoch'], subset[metric], marker='o', label=phase)
+                if subset.empty:
+                    continue
+                x_vals = subset['epoch'] - epoch_offset + 1 if epoch_offset else subset['epoch']
+                ax.plot(x_vals, subset[metric], marker='o', label=phase)
             ax.set_title(metric)
-            ax.set_xlabel("Epoch")
+            xlabel = "Epoch"
+            if epoch_offset > 1:
+                xlabel += " (relative to resume)"
+            ax.set_xlabel(xlabel)
             ax.set_ylabel(metric)
+            if rel_max is not None:
+                ax.set_xlim(1, rel_max)
             ax.grid(True, linestyle="--", alpha=0.4)
         for ax in axes_flat[n:]:
             ax.axis("off")

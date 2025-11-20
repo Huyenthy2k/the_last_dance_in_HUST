@@ -1,3 +1,4 @@
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 # Handle gym/gymnasium compatibility
@@ -332,6 +333,7 @@ class TD3Controller(OffPolicyAlgorithm):
             supported_action_spaces=(gym.spaces.Box,),
             support_multi_env=True,
         )
+        self._warmup_notice_printed = False
 
         self.policy_delay = policy_delay
         self.target_noise_clip = target_noise_clip
@@ -360,6 +362,13 @@ class TD3Controller(OffPolicyAlgorithm):
         n_updates_before = getattr(self, '_n_updates', 0)
         buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
         print(f"[TRAIN] ⚡ train() method CALLED! | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+
+        # Guard against premature training (respect learning_starts even if collect_rollouts misfires)
+        learning_starts = getattr(self, 'learning_starts', 0)
+        if buffer_size < learning_starts:
+            if self.verbose >= 1:
+                print(f"[TRAIN] ⏸ Buffer size {buffer_size} < learning_starts {learning_starts}. Skipping gradient update.", flush=True)
+            return
         
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
@@ -495,8 +504,12 @@ class TD3Controller(OffPolicyAlgorithm):
             if not rollout.continue_training:
                 break
 
-            # FIX: allow training as soon as we reach learning_starts
-            if self.num_timesteps > 0 and self.num_timesteps >= self.learning_starts:
+            # Only train when replay buffer has reached learning_starts
+            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+            if buffer_size < self.learning_starts:
+                continue
+
+            if self.num_timesteps > 0:
                 gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
                 if gradient_steps > 0:
                     self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
@@ -548,10 +561,32 @@ class TD3Controller(OffPolicyAlgorithm):
 
         assert isinstance(env, VecEnv), "You must pass a VecEnv"
         assert train_freq.frequency > 0, "Should at least collect one step or episode."
+
+        def _finalize_rollout_line() -> None:
+            """Clear the live status line so future logs print normally."""
+            if getattr(self, "_live_rollout_line_active", False):
+                width = getattr(self, "_rollout_status_width", 0)
+                sys.stdout.write("\r" + (" " * width) + "\r")
+                sys.stdout.flush()
+                self._live_rollout_line_active = False
+
+        def _log_rollout(message: str) -> None:
+            _finalize_rollout_line()
+            print(message, flush=True)
+
+        def _log_rollout_status(timestep: int, episode: int, collected_steps: int) -> None:
+            message = f"[ROLLOUT] Collecting | Global step: {timestep} | Episode: {episode} | Rollout steps: {collected_steps}"
+            width = getattr(self, "_rollout_status_width", 0)
+            width = max(width, len(message))
+            self._rollout_status_width = width
+            padded_message = message.ljust(width)
+            sys.stdout.write(f"\r{padded_message}")
+            sys.stdout.flush()
+            self._live_rollout_line_active = True
         
         # Log rollout start
         if self.verbose >= 1 and self._episode_num % 10 == 0:
-            print(f"[ROLLOUT] Starting rollout | Timestep: {self.num_timesteps} | Episode: {self._episode_num}", flush=True)
+            _log_rollout_status(self.num_timesteps, self._episode_num, num_collected_steps)
 
         if env.num_envs > 1:
             assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
@@ -571,7 +606,7 @@ class TD3Controller(OffPolicyAlgorithm):
             if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
                 if self.num_timesteps >= self._total_timesteps:
                     if self.verbose >= 1:
-                        print(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping collection", flush=True)
+                        _log_rollout(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping collection")
                     continue_training = False
                     break
             if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
@@ -615,28 +650,33 @@ class TD3Controller(OffPolicyAlgorithm):
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
 
+            if self.verbose >= 1:
+                _log_rollout_status(self.num_timesteps, self._episode_num, num_collected_steps)
+
             # Debug: Log dones to track episode end detection
             dones_has_true = any(dones) if hasattr(dones, '__iter__') else bool(dones)
             if self.verbose >= 1 and dones_has_true:
-                print(f"[ROLLOUT] Episode end detected! dones={dones}, type={type(dones)}, shape={dones.shape if hasattr(dones, 'shape') else 'no shape'}, num_collected_episodes before={num_collected_episodes}, timesteps={self.num_timesteps}", flush=True)
+                _log_rollout(f"[ROLLOUT] Episode end detected! dones={dones}, type={type(dones)}, shape={dones.shape if hasattr(dones, 'shape') else 'no shape'}, num_collected_episodes before={num_collected_episodes}, timesteps={self.num_timesteps}")
                 # Log individual done flags
                 if hasattr(dones, '__iter__') and not isinstance(dones, (str, bytes)):
                     for i, done_flag in enumerate(dones):
-                        print(f"[ROLLOUT]   dones[{i}] = {done_flag}", flush=True)
+                        _log_rollout(f"[ROLLOUT]   dones[{i}] = {done_flag}")
                 else:
-                    print(f"[ROLLOUT]   dones value = {dones}", flush=True)
+                    _log_rollout(f"[ROLLOUT]   dones value = {dones}")
 
             # Check if we've reached total timesteps - stop immediately to prevent extra steps
             if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
                 if self.num_timesteps >= self._total_timesteps:
                     if self.verbose >= 1:
-                        print(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping immediately", flush=True)
+                        _log_rollout(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping immediately")
+                    _finalize_rollout_line()
                     return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
 
             # Give access to local variables
             callback.update_locals(locals())
             # Only stop training if return value is False, not when it is None.
             if callback.on_step() is False:
+                _finalize_rollout_line()
                 return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
 
             # Retrieve reward and episode length if using Monitor wrapper
@@ -651,9 +691,9 @@ class TD3Controller(OffPolicyAlgorithm):
                 learning_starts = getattr(self, 'learning_starts', 100)
                 max_buffer_size = getattr(replay_buffer, 'max_size', None)
                 if max_buffer_size is not None:
-                    print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{max_buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}", flush=True)
+                    _log_rollout(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{max_buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}")
                 else:
-                    print(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}", flush=True)
+                    _log_rollout(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}")
 
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 
@@ -672,7 +712,7 @@ class TD3Controller(OffPolicyAlgorithm):
                     episodes_ended += 1
 
                     if self.verbose >= 1:
-                        print(f"[ROLLOUT] Episode {self._episode_num} completed! num_collected_episodes={num_collected_episodes}, train_freq={train_freq}, done_idx={idx}", flush=True)
+                        _log_rollout(f"[ROLLOUT] Episode {self._episode_num} completed! num_collected_episodes={num_collected_episodes}, train_freq={train_freq}, done_idx={idx}")
 
                     if action_noise is not None:
                         kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
@@ -680,29 +720,38 @@ class TD3Controller(OffPolicyAlgorithm):
 
                     # Log training infos
                     if log_interval is not None and self._episode_num % log_interval == 0:
-                        self._dump_logs()
+                        # Mirror SB3 behaviour so TensorBoard/built-in logger still receives metrics
+                        self.dump_logs()
 
             # Additional debug: Check if episodes were collected
             if self.verbose >= 1 and episodes_ended > 0:
-                print(f"[ROLLOUT] Total episodes ended this step: {episodes_ended}, total collected: {num_collected_episodes}", flush=True)
+                _log_rollout(f"[ROLLOUT] Total episodes ended this step: {episodes_ended}, total collected: {num_collected_episodes}")
         callback.on_rollout_end()
         
-        # Log rollout completion with buffer info - ALWAYS log, not just when num_collected_episodes > 0
+        # Log rollout completion with buffer info
         buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
         learning_starts = getattr(self, 'learning_starts', 100)
+        warmup_phase = buffer_size < learning_starts
         if self.verbose >= 1:
-            print(f"[ROLLOUT] Completed | Collected steps: {num_collected_steps * env.num_envs} | Episodes: {num_collected_episodes}", flush=True)
-            print(f"[ROLLOUT] Buffer size: {buffer_size} | learning_starts: {learning_starts} | Training enabled: {buffer_size >= learning_starts}", flush=True)
-            print(f"[ROLLOUT] Current _n_updates: {getattr(self, '_n_updates', 0)}", flush=True)
-            if train_freq.unit == TrainFrequencyUnit.EPISODE:
-                should_train_flag = num_collected_episodes > 0
-                print(f"[ROLLOUT] train_freq: {train_freq} | Episodes collected: {num_collected_episodes} | Should train: {should_train_flag}", flush=True)
-                if not should_train_flag:
-                    print(f"[ROLLOUT] ❌ No episodes collected → Training will NOT be triggered!", flush=True)
+            if warmup_phase:
+                if not getattr(self, "_warmup_notice_printed", False):
+                    _log_rollout(f"[ROLLOUT] Warm-up phase | Buffer size: {buffer_size}/{learning_starts} | Training disabled until buffer >= learning_starts")
+                    self._warmup_notice_printed = True
             else:
-                collected_steps = num_collected_steps * env.num_envs
-                should_train_flag = collected_steps >= train_freq.frequency
-                print(f"[ROLLOUT] train_freq: {train_freq} | Steps collected: {collected_steps} | Should train: {should_train_flag}", flush=True)
+                self._warmup_notice_printed = False
+                _log_rollout(f"[ROLLOUT] Completed | Collected steps: {num_collected_steps * env.num_envs} | Episodes: {num_collected_episodes}")
+                _log_rollout(f"[ROLLOUT] Buffer size: {buffer_size} | learning_starts: {learning_starts} | Training enabled: True")
+                _log_rollout(f"[ROLLOUT] Current _n_updates: {getattr(self, '_n_updates', 0)}")
+                if train_freq.unit == TrainFrequencyUnit.EPISODE:
+                    should_train_flag = num_collected_episodes > 0
+                    _log_rollout(f"[ROLLOUT] train_freq: {train_freq} | Episodes collected: {num_collected_episodes} | Should train: {should_train_flag}")
+                    if not should_train_flag:
+                        _log_rollout(f"[ROLLOUT] ❌ No episodes collected → Training will NOT be triggered!")
+                else:
+                    collected_steps = num_collected_steps * env.num_envs
+                    should_train_flag = collected_steps >= train_freq.frequency
+                    _log_rollout(f"[ROLLOUT] train_freq: {train_freq} | Steps collected: {collected_steps} | Should train: {should_train_flag}")
 
+        _finalize_rollout_line()
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
         

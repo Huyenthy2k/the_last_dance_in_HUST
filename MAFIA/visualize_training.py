@@ -18,6 +18,14 @@ def find_latest_metrics(base_dir="res"):
             candidates.append((os.path.getmtime(path), path))
     return sorted(candidates, key=lambda item: item[0], reverse=True)[0][1] if candidates else None
 
+def _prepare_epoch_axis(df):
+    """Return tuple of (epoch_offset, rel_epoch_series)."""
+    if df.empty or "epoch" not in df.columns:
+        return 0, df.get("epoch", pd.Series(dtype=float))
+    epoch_offset = int(df["epoch"].min())
+    rel_epoch = df["epoch"] - epoch_offset + 1
+    return epoch_offset, rel_epoch
+
 def plot_metrics(df, metrics, output_path):
     phases = sorted(df["phase"].unique())
     n = len(metrics)
@@ -25,6 +33,8 @@ def plot_metrics(df, metrics, output_path):
     rows = math.ceil(n / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
     axes_flat = axes.flatten()
+    epoch_offset, rel_epoch = _prepare_epoch_axis(df)
+    rel_max = rel_epoch.max() if not rel_epoch.empty else None
 
     for idx, metric in enumerate(metrics):
         if metric not in df.columns:
@@ -33,10 +43,18 @@ def plot_metrics(df, metrics, output_path):
         ax = axes_flat[idx]
         for phase in phases:
             subset = df[df["phase"] == phase]
-            ax.plot(subset["epoch"], subset[metric], marker="o", label=phase)
+            if subset.empty:
+                continue
+            x_vals = subset["epoch"] - epoch_offset + 1
+            ax.plot(x_vals, subset[metric], marker="o", label=phase)
         ax.set_title(metric)
-        ax.set_xlabel("Epoch")
+        xlabel = "Epoch"
+        if epoch_offset > 1:
+            xlabel += " (relative to resume)"
+        ax.set_xlabel(xlabel)
         ax.set_ylabel(metric)
+        if rel_max is not None:
+            ax.set_xlim(1, rel_max)
         ax.grid(True, linestyle="--", alpha=0.4)
     for ax in axes_flat[n:]:
         ax.axis("off")

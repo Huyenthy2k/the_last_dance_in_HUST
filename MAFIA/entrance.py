@@ -44,6 +44,8 @@ from utils.model_pool import model_select, benchmark_algo_select
 from utils.callback_func import PoCallback
 from utils.data_validator import get_stock_data_file
 from RL_controller.mafia_observer import MAFIAObserver
+from stable_baselines3.common.noise import NormalActionNoise
+from utils import run_tracker
 import timeit
 
 # Legacy RLonly function removed - MAFIA-only codebase now uses RLcontroller exclusively
@@ -104,8 +106,26 @@ def RLcontroller(config):
         mkt_observer=mkt_observer, **trainInvest_env_para
     )
 
+    # Ensure run manifest exists early so resume/reporting metadata is always present
+    run_tracker.ensure_manifest(getattr(config, 'run_manifest_path', None), config.cur_datetime, config.num_epochs)
+
     # Load RL model
-    model_para_dict = config.model_para
+    def build_action_noise(env):
+        sigma = getattr(config, 'action_noise_sigma', 0.0)
+        if sigma is None or sigma <= 0:
+            return None
+        action_dim = int(np.prod(env.action_space.shape))
+        if action_dim <= 0:
+            return None
+        return NormalActionNoise(
+            mean=np.zeros(action_dim),
+            sigma=np.ones(action_dim) * sigma
+        )
+
+    model_para_dict = dict(config.model_para)
+    action_noise_obj = build_action_noise(env_train)
+    if action_noise_obj is not None:
+        model_para_dict['action_noise'] = action_noise_obj
     start_epoch = 0
     
     # Auto-detect latest checkpoint if auto_resume is enabled and no checkpoint specified
@@ -169,26 +189,48 @@ def RLcontroller(config):
             print(f"Auto-detected latest checkpoint: {checkpoint_to_resume}", flush=True)
             print(f"  Epoch: {latest_record['info'].get('epoch', 0)}, Timesteps: {latest_record['info'].get('timesteps', 0)}", flush=True)
     
+    # Refresh manifest after any potential directory redirection
+    run_tracker.ensure_manifest(getattr(config, 'run_manifest_path', None), config.cur_datetime, config.num_epochs)
+
     # Resume from checkpoint if specified or auto-detected
     start_epoch = 0
     checkpoint_timesteps = 0
     checkpoint_dir = None
     resume_loaded = False
     incompatible_checkpoint = False
+    replay_buffer_path = None
     if checkpoint_to_resume is not None and isinstance(checkpoint_to_resume, str) and os.path.exists(checkpoint_to_resume):
         print(f"Resuming training from checkpoint: {checkpoint_to_resume}", flush=True)
         
         # Load checkpoint info
         checkpoint_dir = os.path.dirname(checkpoint_to_resume)
         info_path = os.path.join(checkpoint_dir, 'checkpoint_info.json')
+
+        # Ensure new artifacts continue inside the original run directory
+        checkpoint_root_dir = os.path.dirname(checkpoint_dir)
+        previous_run_dir = os.path.dirname(checkpoint_root_dir)
+        if os.path.exists(previous_run_dir):
+            config.cur_datetime = os.path.basename(previous_run_dir)
+            config.res_dir = previous_run_dir
+            config.res_model_dir = os.path.join(previous_run_dir, 'model')
+            config.res_img_dir = os.path.join(previous_run_dir, 'graph')
+            config.checkpoint_dir = os.path.join(previous_run_dir, 'checkpoints')
+            config.metrics_history_path = os.path.join(config.res_dir, 'metrics_history.csv')
+            config.run_manifest_path = os.path.join(config.res_dir, 'run_manifest.json')
+            os.makedirs(config.res_model_dir, exist_ok=True)
+            os.makedirs(config.res_img_dir, exist_ok=True)
+            os.makedirs(config.checkpoint_dir, exist_ok=True)
+            print(f"[RESUME] Continuing outputs inside existing run directory: {config.res_dir}", flush=True)
         
         if os.path.exists(info_path):
             with open(info_path, 'r') as f:
                 checkpoint_info = json.load(f)
+            run_tracker.record_resume_event(getattr(config, 'run_manifest_path', None), checkpoint_to_resume, checkpoint_info)
             start_epoch = checkpoint_info.get('epoch', 0)
             checkpoint_timesteps = checkpoint_info.get('timesteps', 0)
             checkpoint_type = checkpoint_info.get('type', 'epoch')
             day_in_epoch = checkpoint_info.get('day_in_epoch', 0)
+            replay_buffer_path = checkpoint_info.get('replay_buffer_path', None)
             
             print(f"Checkpoint type: {checkpoint_type}", flush=True)
             print(f"Resuming from epoch {start_epoch}, day {day_in_epoch}, timestep {checkpoint_timesteps}", flush=True)
@@ -250,6 +292,10 @@ def RLcontroller(config):
                 po_model = ModelCls.load(rl_checkpoint_path, env=env_train)
                 po_model.mafia_config = config
                 po_model.verbose = 1
+                # Reapply action noise for resumed training
+                action_noise_loaded = build_action_noise(env_train)
+                if action_noise_loaded is not None:
+                    po_model.action_noise = action_noise_loaded
                 resume_loaded = True
                 print(f"RL model loaded from {rl_checkpoint_path}", flush=True)
             except ValueError as e:
@@ -280,6 +326,21 @@ def RLcontroller(config):
             if hasattr(env_train, 'epoch'):
                 env_train.epoch = 0
         else:
+            # Restore replay buffer if the checkpoint saved it
+            if replay_buffer_path and os.path.exists(replay_buffer_path):
+                try:
+                    po_model.load_replay_buffer(replay_buffer_path)
+                    buffer_obj = getattr(po_model, 'replay_buffer', None)
+                    if buffer_obj is not None:
+                        buffer_size = buffer_obj.size() if hasattr(buffer_obj, 'size') else len(buffer_obj)
+                        print(f"[RESUME] Replay buffer loaded from {replay_buffer_path} (size: {buffer_size})", flush=True)
+                    else:
+                        print(f"[RESUME] Replay buffer load reported success but buffer is None", flush=True)
+                except Exception as e:
+                    print(f"[RESUME] Warning: Failed to load replay buffer from {replay_buffer_path}: {e}", flush=True)
+            elif replay_buffer_path:
+                print(f"[RESUME] Replay buffer file not found at {replay_buffer_path}", flush=True)
+
             # Load MAFIA observer from checkpoint if exists
             if (config.enable_market_observer and 
                 hasattr(env_train, 'mkt_observer') and 
@@ -329,6 +390,7 @@ def RLcontroller(config):
     print(f'[INFO] Checkpoint frequency: every {config.checkpoint_freq} epochs' if config.checkpoint_freq > 0 else '[INFO] Checkpoint saving disabled')
     print(f'[INFO] Results directory: {config.res_dir}')
     print(f"{'='*100}\n")
+    run_tracker.print_manifest_summary(getattr(config, 'run_manifest_path', None), heading="RUN STATE SNAPSHOT")
     print('Training Start', flush=True)
     log_interval = 10
     callback1 = PoCallback(config=config, train_env=env_train, valid_env=env_valid, test_env=env_test)

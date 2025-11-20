@@ -126,10 +126,10 @@ def test_save_profile_arrays():
     return True
 
 
-def test_checkpoint_cleanup_disabled():
-    """Test that checkpoint cleanup is disabled."""
+def test_checkpoint_cleanup_enabled():
+    """Test that checkpoint cleanup defaults to enabled."""
     print("\n" + "=" * 60)
-    print("TESTING CHECKPOINT CLEANUP DISABLED")
+    print("TESTING CHECKPOINT CLEANUP ENABLED")
     print("=" * 60)
 
     config = Config(seed_num=123, current_date='2025-11-17-15-00-00')
@@ -138,10 +138,10 @@ def test_checkpoint_cleanup_disabled():
     print(f"enable_checkpoint_cleanup: {getattr(callback, 'enable_checkpoint_cleanup', 'not set')}")
     print(f"max_checkpoints_to_keep: {getattr(callback, 'max_checkpoints_to_keep', 'not set')}")
 
-    if not getattr(callback, 'enable_checkpoint_cleanup', True):
-        print("✓ Checkpoint cleanup is disabled")
+    if getattr(callback, 'enable_checkpoint_cleanup', False):
+        print("✓ Checkpoint cleanup is enabled by default")
     else:
-        print("✗ Checkpoint cleanup is still enabled")
+        print("✗ Checkpoint cleanup is still disabled")
 
     print("✓ Checkpoint cleanup test passed")
 
@@ -156,8 +156,8 @@ if __name__ == "__main__":
     # Test 2: Save profile array lengths
     test_save_profile_arrays()
 
-    # Test 3: Checkpoint cleanup disabled
-    test_checkpoint_cleanup_disabled()
+    # Test 3: Checkpoint cleanup enabled
+    test_checkpoint_cleanup_enabled()
 
     print("\n" + "=" * 80)
     print("ALL TESTS COMPLETED")
