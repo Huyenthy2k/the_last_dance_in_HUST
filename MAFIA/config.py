@@ -16,14 +16,29 @@ Second-order cone programming solver: CVXOPT (http://cvxopt.org/)
 ---------------------------------
 '''
 
+import argparse
+import datetime
 import numpy as np
 import os
 import pandas as pd
+import sys
 import time
-import datetime
 from RL_controller.TD3_controller import TD3PolicyOriginal
 
 class Config():
+    GATING_MODE_MAP = {
+        'attentive': 'attention_based_aggregation',
+        'cnn': 'temporal_convolution',
+        'lstm': 'bidirectional_lstm',
+    }
+    DEFAULT_GATING_MODE_ALIAS = 'cnn'
+    DEFAULT_GATING_ENCODER = GATING_MODE_MAP[DEFAULT_GATING_MODE_ALIAS]
+    GATING_MODE_DESCRIPTIONS = {
+        'attentive': 'Self-attention gating that weighs temporal embeddings via multi-head attention.',
+        'cnn': 'Temporal convolution (CNN) gating that extracts short-term patterns before routing.',
+        'lstm': 'Bidirectional LSTM gating that captures sequential dependencies.',
+    }
+
     def __init__(self, seed_num=2022, current_date=None):
 
         self.notes = 'MAFIA Implementation - MAFIA-only (Legacy models removed)'
@@ -159,8 +174,8 @@ class Config():
         self.seed_num = seed_num
         date_split_dict = {            
             1: {'train_date_start': '2017-01-03 00:00:00',
-                'train_date_end': '2020-12-31 23:59:59',
-                'valid_date_start': '2021-01-01 00:00:00',
+                'train_date_end': '2021-12-31 23:59:59',
+                'valid_date_start': '2022-01-01 00:00:00',
                 'valid_date_end': '2023-12-31 23:59:59',
                 'test_date_start': '2024-01-01 00:00:00',
                 'test_date_end': '2025-11-06 23:59:59'},
@@ -244,7 +259,7 @@ class Config():
         self.hidden_vec_loss_weight = 1.0  # Weight for market_vector loss in Policy Gradient training
         
         # Dense MoE Gating Configuration
-        self.mafia_gating_encoder_type = 'attention_based_aggregation'  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
+        self.mafia_gating_encoder_type = self.DEFAULT_GATING_ENCODER  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
         self.mafia_gating_dropout = 0.1  # Dropout for gating networks
         self.mafia_gating_lstm_layers = 2  # For bidirectional_lstm encoder
@@ -366,6 +381,27 @@ class Config():
         if self.rl_model_name in algo_para_rm_from_base.keys():
             for rm_field in algo_para_rm_from_base[self.rl_model_name]:
                 del self.model_para[rm_field]
+
+    def configure_gating_mode(self, gating_mode: str):
+        """Update the gating encoder using a friendly alias (attentive/cnn/lstm)."""
+        if gating_mode is None:
+            return self.mafia_gating_encoder_type
+
+        alias = gating_mode.lower().strip()
+        if alias not in self.GATING_MODE_MAP:
+            valid = ', '.join(self.GATING_MODE_MAP.keys())
+            raise ValueError(f"Unsupported gating mode '{gating_mode}'. Valid options: {valid}.")
+
+        encoder_type = self.GATING_MODE_MAP[alias]
+        self.mafia_gating_encoder_type = encoder_type
+        return encoder_type
+
+    @classmethod
+    def iter_gating_modes(cls):
+        """Yield (alias, encoder_name, description) tuples for the three supported modes."""
+        for alias, encoder in cls.GATING_MODE_MAP.items():
+            description = cls.GATING_MODE_DESCRIPTIONS.get(alias, '')
+            yield alias, encoder, description
 
 
     def _compute_market_risk(self):
@@ -490,3 +526,32 @@ class Config():
         log_str = log_str + '=' * 30 + '\n'
 
         print(log_str, flush=True)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Inspect or update the MAFIA gating mode configuration.')
+    parser.add_argument(
+        '--gating-mode',
+        choices=list(Config.GATING_MODE_MAP.keys()),
+        default=None,
+        help='Select one of the supported gating modes (attentive, cnn, lstm).'
+    )
+    args = parser.parse_args()
+
+    print('Available gating modes:', flush=True)
+    for alias, encoder_name, description in Config.iter_gating_modes():
+        print(f" - {alias:<9} -> {encoder_name}: {description}", flush=True)
+
+    if args.gating_mode is not None:
+        encoder = Config.GATING_MODE_MAP[args.gating_mode]
+        print(
+            f"[Config] Selected gating mode '{args.gating_mode}' maps to encoder '{encoder}'.",
+            flush=True,
+        )
+        print("Update 'mafia_gating_encoder_type' or call Config.configure_gating_mode() with this alias in your pipeline.", flush=True)
+    else:
+        print(
+            f"[Config] Default gating mode is '{Config.DEFAULT_GATING_MODE_ALIAS}' "
+            f"({Config.DEFAULT_GATING_ENCODER}).",
+            flush=True,
+        )
