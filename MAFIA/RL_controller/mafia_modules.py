@@ -726,8 +726,9 @@ class DenseMoESignalGenerator(nn.Module):
         self, 
         expert_outputs: list,      # [O_tech, O_dc1, O_dc2, O_dc3]
         expert_ta_outputs: list,   # [O_tech_TA, O_dc1_TA, O_dc2_TA, O_dc3_TA]
-        O_mkt_TA: Optional[th.Tensor]  # Market-index TA output for gating
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        O_mkt_TA: Optional[th.Tensor],  # Market-index TA output for gating
+        expert_st_embeddings: Optional[list] = None  # Optional per-stock embeddings per expert [(batch, N, D)]
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Dense MoE forward pass.
         
@@ -742,6 +743,8 @@ class DenseMoESignalGenerator(nn.Module):
             topk_indices: (batch, K) - Indices of selected assets
             market_scores_full: (batch, N) - Full softmax scores for all assets
             gate_weights: (batch, 4) - Expert weights from gating router
+            market_context: (batch, D) - Market condition embedding from gating encoder
+            fused_stock_embedding: (batch, N, D) or None - Weighted fusion of expert ST embeddings per stock
         """
         # Input validation
         num_experts = len(expert_outputs)
@@ -755,7 +758,7 @@ class DenseMoESignalGenerator(nn.Module):
         device = expert_outputs[0].device
         
         # Step 1: Compute gate weights from market condition
-        gate_weights, market_context = self.gating_router(O_mkt_TA)  # (batch, 4)
+        gate_weights, market_context = self.gating_router(O_mkt_TA)  # (batch, 4), (batch, D)
         
         # Expand gate_weights for batch if needed (when O_mkt_TA was None)
         if gate_weights.size(0) == 1 and batch_size > 1:
@@ -774,6 +777,17 @@ class DenseMoESignalGenerator(nn.Module):
             dim=1
         )  # (batch, N)
         
+        # Optional: fuse per-stock ST embeddings from experts using gate weights
+        fused_stock_embedding = None
+        if expert_st_embeddings is not None:
+            if len(expert_st_embeddings) != num_experts:
+                raise ValueError(
+                    f"Expected {num_experts} expert ST embeddings, got {len(expert_st_embeddings)}"
+                )
+            stacked_emb = th.stack(expert_st_embeddings, dim=1)  # (batch, 4, N, D)
+            gate_weights_exp = gate_weights.unsqueeze(-1).unsqueeze(-1)  # (batch, 4, 1, 1)
+            fused_stock_embedding = th.sum(gate_weights_exp * stacked_emb, dim=1)  # (batch, N, D)
+
         # Step 3: Gumbel-TopK selection
         temperature = max(self.tau_gumbel, 1e-6)
         market_scores_full = F.softmax(market_logits / temperature, dim=-1)  # (batch, N)
@@ -816,7 +830,7 @@ class DenseMoESignalGenerator(nn.Module):
         boundary_risk = self.risk_network(expert_ta_flat)  # (batch, 1)
         boundary_risk = boundary_risk.squeeze(-1)  # (batch,)
         
-        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights
+        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding
 
 
 class MAFIAModel(nn.Module):
@@ -862,7 +876,7 @@ class MAFIAModel(nn.Module):
         # Dense MoE Signal Generator
         self.signal_generator = DenseMoESignalGenerator(config)
     
-    def forward(self, ochlv_data: th.Tensor, market_index_ochlv_data: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    def forward(self, ochlv_data: th.Tensor, market_index_ochlv_data: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Forward pass through MAFIA model with Dense MoE.
         
@@ -876,6 +890,8 @@ class MAFIAModel(nn.Module):
             topk_indices: (batch, K) - Indices of selected assets
             market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
             gate_weights: (batch, 4) - Expert weights from Dense MoE gating
+            market_context: (batch, D) - Market condition embedding from the gating encoder
+            fused_stock_embedding: (batch, N, D) or None - Fused per-stock embedding from expert ST outputs
         """
         batch_size, N, M, T_w = ochlv_data.shape
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
@@ -945,9 +961,8 @@ class MAFIAModel(nn.Module):
             O_mkt_TA = self.mkt_ta(P_mkt)  # (batch, T_w, D)
         
         # Dense MoE Signal Generator
-        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = self.signal_generator(
-            stock_expert_outputs, stock_expert_ta_outputs, O_mkt_TA
+        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = self.signal_generator(
+            stock_expert_outputs, stock_expert_ta_outputs, O_mkt_TA, expert_st_embeddings=[O_tech_ST] + O_dc_ST_list
         )
-        
-        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights
 
+        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding

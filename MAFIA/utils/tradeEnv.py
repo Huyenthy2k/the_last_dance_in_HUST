@@ -6,6 +6,7 @@
  Description: Define the trading environment for the trading agent.
 --------------------------------
 '''
+from collections import deque
 import numpy as np
 import os
 import pandas as pd
@@ -266,19 +267,38 @@ class StockPortfolioEnv(gym.Env):
                 self.bound_flag = 1 # 1 for long and long+short, -1 for short
             else:
                 raise ValueError("Unexpected trade pattern: {}".format(self.config.trade_pattern))
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim, ), dtype=np.float32)
-
         self.rawdata.sort_values(['date', 'stock'], ascending=True, inplace=True)
         self.rawdata.index = self.rawdata.date.factorize()[0]
         self.totalTradeDay = len(self.rawdata['date'].unique())
         self.stock_lst = np.sort(self.rawdata['stock'].unique())
 
+        self.stock_index_map = {stock: idx for idx, stock in enumerate(self.stock_lst)}
+        self.use_multibranch_state = getattr(self.config, 'rl_obs_use_multibranch_state', True) and self.config.enable_market_observer
+        if self.use_multibranch_state:
+            self._init_rl_multibranch_spec()
+            self.observation_space = spaces.Dict({
+                'global_context': spaces.Box(low=-np.inf, high=np.inf, shape=(self.rl_global_dim,), dtype=np.float32),
+                'per_stock': spaces.Box(low=-np.inf, high=np.inf, shape=(self.stock_num, self.rl_per_stock_feature_dim), dtype=np.float32),
+                'history': spaces.Box(low=-np.inf, high=np.inf, shape=(self.rl_obs_history_len, self.rl_history_feature_dim), dtype=np.float32),
+            })
+        else:
+            self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim, ), dtype=np.float32)
+
         self.curData = copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
         self.curData.sort_values(['stock'], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
+        if self.use_multibranch_state:
+            self._reset_rl_multibranch_buffers()
 
         # Initialize state (will be built in run_mkt_observer)
-        self.state = np.zeros(self.state_dim, dtype=np.float32)
+        if self.use_multibranch_state:
+            self.state = {
+                'global_context': np.zeros(self.rl_global_dim, dtype=np.float32),
+                'per_stock': np.zeros((self.stock_num, self.rl_per_stock_feature_dim), dtype=np.float32),
+                'history': np.zeros((self.rl_obs_history_len, self.rl_history_feature_dim), dtype=np.float32),
+            }
+        else:
+            self.state = np.zeros(self.state_dim, dtype=np.float32)
         self.ctl_state = {k:np.array(list(self.curData[k].values)) for k in self.config.otherRef_indicator_lst}
         self.terminal = False
         
@@ -288,6 +308,15 @@ class StockPortfolioEnv(gym.Env):
         self.last_valid_capital = self.cur_capital
 
         self.profit_lst = [0] # percentage of portfolio daily returns
+        # Initialize action memories before observer builds history features
+        self.action_cbf_memeory = [np.array([0] * self.stock_num)]
+        self.actions_memory = [np.array([1/self.stock_num]*self.stock_num) * self.bound_flag] 
+        self.action_rl_memory = [np.array([1/self.stock_num]*self.stock_num) * self.bound_flag]
+        # Initialize risk history before running market observer (observer builds state that reads these lists)
+        self.risk_raw_lst = [0]  # Raw risk without controller
+        self.risk_cbf_lst = [0]
+        self.return_raw_lst = [self.initial_asset]
+
         cur_risk_boundary, stock_ma_price = self.run_mkt_observer(stage='init') # after curData and state, before cur_risk_boundary
         if stock_ma_price is not None:
             self.ctl_state['MA-{}'.format(self.config.otherRef_indicator_ma_window)] = stock_ma_price
@@ -298,16 +327,9 @@ class StockPortfolioEnv(gym.Env):
         self.asset_lst = [self.initial_asset] 
         self.date_memory = [self.curData['date'].unique()[0]]
         self.reward_lst = [0]
-        self.action_cbf_memeory = [np.array([0] * self.stock_num)]
-
-        self.actions_memory = [np.array([1/self.stock_num]*self.stock_num) * self.bound_flag] 
-        self.action_rl_memory = [np.array([1/self.stock_num]*self.stock_num) * self.bound_flag]
 
         self.risk_adj_lst = [cur_risk_boundary]
         self.is_last_ctrl_solvable = False
-        self.risk_raw_lst = [0] # For performance analysis. Record the risk without using risk controllrt during the validation/test period.
-        self.risk_cbf_lst = [0]
-        self.return_raw_lst = [self.initial_asset] 
         self.solver_stat = {'solvable': 0, 'insolvable': 0, 'stochastic_solvable': 0, 'stochastic_time': [], 'socp_solvable': 0, 'socp_time': []} 
 
         self.ctrl_weight_lst = [1.0]
@@ -389,6 +411,8 @@ class StockPortfolioEnv(gym.Env):
                 except Exception:
                     self.latest_invest_profile = None
 
+            if self.use_multibranch_state:
+                self.peak_capital = max(self.peak_capital, self.cur_capital)
             # Return format compatible with both gym and gymnasium
             # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
             # Debug: Log return value
@@ -843,6 +867,8 @@ class StockPortfolioEnv(gym.Env):
             self.reward = cur_reward
             self.reward_lst.append(self.reward)
             self.model_save_flag = False
+            if self.use_multibranch_state:
+                self.peak_capital = max(self.peak_capital, self.cur_capital)
             # Return format compatible with both gym and gymnasium
             # Always use gymnasium format (terminated, truncated, info) for consistency with VecEnv
             return self.state, self.reward, self.terminal, False, {}
@@ -997,7 +1023,7 @@ class StockPortfolioEnv(gym.Env):
             'lastDayData': self.lastDayData.copy() if hasattr(self, 'lastDayData') and self.lastDayData is not None else None,
             'cur_slippage_drift': self.cur_slippage_drift.copy() if hasattr(self, 'cur_slippage_drift') else None,
             'last_slippage_drift': self.last_slippage_drift.copy() if hasattr(self, 'last_slippage_drift') else None,
-            'state': self.state.copy() if hasattr(self, 'state') and self.state is not None else None,
+            'state': self._copy_observation(self.state) if hasattr(self, 'state') and self.state is not None else None,
             'ctl_state': {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in self.ctl_state.items()} if hasattr(self, 'ctl_state') else None,
             'terminal': self.terminal if hasattr(self, 'terminal') else False,
             'profit_lst': self.profit_lst.copy() if hasattr(self, 'profit_lst') else None,
@@ -1047,7 +1073,7 @@ class StockPortfolioEnv(gym.Env):
         if state.get('last_slippage_drift') is not None:
             self.last_slippage_drift = state['last_slippage_drift'].copy()
         if state.get('state') is not None:
-            self.state = state['state'].copy()
+            self.state = self._copy_observation(state['state'])
         if state.get('ctl_state') is not None:
             self.ctl_state = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in state['ctl_state'].items()}
         if state.get('terminal') is not None:
@@ -1812,18 +1838,38 @@ class StockPortfolioEnv(gym.Env):
                 stock_ma_price_dict.get(stock, self.curData[self.curData['stock']==stock]['close'].values[0] if len(self.curData[self.curData['stock']==stock]) > 0 else 1.0)
                 for stock in self.curData['stock'].values
             ])
-            
+            if self.use_multibranch_state:
+                full_ma_price = np.ones(self.stock_num, dtype=np.float32)
+                for local_idx, stock in enumerate(self.curData['stock'].values):
+                    idx = self.stock_index_map.get(stock)
+                    if idx is None:
+                        continue
+                    full_ma_price[idx] = stock_ma_price[local_idx]
+                self.latest_stock_ma_price = full_ma_price
+                
             input_kwargs = {'mode': self.mode, 'env': self}  # Pass environment for market-index data extraction
-            market_vector_np, lambda_val, boundary_risk_np, market_scores_full_np, gate_weights_np = self.mkt_observer.predict(
+            (market_vector_np, lambda_val, boundary_risk_np, market_scores_full_np,
+             gate_weights_np, market_context_np, stock_embedding_np) = self.mkt_observer.predict(
                 raw_ochlv_data=raw_ochlv_data, 
                 **input_kwargs
             )
-            
+
             # Store gate_weights for potential analysis/visualization
             if gate_weights_np.ndim > 1:
                 self.gate_weights = gate_weights_np[-1]  # (4,)
             else:
                 self.gate_weights = gate_weights_np  # (4,)
+            if market_context_np.ndim > 1:
+                self.market_context_vec = market_context_np[-1].astype(np.float32)
+            else:
+                self.market_context_vec = market_context_np.astype(np.float32)
+            if stock_embedding_np is not None:
+                if stock_embedding_np.ndim > 2:
+                    self.per_stock_embedding = stock_embedding_np[-1].astype(np.float32)
+                else:
+                    self.per_stock_embedding = stock_embedding_np.astype(np.float32)
+            else:
+                self.per_stock_embedding = np.zeros((self.stock_num, self.config.mafia_D), dtype=np.float32)
             
             # Store market_scores_full in environment for RL/Solver to access
             # market_scores_full_np shape: (batch, N), extract last batch item
@@ -2072,6 +2118,10 @@ class StockPortfolioEnv(gym.Env):
             cur_date: Current date (not used in simplified version)
             cur_risk_boundary: Current risk boundary value
         """
+        if self.use_multibranch_state:
+            self._build_multibranch_state(cur_risk_boundary)
+            return
+
         state_mode = getattr(self.config, 'mafia_state_mode', 'compact')
         
         if state_mode == 'full-score':
@@ -2113,6 +2163,158 @@ class StockPortfolioEnv(gym.Env):
             state_parts.append(np.array([cur_risk_boundary], dtype=np.float32))
         
         self.state = np.concatenate(state_parts, axis=0).astype(np.float32)
+
+    def _init_rl_multibranch_spec(self):
+        self.rl_per_stock_feature_names = getattr(
+            self.config,
+            'rl_obs_per_stock_features',
+            ['score', 'embedding']
+        )
+        # Dim = 1 (score) + mafia_D (embedding)
+        self.rl_per_stock_feature_dim = 1 + self.config.mafia_D
+        self.rl_obs_history_len = int(getattr(self.config, 'rl_obs_history_len', 5))
+        self.rl_history_feature_names = getattr(
+            self.config,
+            'rl_obs_history_features',
+            ['topk_avg', 'portfolio_return', 'action_entropy', 'risk_boundary']
+        )
+        self.rl_history_feature_dim = len(self.rl_history_feature_names)
+        self.rl_global_scalar_items = getattr(
+            self.config,
+            'rl_obs_global_scalars',
+            ['risk_raw', 'risk_market',
+             'log_capital', 'last_turnover', 'drawdown']
+        )
+        # global dim = market_context(D) + gate_weights(4) + selected scalars
+        self.rl_global_dim = self.config.mafia_D + 4 + len(self.rl_global_scalar_items)
+        self.market_context_vec = np.zeros(self.config.mafia_D, dtype=np.float32)
+        self._reset_rl_multibranch_buffers()
+
+    def _reset_rl_multibranch_buffers(self):
+        self.rl_history_buffer = deque(maxlen=self.rl_obs_history_len)
+        for _ in range(self.rl_obs_history_len):
+            self.rl_history_buffer.append(np.zeros(self.rl_history_feature_dim, dtype=np.float32))
+        self.rl_last_turnover = 0.0
+        base_weight = 1.0 / max(1, self.stock_num)
+        self.rl_last_action = np.ones(self.stock_num, dtype=np.float32) * base_weight
+        self.rl_last_action_entropy = 0.0
+        self.peak_capital = self.initial_asset
+        self.latest_stock_ma_price = np.ones(self.stock_num, dtype=np.float32)
+        self.per_stock_embedding = np.zeros((self.stock_num, self.config.mafia_D), dtype=np.float32)
+
+    def _build_multibranch_state(self, cur_risk_boundary):
+        global_context = self._compose_global_context_vector(cur_risk_boundary)
+        per_stock = self._compose_per_stock_features()
+        history = self._compose_history_tensor(cur_risk_boundary)
+        self.state = {
+            'global_context': global_context,
+            'per_stock': per_stock,
+            'history': history,
+        }
+
+    def _compose_global_context_vector(self, cur_risk_boundary):
+        market_context = getattr(self, 'market_context_vec', None)
+        if market_context is None or len(market_context) != self.config.mafia_D:
+            market_context = np.zeros(self.config.mafia_D, dtype=np.float32)
+        gate_weights = getattr(self, 'gate_weights', None)
+        if gate_weights is None or gate_weights.shape[0] != 4:
+            gate_weights = np.ones(4, dtype=np.float32) / 4.0
+        else:
+            gate_weights = gate_weights.astype(np.float32)
+
+        # Map scalar items to current values
+        scalar_lookup = {
+            'risk_raw': self.risk_raw_lst[-1] if len(self.risk_raw_lst) > 0 else 0.0,
+            'risk_market': getattr(self.config, 'risk_market', 0.0),
+            'log_capital': np.log((self.cur_capital / self.initial_asset)) if self.cur_capital > 0 else 0.0,
+            'last_turnover': self.rl_last_turnover,
+            'drawdown': max(0.0, (self.peak_capital - self.cur_capital) / self.peak_capital) if self.peak_capital > 0 else 0.0,
+            'controller_bias': getattr(self.config, 'controller_observer_bias_weight', 0.0),
+            'controller_reg_lambda': getattr(self.config, 'controller_reg_lambda', 1.0),
+        }
+
+        scalars = []
+        for key in self.rl_global_scalar_items:
+            scalars.append(float(scalar_lookup.get(key, 0.0)))
+        padded_scalars = np.array(scalars, dtype=np.float32)
+        return np.concatenate([market_context.astype(np.float32), gate_weights, padded_scalars], axis=0)
+
+    def _compose_per_stock_features(self):
+        scores = self.market_scores_full if isinstance(self.market_scores_full, np.ndarray) else np.zeros(self.stock_num)
+        if scores.shape[0] != self.stock_num:
+            safe_scores = np.zeros(self.stock_num)
+            limit = min(len(scores), self.stock_num)
+            safe_scores[:limit] = scores[:limit]
+            scores = safe_scores
+        embeddings = self.per_stock_embedding if isinstance(self.per_stock_embedding, np.ndarray) else np.zeros((self.stock_num, self.config.mafia_D))
+        if embeddings.shape[0] != self.stock_num:
+            safe_emb = np.zeros((self.stock_num, self.config.mafia_D), dtype=np.float32)
+            limit = min(embeddings.shape[0], self.stock_num)
+            safe_emb[:limit, :] = embeddings[:limit, :]
+            embeddings = safe_emb
+        if embeddings.shape[1] != self.config.mafia_D:
+            embeddings = np.pad(embeddings, ((0, 0), (0, max(0, self.config.mafia_D - embeddings.shape[1]))))
+        features = np.zeros((self.stock_num, self.rl_per_stock_feature_dim), dtype=np.float32)
+        for stock_index, _ in enumerate(self.stock_lst):
+            features[stock_index, 0] = scores[stock_index]
+            features[stock_index, 1:] = embeddings[stock_index, :self.config.mafia_D]
+        return features
+
+    def _compose_history_tensor(self, cur_risk_boundary):
+        self._update_history_buffer(cur_risk_boundary)
+        stacked = np.stack(list(self.rl_history_buffer), axis=0)
+        return stacked.astype(np.float32)
+
+    def _update_history_buffer(self, cur_risk_boundary):
+        scores = self.market_scores_full if isinstance(self.market_scores_full, np.ndarray) else np.zeros(self.stock_num)
+        if len(scores) == 0:
+            topk_avg = 0.0
+        else:
+            k = min(self.config.mafia_top_k, len(scores)) if hasattr(self.config, 'mafia_top_k') else len(scores)
+            if k > 0:
+                topk_vals = np.sort(scores)[-k:]
+                topk_avg = float(np.mean(topk_vals))
+            else:
+                topk_avg = 0.0
+        portfolio_return = self.profit_lst[-1] if len(self.profit_lst) > 0 else 0.0
+        if len(self.action_rl_memory) > 0:
+            current_action = np.array(self.action_rl_memory[-1], dtype=np.float32).flatten()
+        else:
+            current_action = np.ones(self.stock_num, dtype=np.float32) / max(1, self.stock_num)
+        current_action = current_action / (np.sum(np.abs(current_action)) + 1e-8)
+        turnover = np.sum(np.abs(current_action - self.rl_last_action))
+        self.rl_last_turnover = float(turnover)
+        self.rl_last_action = current_action
+        prob = np.clip(np.abs(current_action), 1e-8, None)
+        prob = prob / np.sum(prob)
+        self.rl_last_action_entropy = float(entropy(prob, base=np.e))
+        action_entropy = self.rl_last_action_entropy
+        history_entry = []
+        for name in self.rl_history_feature_names:
+            if name == 'topk_avg':
+                history_entry.append(topk_avg)
+            elif name == 'portfolio_return':
+                history_entry.append(portfolio_return)
+            elif name == 'action_entropy':
+                history_entry.append(action_entropy)
+            elif name == 'risk_boundary':
+                history_entry.append(cur_risk_boundary)
+            else:
+                history_entry.append(0.0)
+        self.rl_history_buffer.append(np.array(history_entry, dtype=np.float32))
+
+    def _copy_observation(self, obs):
+        if obs is None:
+            return None
+        if isinstance(obs, dict):
+            return {k: np.array(v, copy=True) for k, v in obs.items()}
+        if isinstance(obs, np.ndarray):
+            return obs.copy()
+        try:
+            return copy.deepcopy(obs)
+        except Exception:
+            return obs
+
 
 class StockPortfolioEnv_cash(StockPortfolioEnv):
     # Considering cash item

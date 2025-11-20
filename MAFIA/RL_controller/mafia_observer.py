@@ -53,6 +53,8 @@ class MAFIAObserver:
         self.config = config
         self.action_dim = action_dim  # N (number of stocks)
         self.last_topk_indices = None
+        self.last_gate_weights = None
+        self.last_market_context = None
         
         # Validate MAFIA hyperparameters exist
         self._validate_config()
@@ -112,12 +114,14 @@ class MAFIAObserver:
             **kwargs: Must include 'mode' ('train', 'valid', 'test')
         
         Returns:
-            tuple: (market_vector, lambda_val, boundary_risk, market_scores_full, gate_weights)
+            tuple: (market_vector, lambda_val, boundary_risk, market_scores_full, gate_weights, market_context, fused_stock_embedding)
                 - market_vector: (batch, N) numpy array - Top-K weights, zero elsewhere
                 - lambda_val: (batch,) numpy array (dummy zeros for MAFIA)
                 - boundary_risk: (batch,) numpy array (continuous risk value)
                 - market_scores_full: (batch, N) numpy array - Full market scores (softmax on all N assets, no Top-K mask)
                 - gate_weights: (batch, 4) numpy array - Dense MoE gate weights for 4 stock experts
+                - market_context: (batch, D) numpy array - Market condition embedding from gating encoder
+                - fused_stock_embedding: (batch, N, D) numpy array - Per-stock embedding fused via gate weights
         """
         mode = kwargs.get('mode', 'train')
         
@@ -169,13 +173,13 @@ class MAFIAObserver:
         
         if mode == 'train':
             self.mafia_model.train()
-            market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = self.mafia_model(
+            market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, stock_embedding = self.mafia_model(
                 ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
             )
         else:
             self.mafia_model.eval()
             with th.no_grad():
-                market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = self.mafia_model(
+                market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, stock_embedding = self.mafia_model(
                     ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
                 )
         
@@ -192,6 +196,10 @@ class MAFIAObserver:
         boundary_risk_np = boundary_risk.detach().cpu().numpy()
         topk_indices_np = topk_indices.detach().cpu().numpy()
         market_scores_full_np = market_scores_full.detach().cpu().numpy()
+        market_context_np = market_context.detach().cpu().numpy()
+        stock_embedding_np = None
+        if stock_embedding is not None:
+            stock_embedding_np = stock_embedding.detach().cpu().numpy()
         self.last_topk_indices = topk_indices_np
         
         # Clean NaN/Inf from outputs
@@ -251,11 +259,45 @@ class MAFIAObserver:
         else:
             # Fallback: uniform weights for 4 experts
             gate_weights_np = np.ones((market_vector_np.shape[0], 4)) / 4.0
-        
+
+        # Market context cache
+        if hasattr(self, 'last_market_context') and self.last_market_context is not None:
+            last_context_np = self.last_market_context.detach().cpu().numpy()
+        else:
+            last_context_np = np.zeros((market_vector_np.shape[0], self.config.mafia_D))
+
+        if market_context_np.ndim == 1:
+            market_context_np = market_context_np.reshape(1, -1)
+        self.last_market_context = market_context.detach()
+
+        # Fallback if NaN/Inf
+        market_context_np = np.nan_to_num(market_context_np, nan=0.0, posinf=0.0, neginf=0.0)
+        if market_context_np.shape[1] != self.config.mafia_D:
+            market_context_np = last_context_np
+
+        # Stock embedding cache
+        fused_stock_embedding_np = None
+        if stock_embedding_np is not None:
+            if stock_embedding_np.ndim == 3:
+                fused_stock_embedding_np = stock_embedding_np
+            elif stock_embedding_np.ndim == 2:
+                fused_stock_embedding_np = stock_embedding_np.reshape(stock_embedding_np.shape[0], -1, self.config.mafia_D)
+            if fused_stock_embedding_np is not None:
+                fused_stock_embedding_np = np.nan_to_num(fused_stock_embedding_np, nan=0.0, posinf=0.0, neginf=0.0)
+                if fused_stock_embedding_np.shape[1] != self.action_dim:
+                    # pad/truncate to action_dim
+                    if fused_stock_embedding_np.shape[1] < self.action_dim:
+                        pad = np.zeros((fused_stock_embedding_np.shape[0], self.action_dim - fused_stock_embedding_np.shape[1], self.config.mafia_D))
+                        fused_stock_embedding_np = np.concatenate([fused_stock_embedding_np, pad], axis=1)
+                    else:
+                        fused_stock_embedding_np = fused_stock_embedding_np[:, :self.action_dim, :]
+        if fused_stock_embedding_np is None:
+            fused_stock_embedding_np = np.zeros((market_vector_np.shape[0], self.action_dim, self.config.mafia_D), dtype=np.float32)
+
         # Validate output shapes
         self._validate_output_shapes(market_vector_np, lambda_val_np, boundary_risk_np)
-        
-        return market_vector_np, lambda_val_np, boundary_risk_np, market_scores_full_np, gate_weights_np
+
+        return market_vector_np, lambda_val_np, boundary_risk_np, market_scores_full_np, gate_weights_np, market_context_np, fused_stock_embedding_np
     
     def _prepare_ochlv_tensor(self, raw_ochlv_data):
         """

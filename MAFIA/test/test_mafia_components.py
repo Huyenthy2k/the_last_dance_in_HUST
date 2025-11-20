@@ -35,6 +35,7 @@ class MockConfig:
         self.mafia_encoder_heads = 4
         self.mafia_M_tech = 8
         self.mafia_M_dc = 5
+        self.mafia_M_mkt = 19
         self.mafia_learning_rate = 1e-4
         self.mafia_weight_decay = 0.001
         self.topK = 10
@@ -195,9 +196,11 @@ def test_st_fusion():
     O_CSA = th.randn(batch_size, N, D).to(device)
     O_TA = th.randn(batch_size, T_w, D).to(device)
     
-    O_i = st_fusion(O_CSA, O_TA)
+    O_i, O_i_ST = st_fusion(O_CSA, O_TA)
     assert O_i.shape == (batch_size, N, 1), \
         f"Expected shape ({batch_size}, {N}, 1), got {O_i.shape}"
+    assert O_i_ST.shape == (batch_size, N, config.mafia_D), \
+        f"Expected fusion embedding shape ({batch_size}, {N}, {config.mafia_D}), got {O_i_ST.shape}"
     print(f"✓ ST-Fusion output shape: {O_i.shape}")
     
     print("✓ ST-Fusion Module: PASSED\n")
@@ -220,8 +223,8 @@ def test_signal_generator():
     O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
     
     # Forward pass
-    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = signal_gen(
-        expert_outputs, expert_ta_outputs, O_mkt_TA
+    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = signal_gen(
+        expert_outputs, expert_ta_outputs, O_mkt_TA, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)]
     )
     
     # Assertions
@@ -249,6 +252,11 @@ def test_signal_generator():
     print(f"✓ boundary_risk shape: {boundary_risk.shape}")
     print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
     print(f"✓ gate_weights shape: {gate_weights.shape}")
+    print(f"✓ market_context shape: {market_context.shape}")
+    if fused_stock_embedding is not None:
+        assert fused_stock_embedding.shape == (batch_size, N, D), \
+            f"Expected fused stock embedding shape ({batch_size}, {N}, {D}), got {fused_stock_embedding.shape}"
+        print(f"✓ fused_stock_embedding shape: {fused_stock_embedding.shape}")
     print(f"✓ gate_weights sum: {gate_weights.sum(dim=-1).item():.4f}")
     print(f"✓ gate_weights values: {gate_weights[0].tolist()}")
     print("✓ Dense MoE Signal Generator: PASSED\n")
@@ -272,7 +280,7 @@ def test_mafia_model():
     market_index_ochlv_data = th.randn(batch_size, 1, M, T_w).to(device) * 50 + 1000  # VNINDEX prices
     
     with th.no_grad():
-        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights = mafia_model(
+        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = mafia_model(
             ochlv_data, market_index_ochlv_data=market_index_ochlv_data
         )
     
@@ -290,6 +298,10 @@ def test_mafia_model():
         f"Expected market_scores_full shape ({batch_size}, {N}), got {market_scores_full.shape}"
     assert gate_weights.shape == (batch_size, 4), \
         f"Expected gate_weights shape ({batch_size}, 4), got {gate_weights.shape}"
+    assert market_context.shape == (batch_size, config.mafia_D), \
+        f"Expected market_context shape ({batch_size}, {config.mafia_D}), got {market_context.shape}"
+    assert fused_stock_embedding.shape == (batch_size, N, config.mafia_D), \
+        f"Expected fused_stock_embedding shape ({batch_size}, {N}, {config.mafia_D}), got {fused_stock_embedding.shape}"
     assert th.allclose(gate_weights.sum(dim=-1), th.ones(batch_size)), \
         "Gate weights should sum to 1"
     assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
@@ -300,6 +312,8 @@ def test_mafia_model():
     print(f"✓ market_vector range: [{market_vector.min():.4f}, {market_vector.max():.4f}]")
     print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
     print(f"✓ gate_weights: {gate_weights[0].tolist()}")
+    print(f"✓ market_context shape: {market_context.shape}")
+    print(f"✓ fused_stock_embedding shape: {fused_stock_embedding.shape}")
     print("✓ MAFIA Model with Dense MoE: PASSED\n")
 
 
@@ -371,4 +385,3 @@ def run_all_tests():
 if __name__ == '__main__':
     success = run_all_tests()
     sys.exit(0 if success else 1)
-
