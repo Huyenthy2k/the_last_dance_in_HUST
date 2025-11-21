@@ -1,4 +1,5 @@
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 # Handle gym/gymnasium compatibility
@@ -562,27 +563,48 @@ class TD3Controller(OffPolicyAlgorithm):
         assert isinstance(env, VecEnv), "You must pass a VecEnv"
         assert train_freq.frequency > 0, "Should at least collect one step or episode."
 
+        status_last_time = time.time()
+        status_last_step = self.num_timesteps
+
         def _finalize_rollout_line() -> None:
             """Clear the live status line so future logs print normally."""
-            if getattr(self, "_live_rollout_line_active", False):
-                width = getattr(self, "_rollout_status_width", 0)
-                sys.stdout.write("\r" + (" " * width) + "\r")
+            if getattr(self, "_live_rollout_line_active", False) and sys.stdout.isatty():
+                sys.stdout.write("\r\033[2K")
                 sys.stdout.flush()
-                self._live_rollout_line_active = False
+            self._live_rollout_line_active = False
 
         def _log_rollout(message: str) -> None:
             _finalize_rollout_line()
             print(message, flush=True)
 
         def _log_rollout_status(timestep: int, episode: int, collected_steps: int) -> None:
-            message = f"[ROLLOUT] Collecting | Global step: {timestep} | Episode: {episode} | Rollout steps: {collected_steps}"
+            nonlocal status_last_time, status_last_step
+            now = time.time()
+            elapsed = max(now - status_last_time, 1e-8)
+            delta_steps = max(timestep - status_last_step, 0)
+            speed = delta_steps / elapsed
+            status_last_time, status_last_step = now, timestep
+
+            buffer_size = replay_buffer.size() if hasattr(replay_buffer, "size") else len(replay_buffer)
+            learning_starts = getattr(self, "learning_starts", 0)
+            warmup_phase = learning_starts > 0 and buffer_size < learning_starts
+            buffer_target = learning_starts if learning_starts > 0 else getattr(replay_buffer, "max_size", None)
+            buffer_display = f"{buffer_size}/{buffer_target}" if buffer_target else str(buffer_size)
+
+            label = "[WARM-UP]" if warmup_phase else "[ROLLOUT]"
+            message = f"{label} Global step {timestep} | Buffer {buffer_display} | Speed: {speed:.2f} steps/s"
             width = getattr(self, "_rollout_status_width", 0)
             width = max(width, len(message))
             self._rollout_status_width = width
             padded_message = message.ljust(width)
-            sys.stdout.write(f"\r{padded_message}")
-            sys.stdout.flush()
-            self._live_rollout_line_active = True
+            if sys.stdout.isatty():
+                sys.stdout.write(f"\r\033[2K{padded_message}")
+                sys.stdout.flush()
+                self._live_rollout_line_active = True
+            else:
+                # Non-interactive outputs (e.g., logs) cannot update a single line; print discrete entries instead.
+                print(padded_message, flush=True)
+                self._live_rollout_line_active = False
         
         # Log rollout start
         if self.verbose >= 1 and self._episode_num % 10 == 0:

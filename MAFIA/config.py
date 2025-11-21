@@ -164,10 +164,15 @@ class Config:
         )  # Dynamic market risk based on benchmark index
         self._calibrate_risk_bounds()
         self.cbf_gamma = 0.7
+        # Observer mini-epochs: train observer more frequently and reset its buffers to save memory
+        self.observer_mini_epoch_steps = (
+            100  # Set to 0 to disable mid-epoch observer training
+        )
         # TD3 config
         self.reward_scaling = 1
         self.learning_rate = 0.0001
-        self.learning_starts = 1000
+        # Warm-up at least as long as observer mini-epoch (but not too large to delay TD3)
+        self.learning_starts = max(self.observer_mini_epoch_steps, 300)
         self.batch_size = 256
         # Number of mini-batches the TD3 learner runs after each train_freq chunk.
         # Higher value ensures TD3 actually updates parameters frequently.
@@ -223,7 +228,7 @@ class Config:
             False  # Skip 3GB+ replay buffer for frequent step checkpoints
         )
         self.save_replay_buffer_on_epoch_checkpoints = (
-            True  # Keep replay buffer for less frequent epoch checkpoints
+            False  # Keep replay buffer for less frequent epoch checkpoints
         )
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21

@@ -271,6 +271,9 @@ class StockPortfolioEnv(gym.Env):
         self.rawdata.index = self.rawdata.date.factorize()[0]
         self.totalTradeDay = len(self.rawdata['date'].unique())
         self.stock_lst = np.sort(self.rawdata['stock'].unique())
+        # Mini-epoch tracking for observer mid-epoch training
+        self.observer_mini_epoch_steps = getattr(self.config, 'observer_mini_epoch_steps', 0)
+        self._observer_mini_step_counter = 0
 
         self.stock_index_map = {stock: idx for idx, stock in enumerate(self.stock_lst)}
         self.use_multibranch_state = getattr(self.config, 'rl_obs_use_multibranch_state', True) and self.config.enable_market_observer
@@ -387,7 +390,9 @@ class StockPortfolioEnv(gym.Env):
                 ori_profit_rate = np.append([1], np.array(self.return_raw_lst)[1:] / np.array(self.return_raw_lst)[:-1], axis=0)
                 adj_profit_rate = np.array(self.profit_lst) + 1
                 label_kwargs = {'mode': self.mode, 'ori_profit': ori_profit_rate, 'adj_profit': adj_profit_rate, 'ori_risk': np.array(self.risk_raw_lst), 'adj_risk': np.array(self.risk_cbf_lst)}
-                self.mkt_observer.train(**label_kwargs)       
+                print(f"[MAFIA][OBSERVER] ⭐ Epoch-end train @ epoch {self.epoch} | steps: {self.curTradeDay+1}/{self.totalTradeDay}", flush=True)
+                self.mkt_observer.train(**label_kwargs)
+                self._observer_mini_step_counter = 0        
             
             self.end_cputime = time.process_time()
             self.end_systime = time.perf_counter()
@@ -709,6 +714,25 @@ class StockPortfolioEnv(gym.Env):
             self.risk_adj_lst.append(cur_risk_boundary)
             self.ctrl_weight_lst.append(1.0)       
 
+            # Mid-epoch observer training to keep buffers small
+            if (
+                self.mode == 'train'
+                and self.config.enable_market_observer
+                and getattr(self.config, 'observer_mini_epoch_steps', 0) > 0
+            ):
+                self._observer_mini_step_counter += 1
+                if self._observer_mini_step_counter >= self.config.observer_mini_epoch_steps:
+                    try:
+                        print(
+                            f"[MAFIA][OBSERVER] Mini-epoch train @ step {self.curTradeDay}/{self.totalTradeDay} "
+                            f"(window={self.config.observer_mini_epoch_steps})",
+                            flush=True
+                        )
+                        self.mkt_observer.train(mode=self.mode)
+                    except Exception as e:
+                        print(f"[MAFIA] Warning: observer mini-epoch train failed: {e}", flush=True)
+                    self._observer_mini_step_counter = 0
+
             daily_return_ay = self.curData['DAILYRETURNS-{}'.format(self.config.dailyRetun_lookback)].values
             cur_cov = _build_cov_from_indicator(
                 daily_return_ay,
@@ -938,6 +962,7 @@ class StockPortfolioEnv(gym.Env):
         self.rl_reward_profit_lst = []
         self.cnt1 = 0
         self.cnt2 = 0
+        self._observer_mini_step_counter = 0
         self.stepcount = 0
         self.latest_invest_profile = None
 
@@ -2332,6 +2357,7 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 ori_profit_rate = np.append([1], np.array(self.return_raw_lst)[1:] / np.array(self.return_raw_lst)[:-1], axis=0)
                 adj_profit_rate = np.array(self.profit_lst) + 1
                 label_kwargs = {'ori_profit': ori_profit_rate, 'adj_profit': adj_profit_rate, 'ori_risk': np.array(self.risk_raw_lst), 'adj_risk': np.array(self.risk_cbf_lst)}
+                print(f"[MAFIA][OBSERVER] ⭐ Epoch-end train (cash env) @ epoch {self.epoch} | steps: {self.curTradeDay+1}/{self.totalTradeDay}", flush=True)
                 self.mkt_observer.train(**label_kwargs)
 
             self.end_cputime = time.process_time()
