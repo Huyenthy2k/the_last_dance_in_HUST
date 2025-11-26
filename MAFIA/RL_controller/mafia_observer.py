@@ -19,6 +19,7 @@ import pandas as pd
 import torch as th
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from typing import Tuple, Dict, Callable, Any, Optional
 
 th.autograd.set_detect_anomaly(True)
@@ -86,6 +87,9 @@ class MAFIAObserver:
         self.boundary_risk_lst = []   # Store boundary_risk for each step
         self.rate_of_price_change_lst = []  # Store rate_of_price_change for reward calculation
         self.mkt_direction_lst = []   # Store market direction labels
+        self.sigma_log_p_lst = []  # Store log-probabilities for market direction classification
+        self.last_sigma_log_p: Optional[th.Tensor] = None
+        self.last_sigma_pred: Optional[th.Tensor] = None
         
     def _validate_config(self):
         """Validate that config has all required MAFIA hyperparameters."""
@@ -114,14 +118,15 @@ class MAFIAObserver:
             **kwargs: Must include 'mode' ('train', 'valid', 'test')
         
         Returns:
-            tuple: (market_vector, lambda_val, boundary_risk, market_scores_full, gate_weights, market_context, fused_stock_embedding)
+            tuple: (market_vector, boundary_risk, market_scores_full, gate_weights, market_context, fused_stock_embedding, sigma_val, sigma_log_p)
                 - market_vector: (batch, N) numpy array - Top-K weights, zero elsewhere
-                - lambda_val: (batch,) numpy array (dummy zeros for MAFIA)
                 - boundary_risk: (batch,) numpy array (continuous risk value)
                 - market_scores_full: (batch, N) numpy array - Full market scores (softmax on all N assets, no Top-K mask)
                 - gate_weights: (batch, 4) numpy array - Dense MoE gate weights for 4 stock experts
                 - market_context: (batch, D) numpy array - Market condition embedding from gating encoder
                 - fused_stock_embedding: (batch, N, D) numpy array - Per-stock embedding fused via gate weights
+                - sigma_val: (batch,) numpy array - Direction class prediction (0/1/2)
+                - sigma_log_p: (batch, 3) numpy array - Log-probabilities for direction classes
         """
         mode = kwargs.get('mode', 'train')
         
@@ -173,16 +178,41 @@ class MAFIAObserver:
         
         if mode == 'train':
             self.mafia_model.train()
-            market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, stock_embedding = self.mafia_model(
+            (
+                market_vector,
+                boundary_risk,
+                topk_indices,
+                market_scores_full,
+                gate_weights,
+                market_context,
+                stock_embedding,
+                sigma_logits,
+            ) = self.mafia_model(
                 ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
             )
         else:
             self.mafia_model.eval()
             with th.no_grad():
-                market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, stock_embedding = self.mafia_model(
+                (
+                    market_vector,
+                    boundary_risk,
+                    topk_indices,
+                    market_scores_full,
+                    gate_weights,
+                    market_context,
+                    stock_embedding,
+                    sigma_logits,
+                ) = self.mafia_model(
                     ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
                 )
         
+        # Market direction prediction
+        sigma_log_p = F.log_softmax(sigma_logits, dim=-1)  # (batch, 3)
+        sigma_prob = sigma_log_p.exp()
+        sigma_pred = th.argmax(sigma_prob, dim=-1)  # (batch,)
+        self.last_sigma_log_p = sigma_log_p if mode == 'train' else sigma_log_p.detach()
+        self.last_sigma_pred = sigma_pred.detach()
+
         if mode == 'train':
             # Store for training (keep gradient for Policy Gradient)
             self.market_vector_lst.append(market_vector)  # Don't detach - need gradient
@@ -197,6 +227,8 @@ class MAFIAObserver:
         topk_indices_np = topk_indices.detach().cpu().numpy()
         market_scores_full_np = market_scores_full.detach().cpu().numpy()
         market_context_np = market_context.detach().cpu().numpy()
+        sigma_val_np = sigma_pred.detach().cpu().numpy()
+        sigma_log_p_np = sigma_log_p.detach().cpu().numpy()
         stock_embedding_np = None
         if stock_embedding is not None:
             stock_embedding_np = stock_embedding.detach().cpu().numpy()
@@ -249,10 +281,6 @@ class MAFIAObserver:
         if np.any(np.isnan(market_scores_full_np)) or np.any(np.isinf(market_scores_full_np)) or np.sum(np.abs(market_scores_full_np)) < 1e-8:
             market_scores_full_np = np.ones((market_scores_full_np.shape[0], self.action_dim)) / self.action_dim
         
-        # Return format compatible with MarketObserver
-        # lambda_val is not used in MAFIA, return zeros
-        lambda_val_np = np.zeros(boundary_risk_np.shape, dtype=np.float32)
-        
         # Extract gate_weights
         if hasattr(self, 'last_gate_weights') and self.last_gate_weights is not None:
             gate_weights_np = self.last_gate_weights.detach().cpu().numpy()
@@ -294,10 +322,25 @@ class MAFIAObserver:
         if fused_stock_embedding_np is None:
             fused_stock_embedding_np = np.zeros((market_vector_np.shape[0], self.action_dim, self.config.mafia_D), dtype=np.float32)
 
-        # Validate output shapes
-        self._validate_output_shapes(market_vector_np, lambda_val_np, boundary_risk_np)
+        # Market direction outputs
+        if sigma_val_np.ndim == 0:
+            sigma_val_np = sigma_val_np.reshape(1)
+        sigma_val_np = np.nan_to_num(sigma_val_np, nan=1.0, posinf=1.0, neginf=1.0).astype(np.int64)
+        sigma_log_p_np = np.nan_to_num(sigma_log_p_np, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return market_vector_np, lambda_val_np, boundary_risk_np, market_scores_full_np, gate_weights_np, market_context_np, fused_stock_embedding_np
+        # Validate output shapes
+        self._validate_output_shapes(market_vector_np, boundary_risk_np)
+
+        return (
+            market_vector_np,
+            boundary_risk_np,
+            market_scores_full_np,
+            gate_weights_np,
+            market_context_np,
+            fused_stock_embedding_np,
+            sigma_val_np,
+            sigma_log_p_np,
+        )
     
     def _prepare_ochlv_tensor(self, raw_ochlv_data):
         """
@@ -342,14 +385,13 @@ class MAFIAObserver:
         assert 'mode' in kwargs, "kwargs must include 'mode'"
         assert kwargs['mode'] in ['train', 'valid', 'test'], f"Invalid mode: {kwargs['mode']}"
     
-    def _validate_output_shapes(self, market_vector, lambda_val, boundary_risk):
+    def _validate_output_shapes(self, market_vector, boundary_risk):
         """Validate output shapes match MarketObserver format."""
         assert market_vector.shape[1] == self.action_dim, \
             f"market_vector shape mismatch: {market_vector.shape[1]} != {self.action_dim}"
         assert market_vector.ndim == 2, f"market_vector must be 2D, got {market_vector.ndim}D"
-        assert lambda_val.ndim == 1, f"lambda_val must be 1D, got {lambda_val.ndim}D"
         assert boundary_risk.ndim == 1, f"boundary_risk must be 1D, got {boundary_risk.ndim}D"
-        assert market_vector.shape[0] == lambda_val.shape[0] == boundary_risk.shape[0], \
+        assert market_vector.shape[0] == boundary_risk.shape[0], \
             "Batch sizes must match"
     
     def train(self, **label_kwargs):
@@ -386,7 +428,7 @@ class MAFIAObserver:
         
         # Concatenate all rewards
         reward_tensor = th.cat(reward_list, dim=0)  # (total_steps,)
-        mkt_direction_tensor = th.cat(self.mkt_direction_lst, dim=0)  # (total_steps,)
+        mkt_direction_tensor = th.cat(self.mkt_direction_lst, dim=0).long()  # (total_steps,)
         
         # Policy Gradient Loss for market_vector
         # Loss = -mean(reward) (maximize expected reward)
@@ -394,6 +436,19 @@ class MAFIAObserver:
         
         # Total loss
         total_loss = self.config.hidden_vec_loss_weight * loss_market_vector
+
+        # Optional market direction classification loss
+        direction_loss = None
+        if len(self.sigma_log_p_lst) > 0 and len(self.mkt_direction_lst) > 0:
+            sigma_log_p_tensor = th.cat(self.sigma_log_p_lst, dim=0)  # (total_steps, 3)
+            min_len = min(sigma_log_p_tensor.shape[0], mkt_direction_tensor.shape[0])
+            if min_len > 0:
+                sigma_log_p_tensor = sigma_log_p_tensor[:min_len]
+                direction_labels = mkt_direction_tensor[:min_len]
+                direction_loss = F.nll_loss(sigma_log_p_tensor, direction_labels)
+                weight = getattr(self.config, "market_direction_loss_weight", 1.0)
+                if weight > 0:
+                    total_loss = total_loss + weight * direction_loss
         
         # Backward pass
         self.optimizer.zero_grad()
@@ -412,6 +467,8 @@ class MAFIAObserver:
             mode, 
             total_loss.detach().cpu().item()
         )
+        if direction_loss is not None:
+            disp_str += " | dir_loss={:.6f}".format(direction_loss.detach().cpu().item())
         td3_actor = getattr(self.config, 'last_td3_actor_loss', None)
         td3_critic = getattr(self.config, 'last_td3_critic_loss', None)
         td3_reward = getattr(self.config, 'last_td3_mean_reward', None)
@@ -438,6 +495,9 @@ class MAFIAObserver:
         self.boundary_risk_lst = []
         self.rate_of_price_change_lst = []
         self.mkt_direction_lst = []
+        self.sigma_log_p_lst = []
+        self.last_sigma_log_p = None
+        self.last_sigma_pred = None
     
     def update_hidden_vec_reward(self, mode, rate_of_price_change, mkt_direction):
         """
@@ -483,7 +543,12 @@ class MAFIAObserver:
         # Store rate_of_price_change for reward calculation in train()
         # We'll compute reward from market_vector with gradient in train() method
         self.rate_of_price_change_lst.append(rate_of_price_change_stocks)
-        self.mkt_direction_lst.append(th.from_numpy(mkt_direction).to(self.device))
+        mkt_direction_tensor = th.from_numpy(mkt_direction).to(self.device)
+        self.mkt_direction_lst.append(mkt_direction_tensor)
+
+        # Store sigma log-probabilities for direction classification (keep gradient)
+        if self.last_sigma_log_p is not None:
+            self.sigma_log_p_lst.append(self.last_sigma_log_p)
     
     def save_checkpoint(self, checkpoint_path: str, epoch: int):
         """

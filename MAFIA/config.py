@@ -1,20 +1,6 @@
 # ！/usr/bin/python
 # -*- coding: utf-8 -*-#
 
-"""
----------------------------------
- Name:         config.py
- Description:  configuration file
- Author:       MASA
-
-Referenced Repository in Github
-Imple. of compared methods: https://github.com/ZhengyaoJiang/PGPortfolio/blob/48cc5a4af5edefd298e7801b95b0d4696f5175dd/pgportfolio/tdagent/tdagent.py#L7
-RL-based agent (TD3 imple.): Baselines3 (https://stable-baselines3.readthedocs.io/en/master/modules/td3.html)
-Trading environment: FinRL (https://github.com/AI4Finance-Foundation/FinRL)
-Technical indicator imple.: TA-Lib (https://github.com/TA-Lib/ta-lib-python)
-Second-order cone programming solver: CVXOPT (http://cvxopt.org/)
----------------------------------
-"""
 
 import argparse
 import datetime
@@ -24,8 +10,13 @@ import pandas as pd
 import sys
 import time
 from stable_baselines3.td3.policies import MultiInputPolicy
+from RL_controller.compressed_replay_buffer import (
+    CompressedDictReplayBuffer,
+    CompressedReplayBuffer,
+)
 from RL_controller.TD3_controller import TD3PolicyOriginal
 from RL_controller.feature_extractors import MAFIAMultiModalExtractor
+from stable_baselines3.common.utils import LinearSchedule
 
 
 class Config:
@@ -83,7 +74,7 @@ class Config:
         self.mafia_rl_topk_selection_method = (
             "topk"  # Options: 'topk' (select top K), 'threshold' (scores > threshold)
         )
-        self.mafia_rl_topk_threshold = 0.01  # Threshold for 'threshold' method (only stocks with score > threshold)
+        self.mafia_rl_topk_threshold = 0.02  # Threshold for 'threshold' method (only stocks with score > threshold)
 
         # CBF Controller: Use market_scores_full as prior distribution (works in both modes)
         self.mafia_cbf_use_prior = (
@@ -106,14 +97,28 @@ class Config:
         self.mafia_attention_agg = "weighted"  # Aggregation method for ST-Fusion embeddings in attention: 'mean', 'weighted', 'max'
 
         self.trade_pattern = 1  # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
-        self.lambda_1 = 0.99  # return reward weight
-        self.lambda_2 = 0.01  # JSD reward weight (encourage diversity)
+        # Reward weights (tuned via quick Optuna on mini window)
+        self.lambda_1 = 104.60178122433004  # return reward weight
+        self.lambda_2 = 22.001620711836445  # JS penalty weight (controller adherence)
+        # Encourage diversified actions (entropy regularizer on policy output)
+        self.entropy_coef = 0.0013865911407901592
         self.controller_reg_lambda = (
             1.0  # λ_reg: controller regularization weight ||x - a_RL||^2
         )
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
         )
+        # TD3 learning-rate schedule: 'linear' or None
+        self.td3_lr_schedule = "linear"
+        self.td3_lr_end_factor = 0.2  # end_lr = start_lr * end_factor
+        self.td3_lr_end_fraction = 0.5  # fraction of training where end_lr reached
+        # Turnover and membership-change penalties (turnover uses raw sum |w_t - w_{t-1}| )
+        self.lambda_tc = 2.9831220045534392
+        self.lambda_change = (
+            2.307535480569795  # Penalty weight for membership change (Top-K symmetric difference)
+        )
+        # Debug: log reward components for first N train steps (0 = disable)
+        self.reward_debug_steps = 5
         self.train_freq = [1, "step"]  # Update every trading step
         self.risk_default = 0.015
         self.risk_up_bound = 0.025  # bull market
@@ -145,6 +150,7 @@ class Config:
         self.max_zero_volume_days = (
             100  # Drop stocks with > this number of zero-volume days
         )
+        self.rebalance_interval = 1  # Days between portfolio rebalances
 
         if self.mode == "Benchmark":
             self.trained_best_model_type = "max_capital"
@@ -159,14 +165,10 @@ class Config:
         self.default_risk_market = (
             0.001  # Default fallback for market risk (\Sigma_beta)
         )
-        self.risk_market = (
-            self._compute_market_risk()
-        )  # Dynamic market risk based on benchmark index
-        self._calibrate_risk_bounds()
         self.cbf_gamma = 0.7
         # Observer mini-epochs: train observer more frequently and reset its buffers to save memory
         self.observer_mini_epoch_steps = (
-            100  # Set to 0 to disable mid-epoch observer training
+            252  # Set to 0 to disable mid-epoch observer training
         )
         # TD3 config
         self.reward_scaling = 1
@@ -177,7 +179,14 @@ class Config:
         # Number of mini-batches the TD3 learner runs after each train_freq chunk.
         # Higher value ensures TD3 actually updates parameters frequently.
         self.gradient_steps = 1
-        self.action_noise_sigma = 0.1  # Std-dev for Gaussian action noise
+        # Use SB3's memory-optimized replay buffer (safe when using VecEnv/DummyVecEnv)
+        self.optimize_memory_usage = True
+        # Compress observations inside the replay buffer to reduce memory footprint
+        self.compress_obs = True
+        self.replay_buffer_dtype = np.float16
+        self.action_noise_sigma = (
+            0.1328873248989795  # Std-dev for Gaussian action noise
+        )
         self.ars_trial = 10
         self.last_td3_actor_loss = None
         self.last_td3_critic_loss = None
@@ -208,14 +217,18 @@ class Config:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.checkpoint_freq = 1  # Save checkpoint every N epochs (0 to disable)
         self.validation_freq = (
-            10  # Run validation/test every N epochs (final epoch always runs)
+            1  # Run validation every N epochs (test runs only at final epoch)
         )
+        # Control whether to auto-generate Top-K CSVs during train/valid/test. Keep False to run Top-K separately.
+        self.enable_topk_postprocess = False
         # Step-based checkpointing (0 to disable, >0 saves every N timesteps)
         # Recommended: 500-1000 for frequent saves, or 0 to disable
         # Checkpoint/save configuration
         self.partial_checkpoint_steps = (
-            1000  # Save checkpoint every 1000 timesteps (0 to disable)
+            0  # Disable step-based checkpoints; only save per epoch/best_valid
         )
+        # Early stopping based on validation Sharpe (patience in epochs)
+        self.early_stop_patience = 2
         self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh or use auto_resume)
         self.auto_resume_from_latest = True  # Auto-resume from latest checkpoint if exists (when resume_from_checkpoint is None)
         self.enable_checkpoint_cleanup = (
@@ -228,11 +241,12 @@ class Config:
             False  # Skip 3GB+ replay buffer for frequent step checkpoints
         )
         self.save_replay_buffer_on_epoch_checkpoints = (
-            False  # Keep replay buffer for less frequent epoch checkpoints
+            True  # Save replay buffer on epoch checkpoints (uses float16 compression)
         )
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21
         self.seed_num = seed_num
+        self._market_risk_warned_insufficient = False
         date_split_dict = {
             1: {
                 "train_date_start": "2017-01-03 00:00:00",
@@ -274,6 +288,10 @@ class Config:
         else:
             self.test_date_start = None
             self.test_date_end = None
+
+        # Compute market risk using data available up to the end of the training period to avoid look-ahead bias
+        self.risk_market = self._compute_market_risk(cutoff_date=self.train_date_end)
+        self._calibrate_risk_bounds()
 
         self.tech_indicator_talib_lst = ["SMA", "RSI", "ATR"]
         self.tech_indicator_extra_lst = ["CHANGE"]
@@ -346,15 +364,18 @@ class Config:
         self.mafia_M_dc = 5  # Features for DC agents
         self.mafia_M_mkt = 19  # Features for Market-index agent (5 change + 3 basic + 11 extended indicators)
         self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
-        self.mafia_weight_decay = 0.001  # Weight decay for optimizer
+        self.mafia_weight_decay = 0.003  # Weight decay for optimizer
         self.hidden_vec_loss_weight = (
             1.0  # Weight for market_vector loss in Policy Gradient training
+        )
+        self.market_direction_loss_weight = (
+            1.0  # Weight for market direction classification loss
         )
 
         # Dense MoE Gating Configuration
         self.mafia_gating_encoder_type = self.DEFAULT_GATING_ENCODER  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
-        self.mafia_gating_dropout = 0.1  # Dropout for gating networks
+        self.mafia_gating_dropout = 0.2  # Dropout for gating networks
         self.mafia_gating_lstm_layers = 2  # For bidirectional_lstm encoder
         self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
 
@@ -445,6 +466,21 @@ class Config:
             and self.enable_market_observer
         )
 
+        # Select replay buffer implementation based on observation space (Dict vs Box)
+        if use_multibranch:
+            buffer_class = CompressedDictReplayBuffer
+            # DictReplayBuffer does not support optimize_memory_usage
+            optimize_memory_usage = False
+        else:
+            buffer_class = CompressedReplayBuffer
+            optimize_memory_usage = self.optimize_memory_usage
+
+        replay_buffer_kwargs = {
+            "handle_timeout_termination": False,
+            "compress_obs": self.compress_obs,
+            "storage_dtype": self.replay_buffer_dtype,
+        }
+
         if self.enable_market_observer:
             if self.rl_model_name == "TD3":
                 policy_name = MultiInputPolicy if use_multibranch else "TD3PolicyAdj"
@@ -466,10 +502,16 @@ class Config:
                     )
                 else:
                     policy_name = "MlpPolicy"
+        lr_value = self.learning_rate
+        if getattr(self, "td3_lr_schedule", None) == "linear":
+            end_lr = lr_value * getattr(self, "td3_lr_end_factor", 0.2)
+            frac = getattr(self, "td3_lr_end_fraction", 0.5)
+            lr_value = LinearSchedule(start=lr_value, end=end_lr, end_fraction=frac)
+
         base_para = {
             "policy": policy_name,
-            "learning_rate": self.learning_rate,
-            "buffer_size": 1000000,
+            "learning_rate": lr_value,
+            "buffer_size": int(2.6 * 1e5),
             "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "tau": 0.005,
@@ -478,12 +520,12 @@ class Config:
             "verbose": 1,
             "gradient_steps": self.gradient_steps,
             "action_noise": None,
-            "replay_buffer_class": None,
-            "replay_buffer_kwargs": None,
-            "optimize_memory_usage": False,
+            "replay_buffer_class": buffer_class,
+            "replay_buffer_kwargs": replay_buffer_kwargs,
+            "optimize_memory_usage": optimize_memory_usage,
+            "entropy_coef": self.entropy_coef,
             "tensorboard_log": "./tb_logs",
             "policy_kwargs": None,
-            "verbose": 1,
             "seed": self.seed_num,
             "device": "auto",
             "_init_setup_model": True,
@@ -567,11 +609,15 @@ class Config:
             description = cls.GATING_MODE_DESCRIPTIONS.get(alias, "")
             yield alias, encoder, description
 
-    def _compute_market_risk(self):
+    def _compute_market_risk(self, cutoff_date=None):
         """
         Estimate market-wide risk (sigma_beta) from benchmark index daily returns
         using the latest self.cov_lookback window. Falls back to default value if
         data is missing or invalid.
+
+        Args:
+            cutoff_date: Optional datetime-like upper bound for index data (ex-ante). If None,
+                         falls back to self.train_date_end when available.
         """
         fallback = getattr(self, "default_risk_market", 0.001)
         index_file = self.index_data_file
@@ -610,6 +656,25 @@ class Config:
             if "date" in index_df.columns:
                 index_df["date"] = pd.to_datetime(index_df["date"], errors="coerce")
                 index_df = index_df.sort_values("date")
+                effective_cutoff = (
+                    cutoff_date
+                    if cutoff_date is not None
+                    else getattr(self, "train_date_end", None)
+                )
+                if effective_cutoff is not None:
+                    cutoff_ts = pd.to_datetime(effective_cutoff)
+                    # Normalize timezone information to avoid comparison errors
+                    try:
+                        index_df["date"] = index_df["date"].dt.tz_localize(None)
+                    except Exception:
+                        pass
+                    try:
+                        cutoff_ts = cutoff_ts.tz_localize(None)
+                    except Exception:
+                        pass
+                    index_df = index_df[index_df["date"] <= cutoff_ts]
+            if len(index_df) < 2:
+                raise ValueError("Not enough rows in index data after filtering")
             closes = pd.to_numeric(index_df["close"], errors="coerce").dropna()
             if len(closes) < 2:
                 raise ValueError("Not enough close prices for returns")
@@ -617,16 +682,23 @@ class Config:
             if len(returns) == 0:
                 raise ValueError("Empty returns series")
             window = int(max(2, self.cov_lookback))
+            window = min(window, len(returns))
+            if window < 2:
+                raise ValueError("Not enough returns to compute std (window < 2)")
             recent_returns = returns.iloc[-window:]
             market_risk = recent_returns.std(ddof=1)
             if np.isnan(market_risk) or np.isinf(market_risk):
                 raise ValueError("Invalid market risk value")
             return float(market_risk)
         except Exception as e:
-            print(
-                f"[Config] Warning: Failed to compute market risk from {data_path}: {e}. Using default {fallback}",
-                flush=True,
-            )
+            # Avoid spamming when the only issue is insufficient history at very early dates
+            msg = f"[Config] Warning: Failed to compute market risk from {data_path}: {e}. Using default {fallback}"
+            if "Not enough" in str(e) or "Empty returns" in str(e):
+                if not getattr(self, "_market_risk_warned_insufficient", False):
+                    print(msg, flush=True)
+                    self._market_risk_warned_insufficient = True
+            else:
+                print(msg, flush=True)
             return fallback
 
     def _calibrate_risk_bounds(self):

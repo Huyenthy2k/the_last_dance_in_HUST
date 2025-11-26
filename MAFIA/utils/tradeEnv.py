@@ -31,7 +31,6 @@ except ImportError:
     GYM_SEEDING_AVAILABLE = False
 from stable_baselines3.common.vec_env import DummyVecEnv
 from scipy.stats import entropy
-from scipy.spatial.distance import jensenshannon
 import scipy.stats as spstats
 try:
     from utils.weight_symbol_mapper import get_top_stocks
@@ -197,6 +196,8 @@ class StockPortfolioEnv(gym.Env):
         self.reward_scaling = reward_scaling 
         self.norm_method = norm_method
         self.transaction_cost = transaction_cost # 0.001
+        self.lambda_tc = getattr(self.config, 'lambda_tc', self.transaction_cost)
+        self.rebalance_interval = getattr(self.config, 'rebalance_interval', 15)
         self.slippage = slippage # 0.001 for one-side, 0.002 for two-side
         self.cur_slippage_drift = np.random.random(self.stock_num) * (self.slippage * 2) - self.slippage
         if extra_data is not None:
@@ -425,11 +426,13 @@ class StockPortfolioEnv(gym.Env):
             return self.state, self.reward, self.terminal, False, {}
         else:
             actions = np.reshape(actions, (-1)) # [1, num_of_stocks] or [num_of_stocks, ]
-            weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights
-            self.actions_memory.append(weights)
+            turnover_amt = 0.0
             if self.curTradeDay == 0:
+                weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights
+                self.actions_memory.append(weights)
                 self.cur_capital = self.cur_capital * (1 - self.transaction_cost)
             else:
+                is_rebalance_step = (self.curTradeDay % self.rebalance_interval == 0)
                 # Ensure curData and lastDayData prices are aligned with stock_lst
                 cur_close_prices = np.zeros(self.stock_num)
                 last_close_prices = np.zeros(self.stock_num)
@@ -502,7 +505,7 @@ class StockPortfolioEnv(gym.Env):
                 cur_p = cur_close_prices * (1 + self.cur_slippage_drift)
                 last_p = last_close_prices * (1 + self.last_slippage_drift)
                 x_p = cur_p / last_p
-                last_action = np.array(self.actions_memory[-2])
+                last_action = np.array(self.actions_memory[-1])
                 x_p_adj = np.where((x_p>=2)&(last_action<0), 2, x_p)
                 sgn = np.sign(last_action)
                 # Check if loss the whole capital
@@ -511,7 +514,13 @@ class StockPortfolioEnv(gym.Env):
                 if (adj_cap <= 0) or np.all(adj_w_ay==0):
                     raise ValueError("Loss the whole capital! [Day: {}, date: {}, adj_cap: {}, adj_w_ay: {}]".format(self.curTradeDay, self.date_memory[-1], adj_cap, adj_w_ay))
                 last_w_adj = adj_w_ay / adj_cap
-                self.cur_capital = self.cur_capital * (1 - (np.sum(np.abs(self.actions_memory[-1] - last_w_adj)) * self.transaction_cost))
+                if is_rebalance_step:
+                    weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights
+                else:
+                    weights = last_w_adj  # Hold without trading on non-rebalance days
+                self.actions_memory.append(weights)
+                turnover_amt = np.sum(np.abs(weights - last_w_adj))
+                self.cur_capital = self.cur_capital * (1 - (turnover_amt * self.transaction_cost))
                 self.asset_lst[-1] = self.cur_capital
                 self.profit_lst[-1] = (self.cur_capital - self.asset_lst[-2]) / self.asset_lst[-2]
                 if len(self.action_rl_memory) > 1:
@@ -874,13 +883,56 @@ class StockPortfolioEnv(gym.Env):
                 w_rl_latest = weights
             weights_norm = _normalize_prob(weights)
             w_rl_norm = _normalize_prob(w_rl_latest)
-            js_distance = jensenshannon(w_rl_norm, weights_norm, base=2) ** 2
-            if np.isnan(js_distance) or np.isinf(js_distance):
-                js_distance = 0.0
+            js_m = 0.5 * (w_rl_norm + weights_norm)
+            js_divergence = (
+                0.5 * entropy(pk=w_rl_norm, qk=js_m, base=2)
+                + 0.5 * entropy(pk=weights_norm, qk=js_m, base=2)
+            )
+            if np.isnan(js_divergence) or np.isinf(js_divergence):
+                js_divergence = 0.0
             j_return = profit_part  # log-return at current step
             scaled_profit_part = self.config.lambda_1 * j_return
-            scaled_js_part = self.config.lambda_2 * js_distance
-            cur_reward = scaled_profit_part + scaled_js_part
+            # Penalize deviation between RL action and controller-adjusted action
+            scaled_js_part = self.config.lambda_2 * js_divergence
+            turnover_penalty = self.lambda_tc * turnover_amt
+            # Membership change penalty: phạt số mã ra/vào Top-K giữa hai ngày
+            change_penalty = 0.0
+            try:
+                if len(self.actions_memory) > 1:
+                    k = getattr(self.config, "topK", 10)
+                    prev_w = np.array(self.actions_memory[-2])
+                    curr_w = np.array(weights)
+                    # Bỏ tiền mặt nếu có: actions_memory lưu weights đã chuẩn hóa (không cash)
+                    if prev_w.shape[0] == curr_w.shape[0] + 1:
+                        prev_w = prev_w[1:]
+                    if curr_w.shape[0] == prev_w.shape[0] + 1:
+                        curr_w = curr_w[1:]
+                    k = max(1, min(k, len(curr_w)))
+                    prev_top = set(np.argsort(prev_w)[-k:])
+                    curr_top = set(np.argsort(curr_w)[-k:])
+                    sym_diff = prev_top.symmetric_difference(curr_top)
+                    # Chuẩn hóa theo k để scale 0..2
+                    change_penalty = (len(sym_diff) / float(k)) * getattr(
+                        self.config, "lambda_change", 0.0
+                    )
+            except Exception as e:
+                print(f"[Reward] change_penalty skipped: {e}", flush=True)
+                change_penalty = 0.0
+
+            # Final reward: profit minus JS penalty minus turnover/change penalties
+            cur_reward = scaled_profit_part - scaled_js_part - turnover_penalty - change_penalty
+
+            # Optional debug log for reward components (early train steps)
+            self._log_reward_debug(
+                j_return,
+                scaled_profit_part,
+                js_divergence,
+                scaled_js_part,
+                turnover_amt,
+                turnover_penalty,
+                change_penalty,
+                cur_reward,
+            )
 
             self.rl_reward_risk_lst.append(scaled_js_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)
@@ -1387,6 +1439,16 @@ class StockPortfolioEnv(gym.Env):
         rl_action_abs = _align_array(np.sum(np.abs(np.array(self.action_rl_memory)), axis=1))
         cbf_action_abs = _align_array(np.sum(np.abs(np.array(self.action_cbf_memeory)), axis=1))
 
+        # Compute aggregate reward statistics
+        if len(self.reward_lst) > 0:
+            reward_arr = np.array(self.reward_lst, dtype=float)
+            if np.all(np.isnan(reward_arr)):
+                reward_mean = 0.0
+            else:
+                reward_mean = float(np.nanmean(reward_arr))
+        else:
+            reward_mean = 0.0
+
         info_dict = {
             'ep': self.epoch, 'trading_days': self.totalTradeDay, 'annualReturn_pct': annualReturn_pct, 'volatility': volatility, 'sharpeRatio': sharpeRatio, 'sharpeRatio_wocbf': sharpeRatio_woCBF,
             'mdd': self.mdd, 'calmarRatio': calmarRatio, 'sterlingRatio': sterlingRatio, 'netProfit': netProfit, 'netProfit_pct': netProfit_pct, 'winRate': winRate,
@@ -1397,7 +1459,8 @@ class StockPortfolioEnv(gym.Env):
             'dailyReturn_pct_max': dailyReturn_pct_max, 'dailyReturn_pct_min': dailyReturn_pct_min, 'dailyReturn_pct_avg': avg_dailyReturn_pct,
             'sigReturn_max': sigReturn_max, 'sigReturn_min': sigReturn_min, 
             'mdd_high': self.mdd_high, 'mdd_low': self.mdd_low, 'mdd_high_date': self.mdd_highTimepoint, 'mdd_low_date': self.mdd_lowTimepoint, 
-            'final_capital': self.cur_capital, 'reward_sum': np.nansum(self.reward_lst) if len(self.reward_lst) > 0 else 0.0,
+            # Store reward as mean instead of absolute sum to make cross-epoch comparisons fair
+            'final_capital': self.cur_capital, 'reward_sum': reward_mean,
             'final_capital_wocbf': self.return_raw_lst[-1], 
             'cbf_contribution': cbf_abssum_contribution,
             'risk_downsideAtVol': risk_downsideAtVol, 'risk_downsideAtVol_daily_max': risk_downsideAtVol_daily_max, 'risk_downsideAtVol_daily_min': risk_downsideAtVol_daily_min, 'risk_downsideAtVol_daily_avg': risk_downsideAtVol_daily_avg,
@@ -1429,6 +1492,15 @@ class StockPortfolioEnv(gym.Env):
         return info_dict
 
     def save_profile(self, invest_profile):
+        # Prevent duplicate save when save_profile is called multiple times in same epoch/mode
+        if not hasattr(self, "_profile_saved_epochs"):
+            self._profile_saved_epochs = set()
+        ep_key = (self.mode, invest_profile.get("ep", getattr(self, "epoch", None)))
+        if ep_key in self._profile_saved_epochs:
+            print(f"[Profile Save] Skip duplicate save for {ep_key}", flush=True)
+            return
+        self._profile_saved_epochs.add(ep_key)
+
         # basic data
         missing_fields = []
         for fname in self.profile_hist_field_lst:
@@ -1824,6 +1896,12 @@ class StockPortfolioEnv(gym.Env):
 
     def run_mkt_observer(self, stage=None, rate_of_price_change=None):
         cur_date = self.curData['date'].unique()[0]
+        # Recompute market risk ex-ante for current date to avoid look-ahead within episodes
+        try:
+            self.config.risk_market = self.config._compute_market_risk(cutoff_date=cur_date)
+            self.config._calibrate_risk_bounds()
+        except Exception as e:
+            print(f"[tradeEnv] Warning: failed to update rolling market risk at {cur_date}: {e}", flush=True)
         if self.config.enable_market_observer:
             if stage in ['reset', 'init'] and (self.mode == 'train'):
                 self.mkt_observer.reset()
@@ -1873,8 +1951,16 @@ class StockPortfolioEnv(gym.Env):
                 self.latest_stock_ma_price = full_ma_price
                 
             input_kwargs = {'mode': self.mode, 'env': self}  # Pass environment for market-index data extraction
-            (market_vector_np, lambda_val, boundary_risk_np, market_scores_full_np,
-             gate_weights_np, market_context_np, stock_embedding_np) = self.mkt_observer.predict(
+            (
+                market_vector_np,
+                boundary_risk_np,
+                market_scores_full_np,
+                gate_weights_np,
+                market_context_np,
+                stock_embedding_np,
+                sigma_val_np,
+                sigma_log_p_np,
+            ) = self.mkt_observer.predict(
                 raw_ochlv_data=raw_ochlv_data, 
                 **input_kwargs
             )
@@ -1933,14 +2019,29 @@ class StockPortfolioEnv(gym.Env):
             
             # Handle continuous boundary_risk from MAFIA
             if self.config.is_enable_dynamic_risk_bound:
-                # boundary_risk is continuous (ℝ^+)
-                boundary_risk_raw = float(boundary_risk_np[-1])  # Get scalar value
-                # Clip to reasonable range
-                cur_risk_boundary = np.clip(
-                    boundary_risk_raw,
-                    self.config.risk_up_bound,
-                    self.config.risk_down_bound
-                )
+                direction_idx = None
+                if sigma_val_np is not None and len(sigma_val_np) > 0:
+                    try:
+                        direction_idx = int(np.clip(sigma_val_np[-1], 0, 2))
+                    except Exception:
+                        direction_idx = None
+                if direction_idx is not None:
+                    self.last_mkt_direction_pred = direction_idx
+                    if direction_idx == 0:
+                        cur_risk_boundary = self.config.risk_up_bound
+                    elif direction_idx == 1:
+                        cur_risk_boundary = self.config.risk_hold_bound
+                    else:
+                        cur_risk_boundary = self.config.risk_down_bound
+                else:
+                    # boundary_risk is continuous (ℝ^+)
+                    boundary_risk_raw = float(boundary_risk_np[-1])  # Get scalar value
+                    # Clip to reasonable range
+                    cur_risk_boundary = np.clip(
+                        boundary_risk_raw,
+                        self.config.risk_up_bound,
+                        self.config.risk_down_bound
+                    )
             else:
                 cur_risk_boundary = self.config.risk_default
 
@@ -2210,8 +2311,8 @@ class StockPortfolioEnv(gym.Env):
             ['risk_raw', 'risk_market',
              'log_capital', 'last_turnover', 'drawdown']
         )
-        # global dim = market_context(D) + gate_weights(4) + selected scalars
-        self.rl_global_dim = self.config.mafia_D + 4 + len(self.rl_global_scalar_items)
+        # global dim = market_context(D) + market_direction(1) + selected scalars
+        self.rl_global_dim = self.config.mafia_D + 1 + len(self.rl_global_scalar_items)
         self.market_context_vec = np.zeros(self.config.mafia_D, dtype=np.float32)
         self._reset_rl_multibranch_buffers()
 
@@ -2227,6 +2328,41 @@ class StockPortfolioEnv(gym.Env):
         self.latest_stock_ma_price = np.ones(self.stock_num, dtype=np.float32)
         self.per_stock_embedding = np.zeros((self.stock_num, self.config.mafia_D), dtype=np.float32)
 
+    def _log_reward_debug(
+        self,
+        j_return: float,
+        scaled_profit_part: float,
+        js_divergence: float,
+        scaled_js_part: float,
+        turnover_amt: float,
+        turnover_penalty: float,
+        change_penalty: float,
+        cur_reward: float,
+    ):
+        """Log reward components for early steps (controlled by config.reward_debug_steps)."""
+        debug_steps = getattr(self.config, "reward_debug_steps", 0)
+        if debug_steps <= 0 or self.mode != 'train' or self.curTradeDay > debug_steps:
+            return
+        try:
+            print(
+                "[REWARD-DEBUG] day={} j_return={:.6f} scaled_profit={:.4f} "
+                "js={:.6f} scaled_js={:.4f} turnover={:.4f} turnover_pen={:.4f} "
+                "change_pen={:.4f} reward={:.4f}".format(
+                    self.curTradeDay,
+                    float(j_return),
+                    float(scaled_profit_part),
+                    float(js_divergence),
+                    float(scaled_js_part),
+                    float(turnover_amt),
+                    float(turnover_penalty),
+                    float(change_penalty),
+                    float(cur_reward),
+                ),
+                flush=True,
+            )
+        except Exception:
+            pass
+
     def _build_multibranch_state(self, cur_risk_boundary):
         global_context = self._compose_global_context_vector(cur_risk_boundary)
         per_stock = self._compose_per_stock_features()
@@ -2241,11 +2377,9 @@ class StockPortfolioEnv(gym.Env):
         market_context = getattr(self, 'market_context_vec', None)
         if market_context is None or len(market_context) != self.config.mafia_D:
             market_context = np.zeros(self.config.mafia_D, dtype=np.float32)
-        gate_weights = getattr(self, 'gate_weights', None)
-        if gate_weights is None or gate_weights.shape[0] != 4:
-            gate_weights = np.ones(4, dtype=np.float32) / 4.0
-        else:
-            gate_weights = gate_weights.astype(np.float32)
+        # Market direction prediction from observer (0/1/2), fallback -1 if unavailable
+        market_direction = getattr(self, 'last_mkt_direction_pred', None)
+        market_direction_val = float(market_direction) if market_direction is not None else -1.0
 
         # Map scalar items to current values
         scalar_lookup = {
@@ -2262,7 +2396,14 @@ class StockPortfolioEnv(gym.Env):
         for key in self.rl_global_scalar_items:
             scalars.append(float(scalar_lookup.get(key, 0.0)))
         padded_scalars = np.array(scalars, dtype=np.float32)
-        return np.concatenate([market_context.astype(np.float32), gate_weights, padded_scalars], axis=0)
+        return np.concatenate(
+            [
+                market_context.astype(np.float32),
+                np.array([market_direction_val], dtype=np.float32),
+                padded_scalars,
+            ],
+            axis=0,
+        )
 
     def _compose_per_stock_features(self):
         scores = self.market_scores_full if isinstance(self.market_scores_full, np.ndarray) else np.zeros(self.stock_num)
@@ -2374,11 +2515,13 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
             return self.state, self.reward, self.terminal, False, {}
         else:
             actions = np.reshape(actions, (-1)) # [1, num_of_stocks] or [num_of_stocks, ]
-            weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights 
-            self.actions_memory.append(weights[1:]) 
+            turnover_amt = 0.0
             if self.curTradeDay == 0:
+                weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights 
+                self.actions_memory.append(weights[1:]) 
                 self.cur_capital = self.cur_capital * (1 - (1-1/len(weights)) * self.transaction_cost)
             else:
+                is_rebalance_step = (self.curTradeDay % self.rebalance_interval == 0)
                 # Ensure curData and lastDayData prices are aligned with stock_lst
                 cur_close_prices = np.zeros(self.stock_num)
                 last_close_prices = np.zeros(self.stock_num)
@@ -2422,7 +2565,7 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 cur_p = cur_close_prices * (1 + self.cur_slippage_drift)
                 last_p = last_close_prices * (1 + self.last_slippage_drift)
                 x_p = cur_p / last_p
-                last_action = np.array(self.actions_memory[-2])
+                last_action = np.array(self.actions_memory[-1])
                 last_action = np.append([1.0 - np.sum(np.abs(last_action))], last_action, axis=0) # cash
                 x_p_adj = np.where((x_p>=2)&(last_action[1:]<0), 2, x_p)
                 x_p_adj = np.append([1.0], x_p_adj, axis=0) # cash
@@ -2433,7 +2576,13 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 if (adj_cap <= 0) or np.all(adj_w_ay==0):
                     raise ValueError("Loss the whole capital! [Day: {}, date: {}, adj_cap: {}, adj_w_ay: {}]".format(self.curTradeDay, self.date_memory[-1], adj_cap, adj_w_ay))
                 last_w_adj = adj_w_ay / adj_cap
-                self.cur_capital = self.cur_capital * (1 - (np.sum(np.abs(self.actions_memory[-1] - last_w_adj[1:])) * self.transaction_cost))
+                if is_rebalance_step:
+                    weights = self.weights_normalization(actions=actions) # Unnormalized weights -> normalized weights 
+                else:
+                    weights = last_w_adj
+                self.actions_memory.append(weights[1:]) 
+                turnover_amt = np.sum(np.abs(weights[1:] - last_w_adj[1:]))
+                self.cur_capital = self.cur_capital * (1 - (turnover_amt * self.transaction_cost))
                 self.asset_lst[-1] = self.cur_capital
                 self.profit_lst[-1] = (self.cur_capital - self.asset_lst[-2]) / self.asset_lst[-2]
                 if len(self.action_rl_memory) > 1:
@@ -2612,13 +2761,29 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
                 w_rl_latest = weights
             weights_norm = _normalize_prob(weights)
             w_rl_norm = _normalize_prob(w_rl_latest)
-            js_distance = jensenshannon(w_rl_norm, weights_norm, base=2) ** 2
-            if np.isnan(js_distance) or np.isinf(js_distance):
-                js_distance = 0.0
+            js_m = 0.5 * (w_rl_norm + weights_norm)
+            js_divergence = (
+                0.5 * entropy(pk=w_rl_norm, qk=js_m, base=2)
+                + 0.5 * entropy(pk=weights_norm, qk=js_m, base=2)
+            )
+            if np.isnan(js_divergence) or np.isinf(js_divergence):
+                js_divergence = 0.0
             j_return = profit_part
             scaled_profit_part = self.config.lambda_1 * j_return
-            scaled_js_part = self.config.lambda_2 * js_distance
-            cur_reward = scaled_profit_part + scaled_js_part
+            scaled_js_part = self.config.lambda_2 * js_divergence
+            turnover_penalty = self.lambda_tc * turnover_amt
+            cur_reward = scaled_profit_part - scaled_js_part - turnover_penalty
+
+            self._log_reward_debug(
+                j_return,
+                scaled_profit_part,
+                js_divergence,
+                scaled_js_part,
+                turnover_amt,
+                turnover_penalty,
+                0.0,
+                cur_reward,
+            )
 
             self.rl_reward_risk_lst.append(scaled_js_part)
             self.rl_reward_profit_lst.append(scaled_profit_part)

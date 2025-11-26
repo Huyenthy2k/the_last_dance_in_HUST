@@ -72,7 +72,16 @@ def test_mafia_observer_predict():
         raw_ochlv_data = np.random.rand(N, M, T_w) * 100 + 50
         
         # Test predict
-        market_vector, lambda_val, boundary_risk = observer.predict(
+        (
+            market_vector,
+            boundary_risk,
+            _market_scores_full,
+            _gate_weights,
+            _market_context,
+            _stock_embedding,
+            sigma_val,
+            sigma_log_p,
+        ) = observer.predict(
             raw_ochlv_data=raw_ochlv_data,
             mode='test'
         )
@@ -80,14 +89,13 @@ def test_mafia_observer_predict():
         # Verify outputs
         assert market_vector.shape == (1, N), \
             f"Expected market_vector shape (1, {N}), got {market_vector.shape}"
-        assert lambda_val.shape == (1,), \
-            f"Expected lambda_val shape (1,), got {lambda_val.shape}"
         assert boundary_risk.shape == (1,), \
             f"Expected boundary_risk shape (1,), got {boundary_risk.shape}"
+        assert sigma_val.shape[0] == 1, "sigma_val should have batch dimension"
+        assert sigma_log_p.shape[1] == 3, "sigma_log_p should have 3 direction logits"
         assert (boundary_risk > 0).all(), "boundary_risk should be positive"
         
         print(f"✓ market_vector shape: {market_vector.shape}")
-        print(f"✓ lambda_val shape: {lambda_val.shape}")
         print(f"✓ boundary_risk shape: {boundary_risk.shape}")
         print(f"✓ market_vector range: [{market_vector.min():.4f}, {market_vector.max():.4f}]")
         print(f"✓ boundary_risk value: {boundary_risk[0]:.4f}")
@@ -168,7 +176,16 @@ def test_mafia_with_real_data():
                         ochlv_array[i, 4, j] = day_data['volume'].values[0]
             
             # Test predict
-            market_vector, lambda_val, boundary_risk = observer.predict(
+            (
+                market_vector,
+                boundary_risk,
+                _market_scores_full,
+                _gate_weights,
+                _market_context,
+                _stock_embedding,
+                _sigma_val,
+                _sigma_log_p,
+            ) = observer.predict(
                 raw_ochlv_data=ochlv_array,
                 mode='test'
             )
@@ -266,4 +283,3 @@ def run_end_to_end_tests():
 if __name__ == '__main__':
     success = run_end_to_end_tests()
     sys.exit(0 if success else 1)
-

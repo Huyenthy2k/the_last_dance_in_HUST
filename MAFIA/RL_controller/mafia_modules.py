@@ -703,6 +703,7 @@ class DenseMoESignalGenerator(nn.Module):
         self.T_w = config.mafia_T_w
         self.K = config.mafia_top_k
         self.tau_gumbel = getattr(config, 'mafia_gumbel_temperature', 1.0)
+        self.num_direction_classes = 3
         
         # Dense MoE Gating Router (for 4 stock experts: Tech + 3 DC)
         self.gating_router = DenseMoEGatingRouter(config, num_experts=4)
@@ -721,6 +722,14 @@ class DenseMoESignalGenerator(nn.Module):
             nn.Linear(self.D, 1),
             nn.Softplus()  # Ensure positive risk value
         )
+
+        # Direction classification head (market direction: up/hold/down)
+        self.direction_head = nn.Sequential(
+            nn.Linear(self.T_w * self.D * 4, self.D),
+            nn.LayerNorm(self.D),
+            nn.GELU(),
+            nn.Linear(self.D, self.num_direction_classes)
+        )
     
     def forward(
         self, 
@@ -728,7 +737,7 @@ class DenseMoESignalGenerator(nn.Module):
         expert_ta_outputs: list,   # [O_tech_TA, O_dc1_TA, O_dc2_TA, O_dc3_TA]
         O_mkt_TA: Optional[th.Tensor],  # Market-index TA output for gating
         expert_st_embeddings: Optional[list] = None  # Optional per-stock embeddings per expert [(batch, N, D)]
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor], th.Tensor]:
         """
         Dense MoE forward pass.
         
@@ -745,6 +754,7 @@ class DenseMoESignalGenerator(nn.Module):
             gate_weights: (batch, 4) - Expert weights from gating router
             market_context: (batch, D) - Market condition embedding from gating encoder
             fused_stock_embedding: (batch, N, D) or None - Weighted fusion of expert ST embeddings per stock
+            sigma_logits: (batch, 3) - Logits for market direction classification (up/hold/down)
         """
         # Input validation
         num_experts = len(expert_outputs)
@@ -829,8 +839,20 @@ class DenseMoESignalGenerator(nn.Module):
         # Compute risk
         boundary_risk = self.risk_network(expert_ta_flat)  # (batch, 1)
         boundary_risk = boundary_risk.squeeze(-1)  # (batch,)
+
+        # Market direction logits
+        sigma_logits = self.direction_head(expert_ta_flat)  # (batch, 3)
         
-        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding
+        return (
+            market_vector,
+            boundary_risk,
+            topk_indices,
+            market_scores_full,
+            gate_weights,
+            market_context,
+            fused_stock_embedding,
+            sigma_logits,
+        )
 
 
 class MAFIAModel(nn.Module):
@@ -961,8 +983,29 @@ class MAFIAModel(nn.Module):
             O_mkt_TA = self.mkt_ta(P_mkt)  # (batch, T_w, D)
         
         # Dense MoE Signal Generator
-        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = self.signal_generator(
-            stock_expert_outputs, stock_expert_ta_outputs, O_mkt_TA, expert_st_embeddings=[O_tech_ST] + O_dc_ST_list
+        (
+            market_vector,
+            boundary_risk,
+            topk_indices,
+            market_scores_full,
+            gate_weights,
+            market_context,
+            fused_stock_embedding,
+            sigma_logits,
+        ) = self.signal_generator(
+            stock_expert_outputs,
+            stock_expert_ta_outputs,
+            O_mkt_TA,
+            expert_st_embeddings=[O_tech_ST] + O_dc_ST_list,
         )
 
-        return market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding
+        return (
+            market_vector,
+            boundary_risk,
+            topk_indices,
+            market_scores_full,
+            gate_weights,
+            market_context,
+            fused_stock_embedding,
+            sigma_logits,
+        )

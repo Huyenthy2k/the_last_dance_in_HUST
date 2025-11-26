@@ -135,7 +135,16 @@ def test_state_dimensions():
         dummy_ochlv = np.random.randn(stock_num, 5, T_w).astype(np.float32)
         
         # Test predict
-        market_vector, lambda_val, boundary_risk, market_scores_full, gate_weights = mafia_observer.predict(
+        (
+            market_vector,
+            boundary_risk,
+            market_scores_full,
+            gate_weights,
+            _market_context,
+            _stock_embedding,
+            _sigma_val,
+            _sigma_log_p,
+        ) = mafia_observer.predict(
             raw_ochlv_data=dummy_ochlv,
             mode='test'
         )
@@ -206,4 +215,3 @@ def test_state_dimensions():
 if __name__ == '__main__':
     success = test_state_dimensions()
     sys.exit(0 if success else 1)
-

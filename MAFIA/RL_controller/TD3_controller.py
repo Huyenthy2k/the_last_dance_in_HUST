@@ -299,6 +299,7 @@ class TD3Controller(OffPolicyAlgorithm):
         replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
+        entropy_coef: float = 0.0,
         policy_delay: int = 2,
         target_policy_noise: float = 0.2,
         target_noise_clip: float = 0.5,
@@ -334,6 +335,7 @@ class TD3Controller(OffPolicyAlgorithm):
             supported_action_spaces=(gym.spaces.Box,),
             support_multi_env=True,
         )
+        self.entropy_coef = entropy_coef
         self._warmup_notice_printed = False
 
         self.policy_delay = policy_delay
@@ -419,7 +421,16 @@ class TD3Controller(OffPolicyAlgorithm):
             # Delayed policy updates
             if self._n_updates % self.policy_delay == 0:
                 # Compute actor loss
-                actor_loss = -self.critic.q1_forward(replay_data.observations, self.actor(replay_data.observations)).mean()
+                actor_actions = self.actor(replay_data.observations)
+                base_actor_loss = -self.critic.q1_forward(replay_data.observations, actor_actions).mean()
+                entropy_term = 0.0
+                if getattr(self, "entropy_coef", 0.0) > 0:
+                    probs = th.softmax(actor_actions, dim=1)
+                    entropy = -(probs * (probs.clamp(min=1e-8)).log()).sum(dim=1).mean()
+                    entropy_term = entropy
+                    actor_loss = base_actor_loss - self.entropy_coef * entropy
+                else:
+                    actor_loss = base_actor_loss
                 actor_losses.append(actor_loss.item())
 
                 # Optimize the actor

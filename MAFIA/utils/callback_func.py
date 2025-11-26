@@ -24,8 +24,14 @@ import random
 import pickle
 import torch as th
 import math
+import importlib
 sys.path.append('..')
 from RL_controller.controllers import RL_withoutController, RL_withController
+# Robust import of postprocess_topk
+try:
+    import postprocess_topk  # type: ignore
+except Exception:
+    postprocess_topk = None
 
 class PoCallback(BaseCallback):
 
@@ -49,6 +55,8 @@ class PoCallback(BaseCallback):
         self.last_logged_epoch = -1
         self.step_counter = 0
         self.start_time = time.time()
+        self._last_speed_time = self.start_time
+        self._last_speed_steps = 0
         self.last_known_portfolio = None
         # Checkpoint / replay-buffer housekeeping configuration
         self.enable_checkpoint_cleanup = getattr(config, 'enable_checkpoint_cleanup', False)
@@ -59,6 +67,7 @@ class PoCallback(BaseCallback):
         self.save_replay_buffer_on_epoch_checkpoints = getattr(
             config, 'save_replay_buffer_on_epoch_checkpoints', True
         )
+        self.early_stop_patience = getattr(config, 'early_stop_patience', 0)
         # Metrics logging
         default_metrics_path = getattr(self.config, 'metrics_history_path', None)
         if not default_metrics_path:
@@ -77,6 +86,118 @@ class PoCallback(BaseCallback):
         self._rollout_debug_logged = False
         self._training_ready = False
         self._warmup_notice_printed = False
+        self.best_valid_sharpe = -np.inf
+        self.valid_no_improve_epochs = 0
+        self._early_stop = False
+        self.best_valid_checkpoint_path = None
+
+    def _on_training_start(self) -> None:
+        # Initialize speed baseline to current timestep (handles resume from checkpoint)
+        self._last_speed_steps = self.num_timesteps
+        self._last_speed_time = time.time()
+
+    def _build_topk_recommendation(self, env, phase, epoch):
+        """
+        Aggregate actions over recent rebalance periods to produce a stable Top-K.
+        Saves CSV in res_dir with symbols and weights.
+        """
+        # Ensure we can import postprocess_topk even if top-level import failed
+        pp_mod = postprocess_topk
+        if pp_mod is None:
+            try:
+                import importlib
+                # Try relative to this file's directory (agents/MAFIA)
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if base_dir not in sys.path:
+                    sys.path.append(base_dir)
+                pp_mod = importlib.import_module('postprocess_topk')
+            except Exception as e:
+                print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: cannot import postprocess_topk ({e})", flush=True)
+                return None
+
+        actions_array = None
+        stock_lst = None
+
+        # Primary source: env actions_memory
+        if env is not None and hasattr(env, 'actions_memory') and hasattr(env, 'stock_lst'):
+            stock_lst = getattr(env, 'stock_lst')
+            actions = getattr(env, 'actions_memory', None)
+            if actions is not None:
+                actions_array = np.array(actions)
+                if actions_array.ndim != 2:
+                    try:
+                        actions_array = actions_array.reshape(len(actions_array), -1)
+                    except Exception as e:
+                        print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: cannot reshape actions ({e})", flush=True)
+                        actions_array = None
+                if actions_array is not None and actions_array.shape[1] == len(stock_lst) + 1:
+                    actions_array = actions_array[:, 1:]  # drop cash
+
+        # Fallback: load actions CSV from res_dir
+        if actions_array is None:
+            actions_file = os.path.join(getattr(self.config, 'res_dir', '.'), f"{phase}_actions.csv")
+            if os.path.exists(actions_file):
+                try:
+                    df = pd.read_csv(actions_file)
+                    if 'date' in df.columns:
+                        df = df.drop(columns=['date'])
+                    actions_array = df.to_numpy()
+                    stock_lst = df.columns.tolist() if stock_lst is None else stock_lst
+                    print(f"[POSTPROCESS_TOPK] Using actions from file {actions_file}", flush=True)
+                except Exception as e:
+                    print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: failed to load {actions_file} ({e})", flush=True)
+            else:
+                print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: actions_memory/file not available", flush=True)
+                return None
+
+        if stock_lst is None:
+            print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: stock list unavailable", flush=True)
+            return None
+
+        interval = getattr(self.config, 'rebalance_interval', 15)
+        if actions_array.shape[0] < interval:
+            print(f"[POSTPROCESS_TOPK] Skipped {phase} epoch {epoch}: only {actions_array.shape[0]} steps < interval {interval}", flush=True)
+            return None
+        periods = max(1, min(actions_array.shape[0] // max(interval, 1), 6))
+        k = getattr(self.config, 'topK', min(len(stock_lst), 10))
+        try:
+            top_idx, w_final = pp_mod.aggregate_topk(
+                actions_history=actions_array,
+                k=k,
+                interval=interval,
+                periods=periods,
+                alpha=0.5,
+                max_cap=0.25,
+                vol=None,
+                w_prev=None,
+                max_step=0.1,
+            )
+        except Exception as e:
+            print(f"[POSTPROCESS_TOPK] Skip {phase} epoch {epoch}: {e}", flush=True)
+            return None
+        symbols = np.array(env.stock_lst)
+        out_dir = getattr(self.config, 'res_dir', '.')
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f'topk_{phase}_epoch{epoch}.csv')
+        try:
+            pd.DataFrame({
+                'symbol': symbols[top_idx] if len(symbols) > 0 else top_idx,
+                'weight': w_final,
+            }).to_csv(out_path, index=False)
+            print(f"[POSTPROCESS_TOPK] Saved {phase} Top-K epoch {epoch} to {out_path}", flush=True)
+            return out_path
+        except Exception as e:
+            print(f"[POSTPROCESS_TOPK] Failed to save {phase} Top-K: {e}", flush=True)
+            return None
+
+    def _run_topk_postprocess_all(self, epoch, run_validation=False, run_test=False):
+        if not getattr(self.config, 'enable_topk_postprocess', True):
+            return
+        self._build_topk_recommendation(self.train_env, phase='train', epoch=epoch)
+        if run_validation and self.valid_env is not None:
+            self._build_topk_recommendation(self.valid_env, phase='valid', epoch=epoch)
+        if run_test and self.test_env is not None:
+            self._build_topk_recommendation(self.test_env, phase='test', epoch=epoch)
     def _cleanup_old_checkpoints(self):
         """
         Remove old checkpoints, keeping only the N most recent ones (based on timesteps).
@@ -150,7 +271,11 @@ class PoCallback(BaseCallback):
             print(f"[Checkpoint Cleanup] No checkpoints found in {self.config.checkpoint_dir}", flush=True)
             return
 
-        # Sort by timesteps (descending - newest first)
+        # Protect best-valid checkpoints from cleanup
+        protected = [c for c in checkpoint_dirs if c['name'].startswith('checkpoint_best_valid')]
+        checkpoint_dirs = [c for c in checkpoint_dirs if not c['name'].startswith('checkpoint_best_valid')]
+
+        # Sort by timesteps (descending - newest first) for non-protected
         checkpoint_dirs.sort(key=lambda x: x['timesteps'], reverse=True)
 
         print(f"[Checkpoint Cleanup] Found {len(checkpoint_dirs)} checkpoints, keeping {self.max_checkpoints_to_keep} most recent", flush=True)
@@ -174,6 +299,9 @@ class PoCallback(BaseCallback):
             print(f"[Checkpoint Cleanup] Cleanup complete: deleted {deleted_count}/{len(checkpoints_to_delete)} checkpoint(s)", flush=True)
         else:
             print(f"[Checkpoint Cleanup] No cleanup needed: {len(checkpoint_dirs)} checkpoint(s) <= {self.max_checkpoints_to_keep} (max to keep)", flush=True)
+
+        if protected:
+            print(f"[Checkpoint Cleanup] Protected best-valid checkpoints: {[c['name'] for c in protected]}", flush=True)
 
     def _save_checkpoint(self, checkpoint_name, current_epoch, current_day, checkpoint_type):
         checkpoint_dir = os.path.join(self.config.checkpoint_dir, checkpoint_name)
@@ -346,6 +474,14 @@ class PoCallback(BaseCallback):
         if replay_buffer is not None:
             buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
 
+        # Compute speed based on delta since last log (robust to resume)
+        now = time.time()
+        delta_steps = self.num_timesteps - self._last_speed_steps
+        delta_time = now - self._last_speed_time
+        steps_per_sec_delta = delta_steps / delta_time if delta_time > 0 else 0.0
+        self._last_speed_steps = self.num_timesteps
+        self._last_speed_time = now
+
         training_ready = self._training_ready
         if learning_starts is None or learning_starts <= 0:
             training_ready = True
@@ -356,7 +492,7 @@ class PoCallback(BaseCallback):
             print(f"[WARM-UP COMPLETE] Replay buffer reached learning_starts ({buffer_size}/{learning_starts}). Enabling epoch progress + checkpoints.", flush=True)
         elif (not training_ready and not self._warmup_notice_printed and
               learning_starts and buffer_size is not None):
-            print(f"[WARM-UP] Collecting experience | Buffer: {buffer_size}/{learning_starts} | Epoch/Checkpoint logs will start after warm-up.", flush=True)
+            print(f"[WARM-UP] Collecting experience | Buffer: {buffer_size}/{learning_starts} | Speed: {steps_per_sec_delta:.2f} steps/s | Epoch/Checkpoint logs will start after warm-up.", flush=True)
             self._warmup_notice_printed = True
 
         if training_ready:
@@ -409,8 +545,7 @@ class PoCallback(BaseCallback):
         
         # Print progress every 100 steps
         if self.num_timesteps % 100 == 0:
-            elapsed = time.time() - self.start_time
-            steps_per_sec = self.num_timesteps / elapsed if elapsed > 0 else 0
+            steps_per_sec = steps_per_sec_delta
             # Calculate remaining timesteps (accounting for resume from checkpoint)
             # If num_timesteps exceeds total, we're past the expected end, so remaining is 0
             if self.num_timesteps > total_timesteps_for_training:
@@ -489,71 +624,121 @@ class PoCallback(BaseCallback):
             # Evaluate model in validation/test only after the final epoch
             ModelCls = model_select(model_name=self.config.rl_model_name,  mode=self.config.mode)
             trained_model = None
-            if should_validate:
+            # Run validation every validation_freq; run test only on final epoch
+            run_validation = should_validate and self.valid_env is not None
+            # Run test after each epoch (can be costly)
+            run_test = should_validate and self.test_env is not None
+            if run_validation or run_test:
                 trained_model = ModelCls.load(curmpath)
-                if self.valid_env is not None:
-                    if hasattr(self.valid_env, 'validation_mode'):
-                        self.valid_env.validation_mode = True
-                    try:
-                        obs_valid = self.valid_env.reset()
-                        if isinstance(obs_valid, tuple):
-                            obs_valid = obs_valid[0]
-                        while True:
-                            a_rlonly, _ = trained_model.predict(obs_valid)
-                            a_rlonly = np.reshape(a_rlonly, (-1))
-                            a_rl = a_rlonly
-                            if np.sum(np.abs(a_rl)) == 0:
-                                a_rl = np.array([1/len(a_rl)]*len(a_rl))
-                            else:
-                                a_rl = a_rl / np.sum(np.abs(a_rl))
-                            a_final = self.risk_controller(a_rl=a_rl, env=self.valid_env)
-                            a_final = a_final / np.sum(np.abs(a_final))
-                            a_final = np.array([a_final])
-                            step_result = self.valid_env.step(a_final)
-                            if len(step_result) == 5:
-                                obs_valid, rewards, terminal_flag, _, _ = step_result
-                            else:
-                                obs_valid, rewards, terminal_flag, _ = step_result
-                            if terminal_flag:
-                                break
-                        valid_profile = self.valid_env.get_results()
-                        epoch_metrics['valid'] = valid_profile
-                    except Exception as e:
-                        print(f"❌ Validation failed: {e}", flush=True)
-                        valid_profile = None
-                    finally:
-                        if hasattr(self.valid_env, 'validation_mode'):
-                            self.valid_env.validation_mode = False
 
-                if self.test_env is not None:
-                    obs_test = self.test_env.reset()
-                    if isinstance(obs_test, tuple):
-                        obs_test = obs_test[0]
+            valid_profile = None
+            if run_validation:
+                if hasattr(self.valid_env, 'validation_mode'):
+                    self.valid_env.validation_mode = True
+                try:
+                    obs_valid = self.valid_env.reset()
+                    if isinstance(obs_valid, tuple):
+                        obs_valid = obs_valid[0]
                     while True:
-                        a_rlonly, _ = trained_model.predict(obs_test)
+                        a_rlonly, _ = trained_model.predict(obs_valid)
                         a_rlonly = np.reshape(a_rlonly, (-1))
                         a_rl = a_rlonly
                         if np.sum(np.abs(a_rl)) == 0:
                             a_rl = np.array([1/len(a_rl)]*len(a_rl))
                         else:
                             a_rl = a_rl / np.sum(np.abs(a_rl))
-                        a_final  = self.risk_controller(a_rl=a_rl, env=self.test_env)
+                        a_final = self.risk_controller(a_rl=a_rl, env=self.valid_env)
                         a_final = a_final / np.sum(np.abs(a_final))
                         a_final = np.array([a_final])
-                        step_result = self.test_env.step(a_final)
+                        step_result = self.valid_env.step(a_final)
                         if len(step_result) == 5:
-                            obs_test, rewards, terminal_flag, _, _ = step_result
+                            obs_valid, rewards, terminal_flag, _, _ = step_result
                         else:
-                            obs_test, rewards, terminal_flag, _ = step_result 
+                            obs_valid, rewards, terminal_flag, _ = step_result
                         if terminal_flag:
                             break
+                    valid_profile = self.valid_env.get_results()
+                    epoch_metrics['valid'] = valid_profile
+                    # Persist validation profile to CSV (validation_mode skips save_profile inside env)
                     try:
-                        test_profile = self.test_env.get_results()
-                        epoch_metrics['test'] = test_profile
+                        if valid_profile is not None:
+                            self.valid_env.save_profile(valid_profile)
                     except Exception as e:
-                        print(f"❌ Test evaluation metrics unavailable: {e}", flush=True)
-            else:
+                        print(f"❌ Validation profile save failed: {e}", flush=True)
+                except Exception as e:
+                    print(f"❌ Validation failed: {e}", flush=True)
+                    valid_profile = None
+                finally:
+                    if hasattr(self.valid_env, 'validation_mode'):
+                        self.valid_env.validation_mode = False
+                # Early stopping tracking
+                if self.early_stop_patience and valid_profile is not None:
+                    sharpe_val = valid_profile.get('sharpeRatio', None)
+                    if sharpe_val is not None and np.isfinite(sharpe_val):
+                        if sharpe_val > self.best_valid_sharpe + 1e-6:
+                            self.best_valid_sharpe = sharpe_val
+                            self.valid_no_improve_epochs = 0
+                            try:
+                                checkpoint_dir = self._save_checkpoint(
+                                    checkpoint_name='checkpoint_best_valid',
+                                    current_epoch=current_epoch_global,
+                                    current_day=current_day,
+                                    checkpoint_type='epoch_best_valid'
+                                )
+                                self.best_valid_checkpoint_path = checkpoint_dir
+                                print(f"[BEST VALID] Sharpe improved to {sharpe_val:.4f}. Saved best-valid checkpoint: {checkpoint_dir}", flush=True)
+                            except Exception as e:
+                                print(f"[BEST VALID] Failed to save best-valid checkpoint: {e}", flush=True)
+                        else:
+                            self.valid_no_improve_epochs += 1
+                            if self.valid_no_improve_epochs >= self.early_stop_patience:
+                                print(f"[EARLY STOP] Validation Sharpe did not improve for {self.early_stop_patience} epochs (best={self.best_valid_sharpe:.4f}). Stopping training.", flush=True)
+                                self._early_stop = True
+
+            if run_test:
+                obs_test = self.test_env.reset()
+                if isinstance(obs_test, tuple):
+                    obs_test = obs_test[0]
+                while True:
+                    a_rlonly, _ = trained_model.predict(obs_test)
+                    a_rlonly = np.reshape(a_rlonly, (-1))
+                    a_rl = a_rlonly
+                    if np.sum(np.abs(a_rl)) == 0:
+                        a_rl = np.array([1/len(a_rl)]*len(a_rl))
+                    else:
+                        a_rl = a_rl / np.sum(np.abs(a_rl))
+                    a_final  = self.risk_controller(a_rl=a_rl, env=self.test_env)
+                    a_final = a_final / np.sum(np.abs(a_final))
+                    a_final = np.array([a_final])
+                    step_result = self.test_env.step(a_final)
+                    if len(step_result) == 5:
+                        obs_test, rewards, terminal_flag, _, _ = step_result
+                    else:
+                        obs_test, rewards, terminal_flag, _ = step_result 
+                    if terminal_flag:
+                        break
+                try:
+                    test_profile = self.test_env.get_results()
+                    epoch_metrics['test'] = test_profile
+                    try:
+                        if test_profile is not None:
+                            self.test_env.save_profile(test_profile)
+                    except Exception as e:
+                        print(f"❌ Test profile save failed: {e}", flush=True)
+                except Exception as e:
+                    print(f"❌ Test evaluation metrics unavailable: {e}", flush=True)
+            if not run_validation and not run_test:
                 print("[CALLBACK] Skipping validation/test for this epoch (will run after final epoch).", flush=True)
+
+            # Post-process Top-K recommendations for train/valid/test
+            try:
+                self._run_topk_postprocess_all(
+                    current_epoch_global,
+                    run_validation=run_validation,
+                    run_test=run_test,
+                )
+            except Exception as e:
+                print(f"[POSTPROCESS_TOPK] Aggregation failed: {e}", flush=True)
 
             if trained_model is not None:
                 del trained_model
@@ -600,6 +785,11 @@ class PoCallback(BaseCallback):
             self._record_metrics(current_epoch_global, epoch_metrics)
             
         self.train_env.model_save_flag = False
+        if self._early_stop:
+            print(f"\n{'='*100}", flush=True)
+            print(f"🛑 Early stopping triggered (validation). Best valid Sharpe: {self.best_valid_sharpe:.4f}", flush=True)
+            print(f"{'='*100}\n", flush=True)
+            return False
         
         # Check if we've reached total timesteps - stop training to prevent extra steps
         if self.num_timesteps >= total_timesteps_for_training:
