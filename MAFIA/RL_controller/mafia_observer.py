@@ -77,10 +77,42 @@ class MAFIAObserver:
             lr=config.mafia_learning_rate,
             weight_decay=config.mafia_weight_decay
         )
-        decay_steps = max(1, config.num_epochs // 3)  # Ensure at least 1
-        self.lr_scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=decay_steps, gamma=0.1
-        )
+        # Learning-rate schedule: align with TD3-style decay
+        schedule_mode = getattr(config, "mafia_lr_schedule", "linear")
+        start_lr = config.mafia_learning_rate
+        end_lr = start_lr * getattr(config, "mafia_lr_end_factor", 0.2)
+        frac = getattr(config, "mafia_lr_end_fraction", 0.5)
+
+        if schedule_mode == "linear":
+            decay_epochs = max(1, int(config.num_epochs * frac))
+
+            def _lr_lambda(epoch):
+                if epoch >= decay_epochs:
+                    return end_lr / start_lr
+                # Linear decay from start_lr to end_lr over decay_epochs (one-shot over full run)
+                return 1.0 - (1.0 - end_lr / start_lr) * (epoch / float(decay_epochs))
+
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
+        elif schedule_mode == "linear_per_epoch":
+            # Repeat linear decay every epoch: use a cycle on scheduler steps
+            cycle_steps = max(
+                1,
+                int(getattr(config, "observer_mini_epoch_steps", 1)),
+            )
+            decay_steps = max(1, int(cycle_steps * frac))
+
+            def _lr_lambda(step_idx):
+                step_in_cycle = step_idx % cycle_steps
+                if step_in_cycle >= decay_steps:
+                    return end_lr / start_lr
+                return 1.0 + (end_lr / start_lr - 1.0) * (step_in_cycle / float(decay_steps))
+
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
+        else:
+            decay_steps = max(1, config.num_epochs // 3)  # Ensure at least 1
+            self.lr_scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=decay_steps, gamma=0.1
+            )
         
         # Training buffers (for Policy Gradient)
         self.market_vector_lst = []  # Store market_vector for each step (with gradient)
@@ -459,6 +491,20 @@ class MAFIAObserver:
         
         self.optimizer.step()
         self.lr_scheduler.step()
+
+        # Persist latest losses on config for downstream logging/plots
+        if hasattr(self, "config"):
+            try:
+                self.config.last_mafia_loss = float(total_loss.detach().cpu().item())
+            except Exception:
+                self.config.last_mafia_loss = None
+            if direction_loss is not None:
+                try:
+                    self.config.last_mafia_direction_loss = float(direction_loss.detach().cpu().item())
+                except Exception:
+                    self.config.last_mafia_direction_loss = None
+            else:
+                self.config.last_mafia_direction_loss = None
         
         # Logging
         if th.cuda.is_available():
@@ -598,7 +644,11 @@ class MAFIAObserver:
         # Load model state
         self.mafia_model.load_state_dict(checkpoint['mafia_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+        try:
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+        except KeyError as e:
+            # Backward compatibility: scheduler type changed (e.g., StepLR -> LambdaLR)
+            print(f"[MAFIA] Warning: LR scheduler state missing key {e}; using freshly-initialized scheduler state.", flush=True)
         
         epoch = checkpoint.get('epoch', 0)
         print(f"MAFIA Observer checkpoint loaded from {checkpoint_path} (epoch {epoch})", flush=True)

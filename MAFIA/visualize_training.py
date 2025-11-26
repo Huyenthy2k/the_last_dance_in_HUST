@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DEFAULT_METRICS = ["reward_sum", "final_capital", "sharpeRatio", "volatility", "mdd"]
+LOSS_METRIC_PREFIXES = ("td3_", "mafia_")
 
 def find_latest_metrics(base_dir="res"):
     candidates = []
@@ -88,7 +89,13 @@ def main():
 
     res_dir = os.path.dirname(metrics_file) if args.output is None else os.path.dirname(args.output)
     output_path = args.output or os.path.join(res_dir, "metrics_history.png")
-    metrics = args.metrics or DEFAULT_METRICS
+    metrics = args.metrics
+    if not metrics:
+        metrics = list(DEFAULT_METRICS)
+        # Auto-include loss metrics if present
+        for col in df.columns:
+            if col.startswith(LOSS_METRIC_PREFIXES) and col not in metrics:
+                metrics.append(col)
     plot_metrics(df, metrics, output_path)
 
 if __name__ == "__main__":

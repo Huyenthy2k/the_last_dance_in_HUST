@@ -40,7 +40,7 @@ class Config:
         self.benchmark_algo = "TD3-PR"  # TD3 Profit-Risk optimization
         self.market_name = "VNINDEX"  # Financial Index: 'DJIA', 'SP500', 'CSI300'
         self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
-        self.num_epochs = 200  # episodes for convergence
+        self.num_epochs = 100  # episodes for convergence
 
         # MAFIA configuration (fixed)
         self.rl_model_name = "TD3"  # RL agent implemented by TD3
@@ -98,7 +98,7 @@ class Config:
 
         self.trade_pattern = 1  # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
         # Reward weights (tuned via quick Optuna on mini window)
-        self.lambda_1 = 104.60178122433004  # return reward weight
+        self.lambda_1 = 800  # return reward weight
         self.lambda_2 = 22.001620711836445  # JS penalty weight (controller adherence)
         # Encourage diversified actions (entropy regularizer on policy output)
         self.entropy_coef = 0.0013865911407901592
@@ -108,17 +108,19 @@ class Config:
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
         )
-        # TD3 learning-rate schedule: 'linear' or None
-        self.td3_lr_schedule = "linear"
+        # TD3 learning-rate schedule: 'linear', 'linear_per_epoch', or None
+        self.td3_lr_schedule = "linear_per_epoch"
         self.td3_lr_end_factor = 0.2  # end_lr = start_lr * end_factor
-        self.td3_lr_end_fraction = 0.5  # fraction of training where end_lr reached
+        self.td3_lr_end_fraction = (
+            0.5  # fraction of each epoch where end_lr reached (for linear_per_epoch)
+        )
         # Turnover and membership-change penalties (turnover uses raw sum |w_t - w_{t-1}| )
-        self.lambda_tc = 2.9831220045534392
+        self.lambda_tc = 0.05
         self.lambda_change = (
-            2.307535480569795  # Penalty weight for membership change (Top-K symmetric difference)
+            0.05  # Penalty weight for membership change (Top-K symmetric difference)
         )
         # Debug: log reward components for first N train steps (0 = disable)
-        self.reward_debug_steps = 5
+        self.reward_debug_steps = 20
         self.train_freq = [1, "step"]  # Update every trading step
         self.risk_default = 0.015
         self.risk_up_bound = 0.025  # bull market
@@ -134,7 +136,8 @@ class Config:
             self.market_name,
             self.trained_best_model_type,
         )
-        self.dataDir = "./data"
+        # Allow overriding data root for container/host mounts
+        self.dataDir = os.path.abspath(os.environ.get("MAFIA_DATA_DIR", "./data"))
 
         # Data file configuration - can specify custom file names or use None for auto-detection
         # If None, will use pattern: {market_name}_{topK}_{freq}.csv
@@ -192,13 +195,17 @@ class Config:
         self.last_td3_critic_loss = None
         self.last_td3_mean_reward = None
         self.last_td3_updates = 0
+        self.last_mafia_loss = None
+        self.last_mafia_direction_loss = None
 
         if current_date is None:
             self.cur_datetime = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         else:
             self.cur_datetime = current_date
+        res_root = os.path.abspath(os.environ.get("MAFIA_RES_ROOT", "./res"))
+        self.res_root = res_root
         self.res_dir = os.path.join(
-            "./res",
+            res_root,
             self.mode,
             self.rl_model_name,
             "{}-{}".format(self.market_name, self.topK),
@@ -228,7 +235,7 @@ class Config:
             0  # Disable step-based checkpoints; only save per epoch/best_valid
         )
         # Early stopping based on validation Sharpe (patience in epochs)
-        self.early_stop_patience = 2
+        self.early_stop_patience = None
         self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh or use auto_resume)
         self.auto_resume_from_latest = True  # Auto-resume from latest checkpoint if exists (when resume_from_checkpoint is None)
         self.enable_checkpoint_cleanup = (
@@ -364,6 +371,14 @@ class Config:
         self.mafia_M_dc = 5  # Features for DC agents
         self.mafia_M_mkt = 19  # Features for Market-index agent (5 change + 3 basic + 11 extended indicators)
         self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
+        # Match TD3-style LR schedule for observer (linear decay)
+        self.mafia_lr_schedule = (
+            "linear_per_epoch"  # "linear_per_epoch", "linear", or "step"
+        )
+        self.mafia_lr_end_factor = 0.2  # end_lr = start_lr * end_factor
+        self.mafia_lr_end_fraction = (
+            0.5  # fraction of epoch/cycle where end_lr is reached
+        )
         self.mafia_weight_decay = 0.003  # Weight decay for optimizer
         self.hidden_vec_loss_weight = (
             1.0  # Weight for market_vector loss in Policy Gradient training
@@ -502,11 +517,27 @@ class Config:
                     )
                 else:
                     policy_name = "MlpPolicy"
-        lr_value = self.learning_rate
-        if getattr(self, "td3_lr_schedule", None) == "linear":
-            end_lr = lr_value * getattr(self, "td3_lr_end_factor", 0.2)
+        start_lr = self.learning_rate
+        lr_value = start_lr
+        schedule_mode = getattr(self, "td3_lr_schedule", None)
+        if schedule_mode in ("linear", "linear_per_epoch"):
+            end_lr = start_lr * getattr(self, "td3_lr_end_factor", 0.2)
             frac = getattr(self, "td3_lr_end_fraction", 0.5)
-            lr_value = LinearSchedule(start=lr_value, end=end_lr, end_fraction=frac)
+            if schedule_mode == "linear":
+                lr_value = LinearSchedule(start=start_lr, end=end_lr, end_fraction=frac)
+            else:
+                # Repeat linear decay every epoch instead of over the whole run.
+                # progress_remaining goes from 1.0 -> 0.0 over the run; map it into per-epoch phase.
+                total_epochs = max(1, getattr(self, "num_epochs", 1))
+
+                def _per_epoch_linear(progress_remaining: float):
+                    progress = 1.0 - progress_remaining  # 0..1 over full run
+                    phase = (progress * total_epochs) % 1.0  # 0..1 within current epoch
+                    if phase > frac:
+                        return end_lr
+                    return start_lr + (phase / frac) * (end_lr - start_lr)
+
+                lr_value = _per_epoch_linear
 
         base_para = {
             "policy": policy_name,

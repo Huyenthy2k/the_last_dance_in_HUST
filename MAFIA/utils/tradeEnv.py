@@ -1530,6 +1530,10 @@ class StockPortfolioEnv(gym.Env):
         cputime_avg = np.mean(phist_df['cputime'])
         systime_avg = np.mean(phist_df['systime'])
 
+        # Normalize best-model keys once so we reuse consistent names everywhere
+        best_key_ep = 'best_reward_sum_ep' if self.config.trained_best_model_type == 'js_loss' else f"{self.config.trained_best_model_type}_ep"
+        best_key_val = 'best_reward_sum' if self.config.trained_best_model_type == 'js_loss' else self.config.trained_best_model_type
+
         bestmodel_dict = {}
         if self.config.trained_best_model_type == 'max_capital':
             field_name = 'final_capital'
@@ -1614,8 +1618,9 @@ class StockPortfolioEnv(gym.Env):
                 v = 0.0
                 print(f"Warning: Using 0.0 as absolute fallback for {field_name}", flush=True)
         
-        bestmodel_dict['{}_ep'.format(self.config.trained_best_model_type)] = v_ep
-        bestmodel_dict[self.config.trained_best_model_type] = v
+        # Normalize key names: js_loss -> reward_sum naming
+        bestmodel_dict[best_key_ep] = v_ep
+        bestmodel_dict[best_key_val] = v
         
         # Ensure all values in bestmodel_dict are valid (not NaN) before saving
         for key, value in bestmodel_dict.items():
@@ -1807,7 +1812,8 @@ class StockPortfolioEnv(gym.Env):
             step_data = pd.DataFrame(pd.read_csv(fpath, header=0))
 
         # Only update best model columns if this is the best model and arrays have consistent length
-        if bestmodel_dict['{}_ep'.format(self.config.trained_best_model_type)] == invest_profile['ep']:
+        best_epoch_in_record = bestmodel_dict.get(best_key_ep, bestmodel_dict.get(f"{self.config.trained_best_model_type}_ep"))
+        if best_epoch_in_record == invest_profile['ep']:
             # Check if step_data is empty (resume case) or has matching length
             if len(step_data) == 0:
                 print(f"[SAVE_PROFILE] Skipping best model update for resume case (empty step_data)")
@@ -1839,30 +1845,35 @@ class StockPortfolioEnv(gym.Env):
             valid_fpath = os.path.join(self.config.res_dir, 'valid_bestmodel.csv')
             if os.path.exists(valid_fpath):
                 valid_records = pd.DataFrame(pd.read_csv(valid_fpath, header=0))
-                if int(valid_records['{}_ep'.format(self.config.trained_best_model_type)][0]) == invest_profile['ep']:
-                    step_data['capital_policy_validbest'] = invest_profile['asset_lst']
-                    step_data['dailyReturn_policy_validbest'] = invest_profile['daily_return_lst'] # Plot the scatter plot of efficient frontier.
-                    step_data['reward_policy_validbest'] = invest_profile['reward_lst']
-                    step_data['strategyVolatility_policy_validbest'] = invest_profile['stg_vol_lst']
-                    step_data['risk_policy_validbest'] = invest_profile['risk_lst'] # Plot the scatter plot of efficient frontier.
-                    step_data['risk_wocbf_policy_validbest'] = invest_profile['risk_wocbf_lst']
-                    step_data['capital_wocbf_policy_validbest'] = invest_profile['capital_wocbf_lst']
-                    step_data['dailySR_policy_validbest'] = invest_profile['daily_sr_lst']
-                    step_data['dailySR_wocbf_policy_validbest'] = invest_profile['daily_sr_wocbf_lst']
-                    step_data['riskAccepted_policy_validbest'] = invest_profile['risk_adj_lst']
-                    step_data['ctrlWeight_policy_validbest'] = invest_profile['ctrl_weight_lst']
-                    step_data['solvable_flag_policy_validbest'] = invest_profile['solvable_flag']
-                    step_data['risk_pred_policy_validbest'] = invest_profile['risk_pred_lst']
-                    step_data['final_action_abssum_policy_validbest'] = invest_profile['final_action_abssum_lst']
-                    step_data['rl_action_abssum_policy_validbest'] = invest_profile['rl_action_abssum_lst']
-                    step_data['cbf_action_abssum_policy_validbest'] = invest_profile['cbf_action_abssum_lst']           
-                    step_data['downsideAtVol_risk_policy_validbest'] = invest_profile['daily_downsideAtVol_risk_lst']
-                    step_data['downsideAtValue_risk_policy_validbest'] = invest_profile['daily_downsideAtValue_risk_lst']
-                    step_data['cvar_policy_validbest'] = invest_profile['cvar_lst']
-                    step_data['cvar_raw_policy_validbest'] = invest_profile['cvar_raw_lst']
-                print("-"*30)
-                log_str = "Mode: Best-{}, Ep: {}, Capital (test set, by using the best validation model, {} ep): {} ".format(self.mode, self.epoch, int(valid_records['{}_ep'.format(self.config.trained_best_model_type)][0]), np.array(step_data['capital_policy_validbest'])[-1])
-                print(log_str)
+                valid_ep_col = best_key_ep if best_key_ep in valid_records.columns else f"{self.config.trained_best_model_type}_ep"
+                if valid_ep_col in valid_records.columns:
+                    best_valid_ep = int(valid_records[valid_ep_col][0])
+                    if best_valid_ep == invest_profile['ep']:
+                        step_data['capital_policy_validbest'] = invest_profile['asset_lst']
+                        step_data['dailyReturn_policy_validbest'] = invest_profile['daily_return_lst'] # Plot the scatter plot of efficient frontier.
+                        step_data['reward_policy_validbest'] = invest_profile['reward_lst']
+                        step_data['strategyVolatility_policy_validbest'] = invest_profile['stg_vol_lst']
+                        step_data['risk_policy_validbest'] = invest_profile['risk_lst'] # Plot the scatter plot of efficient frontier.
+                        step_data['risk_wocbf_policy_validbest'] = invest_profile['risk_wocbf_lst']
+                        step_data['capital_wocbf_policy_validbest'] = invest_profile['capital_wocbf_lst']
+                        step_data['dailySR_policy_validbest'] = invest_profile['daily_sr_lst']
+                        step_data['dailySR_wocbf_policy_validbest'] = invest_profile['daily_sr_wocbf_lst']
+                        step_data['riskAccepted_policy_validbest'] = invest_profile['risk_adj_lst']
+                        step_data['ctrlWeight_policy_validbest'] = invest_profile['ctrl_weight_lst']
+                        step_data['solvable_flag_policy_validbest'] = invest_profile['solvable_flag']
+                        step_data['risk_pred_policy_validbest'] = invest_profile['risk_pred_lst']
+                        step_data['final_action_abssum_policy_validbest'] = invest_profile['final_action_abssum_lst']
+                        step_data['rl_action_abssum_policy_validbest'] = invest_profile['rl_action_abssum_lst']
+                        step_data['cbf_action_abssum_policy_validbest'] = invest_profile['cbf_action_abssum_lst']           
+                        step_data['downsideAtVol_risk_policy_validbest'] = invest_profile['daily_downsideAtVol_risk_lst']
+                        step_data['downsideAtValue_risk_policy_validbest'] = invest_profile['daily_downsideAtValue_risk_lst']
+                        step_data['cvar_policy_validbest'] = invest_profile['cvar_lst']
+                        step_data['cvar_raw_policy_validbest'] = invest_profile['cvar_raw_lst']
+                        print("-"*30)
+                        log_str = "Mode: Best-{}, Ep: {}, Capital (test set, by using the best validation model, {} ep): {} ".format(self.mode, self.epoch, best_valid_ep, np.array(step_data['capital_policy_validbest'])[-1])
+                        print(log_str)
+                else:
+                    print(f"[SAVE_PROFILE] valid_bestmodel.csv missing expected epoch column ({valid_ep_col}); available columns: {list(valid_records.columns)}")
 
         if invest_profile['ep'] == self.config.num_epochs:
             step_data['capital_policy_last'] = _align_profile_array(invest_profile['asset_lst']).tolist()

@@ -219,3 +219,4 @@ venv_vnstock/
 # Data directories
 MAFIA/data/
 MAFIA/res/
+MAFIA/tb_logs/

@@ -364,7 +364,7 @@ class TD3Controller(OffPolicyAlgorithm):
         # Log that train() was called (ALWAYS log, not just when verbose)
         n_updates_before = getattr(self, '_n_updates', 0)
         buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-        print(f"[TRAIN] ⚡ train() method CALLED! | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+        print(f"[TRAIN] ⚡ train() method CALLED | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
 
         # Guard against premature training (respect learning_starts even if collect_rollouts misfires)
         learning_starts = getattr(self, 'learning_starts', 0)
@@ -462,10 +462,13 @@ class TD3Controller(OffPolicyAlgorithm):
             config_ref.last_td3_updates = n_updates_after
 
         buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-        print(f"[TRAIN] Completed | Updates: {n_updates_after} (was {n_updates_before}) | Actor loss: {mean_actor_loss:.6f} | Critic loss: {mean_critic_loss:.6f} | Sample reward: {mean_sample_reward:.6f} | Buffer size: {buffer_size}", flush=True)
-        
-        # Always log when training completes (for debugging)
-        print(f"[TRAIN] ✅ train() method COMPLETED! | _n_updates: {n_updates_before} → {n_updates_after} (increased by {n_updates_after - n_updates_before})", flush=True)
+        # Single-line completion summary (actor/critic losses, reward, buffer, updates)
+        print(
+            f"[TRAIN] ✅ Updates {n_updates_before}→{n_updates_after} (+{n_updates_after - n_updates_before}) | "
+            f"Actor: {mean_actor_loss:.6f} | Critic: {mean_critic_loss:.6f} | "
+            f"Sample reward: {mean_sample_reward:.6f} | Buffer: {buffer_size}",
+            flush=True,
+        )
 
     def learn(
         self: SelfTD3,
@@ -772,18 +775,21 @@ class TD3Controller(OffPolicyAlgorithm):
                     self._warmup_notice_printed = True
             else:
                 self._warmup_notice_printed = False
-                _log_rollout(f"[ROLLOUT] Completed | Collected steps: {num_collected_steps * env.num_envs} | Episodes: {num_collected_episodes}")
-                _log_rollout(f"[ROLLOUT] Buffer size: {buffer_size} | learning_starts: {learning_starts} | Training enabled: True")
-                _log_rollout(f"[ROLLOUT] Current _n_updates: {getattr(self, '_n_updates', 0)}")
-                if train_freq.unit == TrainFrequencyUnit.EPISODE:
-                    should_train_flag = num_collected_episodes > 0
-                    _log_rollout(f"[ROLLOUT] train_freq: {train_freq} | Episodes collected: {num_collected_episodes} | Should train: {should_train_flag}")
-                    if not should_train_flag:
-                        _log_rollout(f"[ROLLOUT] ❌ No episodes collected → Training will NOT be triggered!")
-                else:
-                    collected_steps = num_collected_steps * env.num_envs
-                    should_train_flag = collected_steps >= train_freq.frequency
-                    _log_rollout(f"[ROLLOUT] train_freq: {train_freq} | Steps collected: {collected_steps} | Should train: {should_train_flag}")
+                collected_steps = num_collected_steps * env.num_envs
+                should_train_flag = (
+                    num_collected_episodes > 0
+                    if train_freq.unit == TrainFrequencyUnit.EPISODE
+                    else collected_steps >= train_freq.frequency
+                )
+                rollout_summary = (
+                    f"[ROLLOUT] Completed | steps: {collected_steps} | episodes: {num_collected_episodes} | "
+                    f"train_freq: {train_freq} | should_train: {should_train_flag} | "
+                    f"_n_updates: {getattr(self, '_n_updates', 0)} | "
+                    f"buffer: {buffer_size}/{learning_starts}"
+                )
+                _log_rollout(rollout_summary)
+                if not should_train_flag:
+                    _log_rollout(f"[ROLLOUT] ❌ No training trigger (insufficient data for {train_freq.unit.name})")
 
         _finalize_rollout_line()
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)

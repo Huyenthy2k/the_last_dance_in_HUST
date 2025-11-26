@@ -25,6 +25,7 @@ import pickle
 import torch as th
 import math
 import importlib
+import gzip
 sys.path.append('..')
 from RL_controller.controllers import RL_withoutController, RL_withController
 # Robust import of postprocess_topk
@@ -82,6 +83,17 @@ class PoCallback(BaseCallback):
             'sharpeRatio',
             'volatility',
             'mdd'
+        ]
+        # TD3 training diagnostics (populated from TD3_controller.mafia_config)
+        self.td3_loss_fields = [
+            'td3_actor_loss',
+            'td3_critic_loss',
+            'td3_mean_reward',
+        ]
+        # MAFIA observer training diagnostics
+        self.mafia_loss_fields = [
+            'mafia_loss',
+            'mafia_direction_loss',
         ]
         self._rollout_debug_logged = False
         self._training_ready = False
@@ -312,9 +324,9 @@ class PoCallback(BaseCallback):
 
         replay_buffer_path = None
         should_save_replay_buffer = True
-        if checkpoint_type == 'step' and not self.save_replay_buffer_on_step_checkpoints:
+        if checkpoint_type.startswith('step') and not self.save_replay_buffer_on_step_checkpoints:
             should_save_replay_buffer = False
-        elif checkpoint_type == 'epoch' and not self.save_replay_buffer_on_epoch_checkpoints:
+        elif checkpoint_type.startswith('epoch') and not self.save_replay_buffer_on_epoch_checkpoints:
             should_save_replay_buffer = False
 
         if (should_save_replay_buffer and
@@ -323,6 +335,16 @@ class PoCallback(BaseCallback):
             replay_buffer_path = os.path.join(checkpoint_dir, 'replay_buffer.pkl')
             try:
                 self.model.save_replay_buffer(replay_buffer_path)
+                # Compress replay buffer to save disk space
+                compressed_path = replay_buffer_path + ".gz"
+                try:
+                    with open(replay_buffer_path, 'rb') as f_in, gzip.open(compressed_path, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    os.remove(replay_buffer_path)
+                    replay_buffer_path = compressed_path
+                    print(f"[Checkpoint Storage] Replay buffer compressed to {compressed_path}", flush=True)
+                except Exception as e:
+                    print(f"Warning: Replay buffer compression failed (keeping uncompressed): {e}", flush=True)
             except Exception as e:
                 print(f"Warning: Failed to save replay buffer: {e}", flush=True)
                 replay_buffer_path = None
@@ -561,7 +583,9 @@ class PoCallback(BaseCallback):
             else:
                 warmup_target = learning_starts if isinstance(learning_starts, (int, float)) else '?'
                 buffer_display = buffer_size if buffer_size is not None else '?'
-                print(f"   [WARM-UP] Global step {display_timesteps:4d} | Buffer {buffer_display}/{warmup_target} | Speed: {steps_per_sec:.2f} steps/s", flush=True)
+                msg = f"   [WARM-UP] Global step {display_timesteps:4d} | Buffer {buffer_display}/{warmup_target} | Speed: {steps_per_sec:.2f} steps/s"
+                sys.stdout.write("\r" + msg)
+                sys.stdout.flush()
             sys.stdout.flush()
 
         # Step-based checkpointing
@@ -844,7 +868,18 @@ class PoCallback(BaseCallback):
         """
         This event is triggered before exiting the `learn()` method.
         """
-        pass
+        try:
+            current_epoch = getattr(self.train_env, 'epoch', self.config.num_epochs)
+            current_day = getattr(self.train_env, 'curTradeDay', 0)
+            checkpoint_dir = self._save_checkpoint(
+                checkpoint_name='checkpoint_final',
+                current_epoch=current_epoch,
+                current_day=current_day,
+                checkpoint_type='epoch_final'
+            )
+            print(f"[Checkpoint] Final checkpoint saved: {checkpoint_dir}", flush=True)
+        except Exception as e:
+            print(f"[Checkpoint] Failed to save final checkpoint: {e}", flush=True)
 
     def _record_metrics(self, epoch, metrics_payload):
         rows = []
@@ -855,6 +890,20 @@ class PoCallback(BaseCallback):
         if not rows:
             return
         df = pd.DataFrame(rows)
+        # Append latest TD3 loss snapshots (same across phases for a given epoch)
+        td3_snapshot = {
+            'td3_actor_loss': getattr(self.config, 'last_td3_actor_loss', np.nan),
+            'td3_critic_loss': getattr(self.config, 'last_td3_critic_loss', np.nan),
+            'td3_mean_reward': getattr(self.config, 'last_td3_mean_reward', np.nan),
+        }
+        mafia_snapshot = {
+            'mafia_loss': getattr(self.config, 'last_mafia_loss', np.nan),
+            'mafia_direction_loss': getattr(self.config, 'last_mafia_direction_loss', np.nan),
+        }
+        for key, val in td3_snapshot.items():
+            df[key] = val
+        for key, val in mafia_snapshot.items():
+            df[key] = val
         header = not os.path.exists(self.metrics_file)
         df.to_csv(self.metrics_file, mode='a', header=header, index=False)
         run_tracker.record_metrics_update(self.manifest_path, epoch, df['phase'].tolist())
@@ -880,7 +929,11 @@ class PoCallback(BaseCallback):
             return
         if df.empty:
             return
-        metrics = self.metric_fields
+        metrics = list(dict.fromkeys(
+            self.metric_fields
+            + [m for m in self.td3_loss_fields if m in df.columns]
+            + [m for m in self.mafia_loss_fields if m in df.columns]
+        ))
         epoch_offset = int(df['epoch'].min()) if 'epoch' in df.columns else 0
         relative_epoch = df['epoch'] - epoch_offset + 1 if epoch_offset else df.get('epoch')
         rel_max = relative_epoch.max() if relative_epoch is not None else None
