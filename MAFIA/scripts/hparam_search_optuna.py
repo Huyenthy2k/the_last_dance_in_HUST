@@ -46,7 +46,7 @@ def run_one_trial(trial, mini_epochs=5):
         "lambda_change", 0.005, 0.5
     )  # membership-change penalty
     cfg.entropy_coef = trial.suggest_float("entropy_coef", 5e-4, 3e-3, log=True)
-    cfg.action_noise_sigma = trial.suggest_float("action_noise_sigma", 0.08, 0.22)
+    cfg.action_noise_sigma = trial.suggest_float("action_noise_sigma", 0.01, 0.22)
     cfg.controller_reg_lambda = trial.suggest_float(
         "controller_reg_lambda", 0.05, 5.0, log=True
     )
