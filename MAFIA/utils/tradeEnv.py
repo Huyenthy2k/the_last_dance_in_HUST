@@ -1531,11 +1531,16 @@ class StockPortfolioEnv(gym.Env):
         systime_avg = np.mean(phist_df['systime'])
 
         # Normalize best-model keys once so we reuse consistent names everywhere
-        best_key_ep = 'best_reward_sum_ep' if self.config.trained_best_model_type == 'js_loss' else f"{self.config.trained_best_model_type}_ep"
-        best_key_val = 'best_reward_sum' if self.config.trained_best_model_type == 'js_loss' else self.config.trained_best_model_type
+        # For test mode, always choose by reward_sum regardless of trained_best_model_type
+        if self.mode == 'test':
+            metric_for_best = 'reward_sum'
+        else:
+            metric_for_best = self.config.trained_best_model_type
+        best_key_ep = 'best_reward_sum_ep' if metric_for_best == 'js_loss' or metric_for_best == 'reward_sum' else f"{metric_for_best}_ep"
+        best_key_val = 'best_reward_sum' if metric_for_best == 'js_loss' or metric_for_best == 'reward_sum' else metric_for_best
 
         bestmodel_dict = {}
-        if self.config.trained_best_model_type == 'max_capital':
+        if metric_for_best == 'max_capital':
             field_name = 'final_capital'
             # Filter out NaN values before finding max
             valid_values = phist_df[field_name].dropna()
@@ -1543,7 +1548,7 @@ class StockPortfolioEnv(gym.Env):
                 v = np.max(valid_values)
             else:
                 v = np.nan
-        elif 'loss' in self.config.trained_best_model_type:
+        elif metric_for_best in ['js_loss', 'reward_sum'] or ('loss' in metric_for_best):
             field_name = 'reward_sum'
             # Filter out NaN values before finding max
             valid_values = phist_df[field_name].dropna()
@@ -1551,7 +1556,7 @@ class StockPortfolioEnv(gym.Env):
                 v = np.max(valid_values)
             else:
                 v = np.nan
-        elif self.config.trained_best_model_type == 'sharpeRatio':
+        elif metric_for_best == 'sharpeRatio':
             field_name = 'sharpeRatio'
             # Filter out NaN values before finding max
             valid_values = phist_df[field_name].dropna()
@@ -1559,7 +1564,7 @@ class StockPortfolioEnv(gym.Env):
                 v = np.max(valid_values)
             else:
                 v = np.nan
-        elif self.config.trained_best_model_type == 'volatility':
+        elif metric_for_best == 'volatility':
             field_name = 'volatility'
             # Filter out NaN values before finding min
             valid_values = phist_df[field_name].dropna()
@@ -1567,7 +1572,7 @@ class StockPortfolioEnv(gym.Env):
                 v = np.min(valid_values)
             else:
                 v = np.nan
-        elif self.config.trained_best_model_type == 'mdd':
+        elif metric_for_best == 'mdd':
             field_name = 'mdd'
             # Filter out NaN values before finding min
             valid_values = phist_df[field_name].dropna()

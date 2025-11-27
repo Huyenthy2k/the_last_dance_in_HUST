@@ -98,7 +98,8 @@ class PoCallback(BaseCallback):
         self._rollout_debug_logged = False
         self._training_ready = False
         self._warmup_notice_printed = False
-        self.best_valid_sharpe = -np.inf
+        # Track best validation reward_sum for checkpointing
+        self.best_valid_reward_sum = -np.inf
         self.valid_no_improve_epochs = 0
         self._early_stop = False
         self.best_valid_checkpoint_path = None
@@ -695,12 +696,12 @@ class PoCallback(BaseCallback):
                 finally:
                     if hasattr(self.valid_env, 'validation_mode'):
                         self.valid_env.validation_mode = False
-                # Early stopping tracking
-                if self.early_stop_patience and valid_profile is not None:
-                    sharpe_val = valid_profile.get('sharpeRatio', None)
-                    if sharpe_val is not None and np.isfinite(sharpe_val):
-                        if sharpe_val > self.best_valid_sharpe + 1e-6:
-                            self.best_valid_sharpe = sharpe_val
+                # Early stopping / best-valid tracking
+                if valid_profile is not None:
+                    reward_val = valid_profile.get('reward_sum', None)
+                    if reward_val is not None and np.isfinite(reward_val):
+                        if reward_val > self.best_valid_reward_sum + 1e-6:
+                            self.best_valid_reward_sum = reward_val
                             self.valid_no_improve_epochs = 0
                             try:
                                 checkpoint_dir = self._save_checkpoint(
@@ -710,13 +711,13 @@ class PoCallback(BaseCallback):
                                     checkpoint_type='epoch_best_valid'
                                 )
                                 self.best_valid_checkpoint_path = checkpoint_dir
-                                print(f"[BEST VALID] Sharpe improved to {sharpe_val:.4f}. Saved best-valid checkpoint: {checkpoint_dir}", flush=True)
+                                print(f"[BEST VALID] reward_sum improved to {reward_val:.6f}. Saved best-valid checkpoint: {checkpoint_dir}", flush=True)
                             except Exception as e:
                                 print(f"[BEST VALID] Failed to save best-valid checkpoint: {e}", flush=True)
                         else:
                             self.valid_no_improve_epochs += 1
-                            if self.valid_no_improve_epochs >= self.early_stop_patience:
-                                print(f"[EARLY STOP] Validation Sharpe did not improve for {self.early_stop_patience} epochs (best={self.best_valid_sharpe:.4f}). Stopping training.", flush=True)
+                            if self.early_stop_patience and self.valid_no_improve_epochs >= self.early_stop_patience:
+                                print(f"[EARLY STOP] Validation reward_sum did not improve for {self.early_stop_patience} epochs (best={self.best_valid_reward_sum:.6f}). Stopping training.", flush=True)
                                 self._early_stop = True
 
             if run_test:
@@ -811,7 +812,7 @@ class PoCallback(BaseCallback):
         self.train_env.model_save_flag = False
         if self._early_stop:
             print(f"\n{'='*100}", flush=True)
-            print(f"🛑 Early stopping triggered (validation). Best valid Sharpe: {self.best_valid_sharpe:.4f}", flush=True)
+            print(f"🛑 Early stopping triggered (validation). Best valid reward_sum: {self.best_valid_reward_sum:.6f}", flush=True)
             print(f"{'='*100}\n", flush=True)
             return False
         
