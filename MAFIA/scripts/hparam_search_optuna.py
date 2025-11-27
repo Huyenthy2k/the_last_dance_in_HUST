@@ -41,9 +41,11 @@ def run_one_trial(trial, mini_epochs=5):
     # Hyperparameters to tune (scales aligned with reward_sum/Sharpe)
     cfg.lambda_1 = trial.suggest_float("lambda_1", 100.0, 1000.0, log=True)
     cfg.lambda_2 = trial.suggest_float("lambda_2", 10.0, 200.0, log=True)
-    cfg.lambda_tc = trial.suggest_float("lambda_tc", 0.005, 0.5)  # turnover penalty
+    cfg.lambda_tc = trial.suggest_float(
+        "lambda_tc", 0.0001, 0.1, log=True
+    )  # turnover penalty
     cfg.lambda_change = trial.suggest_float(
-        "lambda_change", 0.005, 0.5
+        "lambda_change", 0.0001, 0.1, log=True
     )  # membership-change penalty
     cfg.entropy_coef = trial.suggest_float("entropy_coef", 5e-4, 3e-3, log=True)
     cfg.action_noise_sigma = trial.suggest_float("action_noise_sigma", 0.01, 0.22)
