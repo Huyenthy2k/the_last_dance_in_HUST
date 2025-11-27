@@ -98,13 +98,11 @@ class Config:
 
         self.trade_pattern = 1  # 1: Long only, 2: Long and short (Not applicable), 3: short only (Not applicable)
         # Reward weights (tuned via quick Optuna on mini window)
-        self.lambda_1 = 800  # return reward weight
-        self.lambda_2 = 22.001620711836445  # JS penalty weight (controller adherence)
+        self.lambda_1 = 500  # return reward weight
+        self.lambda_2 = 150  # Tăng λ₂ nghĩa là phạt nặng hơn khi RL khác xa controller → khuyến khích RL bám sát/quy phục hành động của controller (ít lệch, ít “liều” theo hướng riêng), thường dẫn đến phân bổ ổn định hơn và ít turnover thay đổi mạnh.
         # Encourage diversified actions (entropy regularizer on policy output)
-        self.entropy_coef = 0.0013865911407901592
-        self.controller_reg_lambda = (
-            1.0  # λ_reg: controller regularization weight ||x - a_RL||^2
-        )
+        self.entropy_coef = 0.002  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
+        self.controller_reg_lambda = 0.6  # λ_reg: controller regularization weight ||x - a_RL||^2,  λ_reg lớn → bám sát RL, nhỏ → cho solver chỉnh mạnh hơn
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
         )
@@ -115,9 +113,9 @@ class Config:
             0.5  # fraction of each epoch where end_lr reached (for linear_per_epoch)
         )
         # Turnover and membership-change penalties (turnover uses raw sum |w_t - w_{t-1}| )
-        self.lambda_tc = 0.05
+        self.lambda_tc = 0.001
         self.lambda_change = (
-            0.05  # Penalty weight for membership change (Top-K symmetric difference)
+            0.001  # Penalty weight for membership change (Top-K symmetric difference)
         )
         # Debug: log reward components for first N train steps (0 = disable)
         self.reward_debug_steps = 20

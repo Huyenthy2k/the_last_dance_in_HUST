@@ -20,7 +20,7 @@ import json
 import os
 import random
 import sys
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import optuna
@@ -48,13 +48,16 @@ def set_all_seeds(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def run_hparam_search(n_trials: int, mini_epochs: int) -> Dict[str, float]:
+def run_hparam_search(n_trials: int, mini_epochs: int, target_score: float | None = None) -> Tuple[Dict[str, float], str]:
     run_ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    res_root = os.path.abspath(os.environ.get("MAFIA_RES_ROOT", "./res"))
-    log_dir = os.path.join(res_root, "auto_pipeline_logs")
-    os.makedirs(log_dir, exist_ok=True)
-    trials_csv = os.path.join(log_dir, f"optuna_trials_{run_ts}.csv")
-    best_json = os.path.join(log_dir, f"optuna_best_{run_ts}.json")
+    # Use repo-level res as default to keep logs in a consistent location
+    default_res_root = os.path.join(REPO_ROOT, "res")
+    res_root = os.path.abspath(os.environ.get("MAFIA_RES_ROOT", default_res_root))
+    log_root = os.path.join(res_root, "auto_pipeline_logs")
+    log_run_dir = os.path.join(log_root, f"run_{run_ts}")
+    os.makedirs(log_run_dir, exist_ok=True)
+    trials_csv = os.path.join(log_run_dir, f"optuna_trials_{run_ts}.csv")
+    best_json = os.path.join(log_run_dir, f"optuna_best_{run_ts}.json")
 
     print("\n" + "=" * 80)
     print(f"[AUTO] 🔍 Starting Optuna search | trials={n_trials}, mini_epochs={mini_epochs}")
@@ -66,7 +69,15 @@ def run_hparam_search(n_trials: int, mini_epochs: int) -> Dict[str, float]:
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
     )
-    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+
+    callbacks = []
+    if target_score is not None:
+        def _early_stop(study, trial):
+            if study.best_value is not None and study.best_value >= target_score:
+                study.stop()
+        callbacks.append(_early_stop)
+
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, callbacks=callbacks)
     print("[AUTO] ✅ Optuna search done")
     print(f"[AUTO] Best score: {study.best_value}")
     print("[AUTO] Best params:")
@@ -83,12 +94,13 @@ def run_hparam_search(n_trials: int, mini_epochs: int) -> Dict[str, float]:
         "best_value": float(study.best_value),
         "best_params": {k: float(v) if isinstance(v, (float, int, np.floating)) else v for k, v in study.best_params.items()},
         "trials_csv": trials_csv,
+        "log_dir": log_run_dir,
     }
     with open(best_json, "w") as f:
         json.dump(best_payload, f, indent=2)
     print(f"[AUTO] 📝 Saved hparam trials to {trials_csv}")
     print(f"[AUTO] 🏅 Saved best params to {best_json}")
-    return study.best_params
+    return study.best_params, log_run_dir
 
 
 def run_one_seed(seed: int, best_params: Dict[str, float], train_epochs: int) -> Dict[str, float]:
@@ -143,6 +155,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--hparam-trials", type=int, default=100, help="Optuna trials")
     p.add_argument("--hparam-epochs", type=int, default=10, help="Epochs per hparam trial")
+    p.add_argument("--hparam-target", type=float, default=None, help="Early stop hparam search when best score >= target (None to disable)")
     p.add_argument("--train-epochs", type=int, default=100, help="Epochs for full training per seed")
     p.add_argument("--num-seeds", type=int, default=10, help="Number of seeds to run (ignored if --seeds provided)")
     p.add_argument("--base-seed", type=int, default=2025, help="Base seed; seeds will be base_seed + i")
@@ -156,7 +169,11 @@ def main():
     print("[AUTO] PIPELINE START")
     print("=" * 80)
     # 1) Hyperparam search
-    best_params = run_hparam_search(n_trials=args.hparam_trials, mini_epochs=args.hparam_epochs)
+    best_params, log_run_dir = run_hparam_search(
+        n_trials=args.hparam_trials,
+        mini_epochs=args.hparam_epochs,
+        target_score=args.hparam_target,
+    )
 
     # 2) Prepare seeds
     if args.seeds:
@@ -181,6 +198,27 @@ def main():
     print("\n[AUTO] 📈 Summary (mean/std across seeds):")
     print(summary)
     print("=" * 80)
+    # Persist aggregate outputs alongside hparam logs
+    os.makedirs(log_run_dir, exist_ok=True)
+    results_csv = os.path.join(log_run_dir, "seed_results.csv")
+    summary_csv = os.path.join(log_run_dir, "seed_summary.csv")
+    df.to_csv(results_csv, index=False)
+    summary.to_csv(summary_csv)
+    with open(os.path.join(log_run_dir, "run_info.json"), "w") as f:
+        json.dump(
+            {
+                "seeds": seeds,
+                "train_epochs": args.train_epochs,
+                "hparam_trials": args.hparam_trials,
+                "hparam_epochs": args.hparam_epochs,
+                "best_params": best_params,
+                "seed_results_csv": results_csv,
+                "seed_summary_csv": summary_csv,
+            },
+            f,
+            indent=2,
+        )
+    print(f"[AUTO] 📝 Saved seed results & summary to {log_run_dir}")
     print("[AUTO] PIPELINE DONE")
     print("=" * 80)
 

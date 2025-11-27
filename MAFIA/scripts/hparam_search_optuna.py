@@ -28,35 +28,50 @@ def run_one_trial(trial, mini_epochs=5):
     # Build config for this trial (use unique timestamp to separate artifacts)
     cur_ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     cfg = Config(current_date=f"{cur_ts}-trial{trial.number}")
+    # Hparam trials must start fresh: disable any checkpoint resume
+    cfg.auto_resume_from_latest = False
+    cfg.resume_from_checkpoint = None
     # Track artifacts in Optuna user attrs so auto_pipeline can log them
     trial.set_user_attr("res_dir", cfg.res_dir)
     trial.set_user_attr("trial_ts", cfg.cur_datetime)
 
-    # Enable auto-resume to continue from latest checkpoint if available
-    cfg.auto_resume_from_latest = True
-    cfg.resume_from_checkpoint = None
+    # No auto-resume during search; keep patience off for consistency
     cfg.early_stop_patience = 0  # disable early stop for fair comparison
 
     # Hyperparameters to tune (scales aligned with reward_sum/Sharpe)
-    cfg.lambda_1 = trial.suggest_float("lambda_1", 100.0, 900.0, log=True)
-    cfg.lambda_2 = trial.suggest_float("lambda_2", 5.0, 40.0, log=True)
-    cfg.lambda_tc = trial.suggest_float("lambda_tc", 0.05, 1.0)  # turnover penalty
+    cfg.lambda_1 = trial.suggest_float("lambda_1", 100.0, 1000.0, log=True)
+    cfg.lambda_2 = trial.suggest_float("lambda_2", 10.0, 200.0, log=True)
+    cfg.lambda_tc = trial.suggest_float("lambda_tc", 0.005, 0.5)  # turnover penalty
     cfg.lambda_change = trial.suggest_float(
-        "lambda_change", 0.05, 1.0
+        "lambda_change", 0.005, 0.5
     )  # membership-change penalty
     cfg.entropy_coef = trial.suggest_float("entropy_coef", 5e-4, 3e-3, log=True)
     cfg.action_noise_sigma = trial.suggest_float("action_noise_sigma", 0.08, 0.22)
+    cfg.controller_reg_lambda = trial.suggest_float(
+        "controller_reg_lambda", 0.05, 5.0, log=True
+    )
+    cfg.controller_observer_bias_weight = trial.suggest_float(
+        "controller_observer_bias_weight", 0.05, 0.8
+    )
 
     # Make the run lightweight
     cfg.num_epochs = mini_epochs
     # Allow checkpointing/resume for search runs (defaults are resume-friendly but controllable via env)
     ckpt_freq = int(os.environ.get("HSEARCH_CHECKPOINT_FREQ", "1"))
     partial_steps = int(os.environ.get("HSEARCH_PARTIAL_STEPS", "0"))
-    save_rb_epoch = os.environ.get("HSEARCH_SAVE_RB", "1") not in ("0", "false", "False")
-    save_rb_step = os.environ.get("HSEARCH_SAVE_STEP_RB", "0") not in ("0", "false", "False")
+    save_rb_epoch = os.environ.get("HSEARCH_SAVE_RB", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+    save_rb_step = os.environ.get("HSEARCH_SAVE_STEP_RB", "0") not in (
+        "0",
+        "false",
+        "False",
+    )
     max_ckpt_keep = int(os.environ.get("HSEARCH_MAX_CKPT_KEEP", "1"))
 
-    cfg.checkpoint_freq = ckpt_freq          # save every N epochs (default 1 for resume)
+    cfg.checkpoint_freq = ckpt_freq  # save every N epochs (default 1 for resume)
     cfg.partial_checkpoint_steps = partial_steps  # 0 disables step-based checkpoints
     cfg.validation_freq = 1
     cfg.enable_topk_postprocess = False
@@ -100,8 +115,8 @@ def run_one_trial(trial, mini_epochs=5):
         valid_rows["reward_sum"].iloc[-1] if "reward_sum" in valid_rows else 0.0
     )
 
-    # Composite objective (balanced scale): prioritize reward_sum, then Sharpe; penalize drawdown, reward annual return
-    score = reward_sum_val + 0.5 * sharpe_val - 1.0 * mdd_val + 0.2 * annret_val
+    # Composite objective: emphasize Sharpe and reward_sum, downweight drawdown
+    score = reward_sum_val + 1.0 * sharpe_val - 0.3 * mdd_val + 0.2 * annret_val
     return score
 
 
