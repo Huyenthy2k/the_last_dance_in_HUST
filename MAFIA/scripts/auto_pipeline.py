@@ -27,6 +27,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
+from huggingface_hub import HfApi, create_repo, upload_folder
 
 # Ensure repo root on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -239,6 +240,47 @@ def copy_checkpoint(
     return info_path, info, dest_run_dir
 
 
+def upload_to_huggingface(
+    local_dir: str,
+    repo_id: str,
+    token: str = None,
+    commit_message: str = "Upload checkpoint",
+):
+    """
+    Upload checkpoint directory to Hugging Face Hub.
+    
+    Args:
+        local_dir: Path to the local directory containing checkpoint files
+        repo_id: Hugging Face repo ID (e.g., 'username/model-name')
+        token: Hugging Face token (if None, will use HF_TOKEN env variable)
+        commit_message: Commit message for the upload
+    """
+    try:
+        print(f"\n[HF] 📤 Uploading {local_dir} to {repo_id}...")
+        
+        # Create repo if it doesn't exist
+        api = HfApi(token=token)
+        try:
+            create_repo(repo_id=repo_id, token=token, exist_ok=True)
+            print(f"[HF] ✅ Repository {repo_id} is ready")
+        except Exception as e:
+            print(f"[HF] ⚠️ Repo creation note: {e}")
+        
+        # Upload the entire folder
+        url = upload_folder(
+            folder_path=local_dir,
+            repo_id=repo_id,
+            token=token,
+            commit_message=commit_message,
+        )
+        print(f"[HF] ✅ Successfully uploaded to: {url}")
+        return url
+    except Exception as e:
+        print(f"[HF] ❌ Upload failed: {e}")
+        print(f"[HF] 💡 Tip: Set HF_TOKEN environment variable or pass --hf-token argument")
+        return None
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--hparam-trials", type=int, default=10, help="Optuna trials")
@@ -316,6 +358,23 @@ def parse_args():
         action="store_true",
         help="Keep epoch/timestep counters from checkpoint instead of resetting to 0",
     )
+    p.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default="",
+        help="Hugging Face repository ID (e.g., 'username/model-name') to upload checkpoints",
+    )
+    p.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Hugging Face API token (or use HF_TOKEN env variable)",
+    )
+    p.add_argument(
+        "--hf-upload-official-only",
+        action="store_true",
+        help="Only upload the official run checkpoint (not seed runs)",
+    )
     return p.parse_args()
 
 
@@ -369,6 +428,15 @@ def main():
         print(f"[AUTO]    epochs: {official_epochs}")
         print("=" * 80, flush=True)
         RLcontroller(cfg)
+        
+        # Upload official run to Hugging Face if requested
+        if args.hf_repo_id:
+            upload_to_huggingface(
+                local_dir=official_run_dir,
+                repo_id=args.hf_repo_id,
+                token=args.hf_token,
+                commit_message=f"Official run: {args.official_tag} (epochs={official_epochs})",
+            )
 
     # 2) Prepare seeds
     if args.seeds:
@@ -384,6 +452,15 @@ def main():
     for seed in seeds:
         metrics = run_one_seed(seed, best_params, train_epochs=args.train_epochs)
         results.append(metrics)
+        
+        # Upload seed run to Hugging Face if requested (and not official-only mode)
+        if args.hf_repo_id and not args.hf_upload_official_only:
+            upload_to_huggingface(
+                local_dir=metrics["res_dir"],
+                repo_id=f"{args.hf_repo_id}/seed-{seed}",
+                token=args.hf_token,
+                commit_message=f"Seed {seed} training (epochs={args.train_epochs})",
+            )
 
     # 4) Aggregate and report
     df, summary = aggregate_results(results)
@@ -416,6 +493,16 @@ def main():
             indent=2,
         )
     print(f"[AUTO] 📝 Saved seed results & summary to {log_run_dir}")
+    
+    # Upload aggregate logs to Hugging Face if requested
+    if args.hf_repo_id:
+        upload_to_huggingface(
+            local_dir=log_run_dir,
+            repo_id=f"{args.hf_repo_id}/logs",
+            token=args.hf_token,
+            commit_message=f"Pipeline logs and aggregate results",
+        )
+    
     print("[AUTO] PIPELINE DONE")
     print("=" * 80)
 

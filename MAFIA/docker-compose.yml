@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  mafia-training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mafia-rl-training:latest
+    container_name: mafia-training
+    volumes:
+      # Mount data directory
+      - ./data:/app/data
+      # Mount results directory to persist checkpoints
+      - ./res:/app/res
+      # Mount logs directory
+      - ./log:/app/log
+      # Mount source code for development (optional, comment out for production)
+      - ./scripts:/app/scripts
+      - ./RL_controller:/app/RL_controller
+      - ./utils:/app/utils
+    environment:
+      # Set Hugging Face token from environment variable
+      - HF_TOKEN=${HF_TOKEN}
+      # Python optimizations
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+    # Use GPU if available (uncomment if you have nvidia-docker)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    command: >
+      python scripts/auto_pipeline.py
+      --hparam-trials 10
+      --hparam-epochs 10
+      --train-epochs 100
+      --num-seeds 5
+      --hf-repo-id "${HF_REPO_ID}"
+      --hf-upload-official-only
+    restart: unless-stopped
