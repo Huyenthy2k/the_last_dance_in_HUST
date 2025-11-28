@@ -506,7 +506,13 @@ class PoCallback(BaseCallback):
         self._last_speed_time = now
 
         training_ready = self._training_ready
-        if learning_starts is None or learning_starts <= 0:
+        # If resuming from checkpoint, force-skip warm-up
+        if getattr(self.config, "resume_from_checkpoint", None):
+            learning_starts = 0
+            if hasattr(self.model, "learning_starts"):
+                self.model.learning_starts = 0
+            training_ready = True
+        elif learning_starts is None or learning_starts <= 0:
             training_ready = True
         elif buffer_size is not None:
             training_ready = buffer_size >= learning_starts
@@ -515,7 +521,10 @@ class PoCallback(BaseCallback):
             print(f"[WARM-UP COMPLETE] Replay buffer reached learning_starts ({buffer_size}/{learning_starts}). Enabling epoch progress + checkpoints.", flush=True)
         elif (not training_ready and not self._warmup_notice_printed and
               learning_starts and buffer_size is not None):
-            print(f"[WARM-UP] Collecting experience | Buffer: {buffer_size}/{learning_starts} | Speed: {steps_per_sec_delta:.2f} steps/s | Epoch/Checkpoint logs will start after warm-up.", flush=True)
+            # Suppress warm-up spam; print a single-line status update instead
+            msg = f"[WARM-UP] Collecting experience | Buffer: {buffer_size}/{learning_starts} | Speed: {steps_per_sec_delta:.2f} steps/s"
+            sys.stdout.write("\r" + msg)
+            sys.stdout.flush()
             self._warmup_notice_printed = True
 
         if training_ready:
@@ -580,13 +589,12 @@ class PoCallback(BaseCallback):
             # Use display_timesteps to avoid showing values > total when resuming
             display_timesteps = min(self.num_timesteps, total_timesteps_for_training) if self.num_timesteps > total_timesteps_for_training else self.num_timesteps
             if self._training_ready:
-                print(f"   🔄 Step {display_timesteps:4d}/{total_timesteps_for_training} | Epoch {current_epoch_global}/{self.config.num_epochs} Day {day_in_epoch_display:4d}/{total_days} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_seconds/60:.1f}m", flush=True)
+                line = f"   🔄 Step {display_timesteps:4d}/{total_timesteps_for_training} | Epoch {current_epoch_global}/{self.config.num_epochs} Day {day_in_epoch_display:4d}/{total_days} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_seconds/60:.1f}m"
             else:
                 warmup_target = learning_starts if isinstance(learning_starts, (int, float)) else '?'
                 buffer_display = buffer_size if buffer_size is not None else '?'
-                msg = f"   [WARM-UP] Global step {display_timesteps:4d} | Buffer {buffer_display}/{warmup_target} | Speed: {steps_per_sec:.2f} steps/s"
-                sys.stdout.write("\r" + msg)
-                sys.stdout.flush()
+                line = f"   [WARM-UP] Global step {display_timesteps:4d} | Buffer {buffer_display}/{warmup_target} | Speed: {steps_per_sec:.2f} steps/s"
+            sys.stdout.write("\r\033[2K" + line)
             sys.stdout.flush()
 
         # Step-based checkpointing

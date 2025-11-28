@@ -246,6 +246,7 @@ class MAFIAFeatureProcessor:
     
     def _compute_sma(self, prices: np.ndarray, window: int) -> np.ndarray:
         """Compute Simple Moving Average."""
+        prices = prices.astype(np.float64, copy=False)
         if TALIB_AVAILABLE:
             # Use TA-Lib if available
             result = talib.SMA(prices, timeperiod=window)
@@ -262,6 +263,7 @@ class MAFIAFeatureProcessor:
     
     def _compute_rsi(self, prices: np.ndarray, period: int) -> np.ndarray:
         """Compute Relative Strength Index."""
+        prices = prices.astype(np.float64, copy=False)
         if TALIB_AVAILABLE:
             result = talib.RSI(prices, timeperiod=period)
             # Fill NaN values with 50 (neutral RSI)
@@ -288,6 +290,9 @@ class MAFIAFeatureProcessor:
     
     def _compute_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
         """Compute Average True Range."""
+        high = high.astype(np.float64, copy=False)
+        low = low.astype(np.float64, copy=False)
+        close = close.astype(np.float64, copy=False)
         if TALIB_AVAILABLE:
             result = talib.ATR(high, low, close, timeperiod=period)
             # Fill NaN values with first valid value
@@ -457,4 +462,3 @@ class MAFIAFeatureProcessor:
         P_Mkt[0, :, 18] = regime
         
         return P_Mkt.astype(np.float32)
-

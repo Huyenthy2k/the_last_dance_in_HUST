@@ -79,6 +79,12 @@ def parse_args() -> argparse.Namespace:
         help="Keep epoch/day/timesteps from checkpoint_info to continue counting from that point.",
     )
     p.add_argument(
+        "--best-params-json",
+        type=str,
+        default=None,
+        help="Path to JSON containing best_params (e.g., saved by Optuna). Keys will be applied to Config before training.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Only prepare the forked checkpoint/run directory; do not launch training",
@@ -158,6 +164,30 @@ def main():
     print(f"[RUN] Using checkpoint info: {ckpt_info_path}")
 
     cfg = Config(seed_num=args.seed, current_date=args.tag)
+    # Apply best_params if provided (e.g., from Optuna)
+    if args.best_params_json:
+        if not os.path.exists(args.best_params_json):
+            raise FileNotFoundError(f"best_params JSON not found: {args.best_params_json}")
+        with open(args.best_params_json, "r") as f:
+            best_params = json.load(f)
+        # Normalize payload if wrapped like {"best_params": {...}}
+        if isinstance(best_params, dict) and "best_params" in best_params:
+            best_params = best_params["best_params"]
+        # Apply known keys
+        for key in [
+            "lambda_1",
+            "lambda_2",
+            "lambda_tc",
+            "lambda_change",
+            "entropy_coef",
+            "action_noise_sigma",
+            "controller_reg_lambda",
+            "controller_observer_bias_weight",
+        ]:
+            if key in best_params:
+                setattr(cfg, key, best_params[key])
+        print(f"[RUN] Applied best_params from {args.best_params_json}: {best_params}")
+
     cfg.resume_from_checkpoint = ckpt_info_path
     cfg.auto_resume_from_latest = False
     cfg.reward_debug_steps = 0

@@ -582,7 +582,7 @@ class TD3Controller(OffPolicyAlgorithm):
 
         def _finalize_rollout_line() -> None:
             """Clear the live status line so future logs print normally."""
-            if getattr(self, "_live_rollout_line_active", False) and sys.stdout.isatty():
+            if getattr(self, "_live_rollout_line_active", False):
                 sys.stdout.write("\r\033[2K")
                 sys.stdout.flush()
             self._live_rollout_line_active = False
@@ -593,6 +593,11 @@ class TD3Controller(OffPolicyAlgorithm):
 
         def _log_rollout_status(timestep: int, episode: int, collected_steps: int) -> None:
             nonlocal status_last_time, status_last_step
+            # Throttle status updates to reduce spam
+            status_interval = getattr(self, "_rollout_status_interval", 10)
+            if collected_steps > 0 and collected_steps % status_interval != 0:
+                return
+
             now = time.time()
             elapsed = max(now - status_last_time, 1e-8)
             delta_steps = max(timestep - status_last_step, 0)
@@ -611,14 +616,10 @@ class TD3Controller(OffPolicyAlgorithm):
             width = max(width, len(message))
             self._rollout_status_width = width
             padded_message = message.ljust(width)
-            if sys.stdout.isatty():
-                sys.stdout.write(f"\r\033[2K{padded_message}")
-                sys.stdout.flush()
-                self._live_rollout_line_active = True
-            else:
-                # Non-interactive outputs (e.g., logs) cannot update a single line; print discrete entries instead.
-                print(padded_message, flush=True)
-                self._live_rollout_line_active = False
+            # Always update on one line to avoid log spam (even when stdout is not a TTY)
+            sys.stdout.write(f"\r\033[2K{padded_message}")
+            sys.stdout.flush()
+            self._live_rollout_line_active = True
         
         # Log rollout start
         if self.verbose >= 1 and self._episode_num % 10 == 0:

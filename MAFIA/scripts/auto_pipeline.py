@@ -138,6 +138,8 @@ def run_one_seed(
         "lambda_change",
         "entropy_coef",
         "action_noise_sigma",
+        "controller_reg_lambda",
+        "controller_observer_bias_weight",
     ]:
         if key in best_params:
             setattr(cfg, key, best_params[key])
@@ -355,6 +357,8 @@ def main():
             "lambda_change",
             "entropy_coef",
             "action_noise_sigma",
+            "controller_reg_lambda",
+            "controller_observer_bias_weight",
         ]:
             if key in best_params:
                 setattr(cfg, key, best_params[key])
@@ -362,6 +366,9 @@ def main():
         cfg.auto_resume_from_latest = False
         cfg.reward_debug_steps = 0
         cfg.num_epochs = official_epochs
+        rb_path = ckpt_info.get("replay_buffer_path")
+        if rb_path and os.path.exists(rb_path):
+            print(f"[AUTO] Official replay buffer: {rb_path} ({os.path.getsize(rb_path)} bytes)")
         print("\n" + "=" * 80)
         print(f"[AUTO] 🏁 Official run from best trial checkpoint")
         print(f"[AUTO]    checkpoint: {ckpt_info_path}")
