@@ -21,7 +21,7 @@ $env:HF_TOKEN = "your-huggingface-token-here"
 ### Cách 2: Truyền token qua argument
 
 ```bash
-python scripts/auto_pipeline.py --hf-token "your-huggingface-token-here" --hf-repo-id "username/model-name"
+python scripts/auto_pipeline.py --hf-token "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" --hf-repo-id "Siry2k/mafia"
 ```
 
 ### Lấy Hugging Face Token
