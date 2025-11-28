@@ -1,11 +1,12 @@
 """
 Run repeated TD3+MAFIA training/validation/test across multiple random seeds,
-log artifacts per run, and report averaged test metrics.
+log artifacts per run, and report averaged test metrics (printed + saved to CSV).
 
 Usage examples:
 - python agents/MAFIA/scripts/run_multi_seed_experiment.py
 - python agents/MAFIA/scripts/run_multi_seed_experiment.py --num-seeds 5 --base-seed 2026
 - python agents/MAFIA/scripts/run_multi_seed_experiment.py --seeds 2023,42,99
+- python agents/MAFIA/scripts/run_multi_seed_experiment.py --output-dir ./res/multi_seed_logs
 """
 
 import argparse
@@ -85,6 +86,18 @@ def parse_args():
     p.add_argument("--num-seeds", type=int, default=10, help="Number of runs (ignored if --seeds is provided)")
     p.add_argument("--base-seed", type=int, default=2025, help="Base seed; seeds will be base_seed + i")
     p.add_argument("--seeds", type=str, default="", help="Comma-separated list of seeds to run (overrides num/base)")
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Where to save summary CSVs (default: <MAFIA_RES_ROOT or ./res>/multi_seed_logs/mseed_<ts>)",
+    )
+    p.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        help="Custom tag for output folder name (default: timestamp)",
+    )
     return p.parse_args()
 
 
@@ -106,6 +119,34 @@ def main():
     print(df.to_string(index=False))
     print("\n[MULTI-SEED] Summary (mean/std):")
     print(summary)
+
+    # Persist summary to CSV
+    ts = args.run_tag or datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    res_root = os.path.abspath(os.environ.get("MAFIA_RES_ROOT", os.path.join(REPO_ROOT, "res")))
+    default_dir = os.path.join(res_root, "multi_seed_logs", f"mseed_{ts}")
+    out_dir = os.path.abspath(args.output_dir) if args.output_dir else default_dir
+    os.makedirs(out_dir, exist_ok=True)
+    runs_csv = os.path.join(out_dir, "runs.csv")
+    summary_csv = os.path.join(out_dir, "summary.csv")
+    info_json = os.path.join(out_dir, "run_info.json")
+    df.to_csv(runs_csv, index=False)
+    summary.to_csv(summary_csv)
+    with open(info_json, "w") as f:
+        json.dump(
+            {
+                "seeds": seeds,
+                "num_seeds": len(seeds),
+                "base_seed": args.base_seed,
+                "runs_csv": runs_csv,
+                "summary_csv": summary_csv,
+                "timestamp": ts,
+            },
+            f,
+            indent=2,
+        )
+    print(f"\n[MULTI-SEED] Saved per-run metrics -> {runs_csv}")
+    print(f"[MULTI-SEED] Saved summary        -> {summary_csv}")
+    print(f"[MULTI-SEED] Run info             -> {info_json}")
 
 
 if __name__ == "__main__":

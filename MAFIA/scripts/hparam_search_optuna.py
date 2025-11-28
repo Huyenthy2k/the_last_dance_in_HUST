@@ -1,7 +1,7 @@
 """
 Lightweight Optuna search for RL hyperparameters.
 
-Runs short mini-runs (default 2 epochs) and scores by validation Sharpe.
+Runs short mini-runs (default 10 epochs) and scores by validation Sharpe.
 Adjust the search space or objective as needed.
 """
 
@@ -24,7 +24,7 @@ from entrance import RLcontroller
 from config import Config
 
 
-def run_one_trial(trial, mini_epochs=5):
+def run_one_trial(trial, mini_epochs=10):
     # Build config for this trial (use unique timestamp to separate artifacts)
     cur_ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     cfg = Config(current_date=f"{cur_ts}-trial{trial.number}")
@@ -124,7 +124,7 @@ def run_one_trial(trial, mini_epochs=5):
 
 def objective(trial):
     print(f"[HSEARCH] Trial {trial.number} params sampling...", flush=True)
-    val = run_one_trial(trial, mini_epochs=5)
+    val = run_one_trial(trial, mini_epochs=10)
     print(
         f"[HSEARCH] Trial {trial.number} done | score={val} | params={trial.params}",
         flush=True,
@@ -177,7 +177,7 @@ def main():
             study.stop()
 
     # Increase max trials; early-stop when đạt TARGET_SCORE
-    study.optimize(objective, n_trials=200, n_jobs=2, callbacks=[_early_stop])
+    study.optimize(objective, n_trials=20, n_jobs=2, callbacks=[_early_stop])
     print("Best trial:", study.best_trial.number)
     print("Best value:", study.best_value)
     print("Best params:", study.best_params)
