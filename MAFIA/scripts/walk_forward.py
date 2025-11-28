@@ -57,7 +57,18 @@ HYPERPARAM_KEYS = [
 def parse_args():
     p = argparse.ArgumentParser(description="Walk-forward/sliding-window training")
     p.add_argument("--start-date", required=True, help="Start date for first window (YYYY-MM-DD)")
-    p.add_argument("--num-windows", type=int, default=1, help="Number of walk-forward windows")
+    p.add_argument(
+        "--num-windows",
+        type=int,
+        default=0,
+        help="Number of walk-forward windows (0 or negative -> auto-compute until end-date)",
+    )
+    p.add_argument(
+        "--end-date",
+        type=str,
+        default="2023-12-31",
+        help="Upper bound for auto window computation (YYYY-MM-DD, inclusive)",
+    )
     p.add_argument("--train-years", type=int, default=3, help="Years for training window")
     p.add_argument("--valid-years", type=int, default=1, help="Years for validation window")
     p.add_argument("--test-years", type=int, default=1, help="Years for test window")
@@ -84,6 +95,28 @@ def parse_args():
 
 def make_seed_list(num_seeds: int, base_seed: int) -> List[int]:
     return [base_seed + i for i in range(num_seeds)]
+
+
+def compute_max_windows(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    train_delta: datetime.timedelta,
+    valid_delta: datetime.timedelta,
+    test_delta: datetime.timedelta,
+    step_delta: datetime.timedelta,
+) -> int:
+    """Compute how many windows fit until end_date (inclusive)."""
+    win = 0
+    cur_start = start_date
+    while True:
+        train_end = cur_start + train_delta - datetime.timedelta(days=1)
+        valid_end = train_end + valid_delta
+        test_end = valid_end + test_delta
+        if test_end > end_date:
+            break
+        win += 1
+        cur_start = cur_start + step_delta
+    return win
 
 
 def find_checkpoint(res_dir: str) -> Optional[str]:
@@ -155,7 +188,9 @@ def run_one_window(
         f"res_dir={cfg.res_dir}",
         flush=True,
     )
+    print(f"[WF] >>> Starting training for window={window_idx} seed={seed}", flush=True)
     RLcontroller(cfg)
+    print(f"[WF] <<< Finished training for window={window_idx} seed={seed}", flush=True)
     next_checkpoint = find_checkpoint(cfg.res_dir)
     if next_checkpoint:
         print(f"[WF] Next resume checkpoint: {next_checkpoint}", flush=True)
@@ -180,30 +215,68 @@ def run_one_window(
         "reward_sum": row.get("reward_sum", np.nan),
         "next_checkpoint": next_checkpoint,
     }
+    print(
+        f"[WF] Metrics window={window_idx} seed={seed} | "
+        f"Sharpe={metrics['sharpeRatio']} MDD={metrics['mdd']} "
+        f"AnnualRet={metrics['annualReturn_pct']} NetProfit={metrics['netProfit_pct']} "
+        f"FinalCap={metrics['final_capital']}",
+        flush=True,
+    )
     return metrics
 
 
 def main():
     args = parse_args()
     start_date = pd.Timestamp(args.start_date)
+    end_date = pd.Timestamp(args.end_date)
     train_years = datetime.timedelta(days=365 * args.train_years)
     valid_years = datetime.timedelta(days=365 * args.valid_years)
     test_years = datetime.timedelta(days=365 * args.test_years)
     step_years = datetime.timedelta(days=365 * args.step_years)
-
     seeds = make_seed_list(args.num_seeds, args.base_seed)
+    num_windows = args.num_windows
+    if num_windows <= 0:
+        num_windows = compute_max_windows(
+            start_date=start_date,
+            end_date=end_date,
+            train_delta=train_years,
+            valid_delta=valid_years,
+            test_delta=test_years,
+            step_delta=step_years,
+        )
+        print(
+            f"[WF] Auto-computed num_windows={num_windows} until {end_date.date()} "
+            f"(start={start_date.date()}, step={args.step_years}y, "
+            f"train/valid/test={args.train_years}/{args.valid_years}/{args.test_years}y)",
+            flush=True,
+        )
+
+    print(
+        f"[WF] Plan: windows={num_windows}, seeds={seeds}, "
+        f"train/valid/test={args.train_years}/{args.valid_years}/{args.test_years} years, "
+        f"step={args.step_years} years, start={start_date.date()}, end={end_date.date()}",
+        flush=True,
+    )
     all_metrics: List[Dict[str, float]] = []
     # Track per-seed checkpoint for chaining windows (only when non-overlapping)
     last_ckpt_by_seed: Dict[int, Optional[str]] = {s: None for s in seeds}
     last_window_end_by_seed: Dict[int, Optional[pd.Timestamp]] = {s: None for s in seeds}
 
-    for win in range(args.num_windows):
+    for win in range(num_windows):
         train_start = start_date + win * step_years
         train_end = train_start + train_years - datetime.timedelta(days=1)
         valid_start = train_end + datetime.timedelta(days=1)
         valid_end = valid_start + valid_years - datetime.timedelta(days=1)
         test_start = valid_end + datetime.timedelta(days=1)
         test_end = test_start + test_years - datetime.timedelta(days=1)
+
+        print(
+            f"[WF] Window {win} dates | "
+            f"train {train_start.date()}→{train_end.date()} | "
+            f"valid {valid_start.date()}→{valid_end.date()} | "
+            f"test {test_start.date()}→{test_end.date()}",
+            flush=True,
+        )
 
         for seed in seeds:
             resume_ckpt = None
@@ -215,6 +288,11 @@ def main():
                     resume_ckpt = prev_ckpt
                 elif prev_end is not None and train_start > prev_end:
                     resume_ckpt = prev_ckpt
+            print(
+                f"[WF] >>> Window {win + 1}/{num_windows} | seed={seed} | "
+                f"resume={'yes' if resume_ckpt else 'no'}",
+                flush=True,
+            )
             m = run_one_window(
                 window_idx=win,
                 seed=seed,

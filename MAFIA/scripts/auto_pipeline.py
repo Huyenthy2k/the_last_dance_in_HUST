@@ -8,13 +8,13 @@ Automated pipeline:
 
 Usage:
   python agents/MAFIA/scripts/auto_pipeline.py \
-    --hparam-trials 5 --hparam-epochs 5 \
-    --train-epochs 100 --num-seeds 10 --base-seed 2025
+    --hparam-trials 10 --hparam-epochs 5 \
+    --train-epochs 50 --num-seeds 10 --base-seed 2025
 
 Optional:
   --seeds 1,2,3              # explicit seeds
-  --hparam-trials 10          # more search trials
-  --walkforward-start-date 2017-01-01 --walkforward-num-windows 3 --walkforward-resume-overlap
+  --hparam-trials 10          # more search trials (default)
+  --walkforward-start-date 2017-01-01 --walkforward-num-windows 3 --walkforward-resume-overlap (default on)
 """
 
 import argparse
@@ -202,6 +202,7 @@ def run_walk_forward_stage(
     valid_years: int,
     test_years: int,
     step_years: int,
+    end_date: Optional[str],
     seeds: List[int],
     hparam_overrides: Optional[Dict[str, float]],
     resume_overlap: bool,
@@ -221,10 +222,24 @@ def run_walk_forward_stage(
     print("=" * 80, flush=True)
 
     start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date) if end_date else None
     train_delta = datetime.timedelta(days=365 * train_years)
     valid_delta = datetime.timedelta(days=365 * valid_years)
     test_delta = datetime.timedelta(days=365 * test_years)
     step_delta = datetime.timedelta(days=365 * step_years)
+    if num_windows <= 0 and end_ts is not None:
+        num_windows = walk_forward.compute_max_windows(
+            start_date=start_ts,
+            end_date=end_ts,
+            train_delta=train_delta,
+            valid_delta=valid_delta,
+            test_delta=test_delta,
+            step_delta=step_delta,
+        )
+        print(
+            f"[AUTO] 🧊 Auto-computed num_windows={num_windows} until {end_ts.date()}",
+            flush=True,
+        )
 
     last_ckpt_by_seed: Dict[int, Optional[str]] = {s: None for s in seeds}
     last_window_end_by_seed: Dict[int, Optional[pd.Timestamp]] = {
@@ -239,6 +254,14 @@ def run_walk_forward_stage(
         valid_end = valid_start + valid_delta - datetime.timedelta(days=1)
         test_start = valid_end + datetime.timedelta(days=1)
         test_end = test_start + test_delta - datetime.timedelta(days=1)
+
+        print(
+            f"[AUTO][WF] Window {win} dates | "
+            f"train {train_start.date()}→{train_end.date()} | "
+            f"valid {valid_start.date()}→{valid_end.date()} | "
+            f"test {test_start.date()}→{test_end.date()}",
+            flush=True,
+        )
 
         for seed in seeds:
             resume_ckpt = None
@@ -362,7 +385,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--hparam-trials", type=int, default=10, help="Optuna trials")
     p.add_argument(
-        "--hparam-epochs", type=int, default=10, help="Epochs per hparam trial"
+        "--hparam-epochs", type=int, default=5, help="Epochs per hparam trial"
     )
     p.add_argument(
         "--hparam-target",
@@ -373,7 +396,7 @@ def parse_args():
     p.add_argument(
         "--train-epochs",
         type=int,
-        default=100,
+        default=50,
         help="Epochs for full training per seed",
     )
     p.add_argument(
@@ -438,14 +461,20 @@ def parse_args():
     p.add_argument(
         "--walkforward-start-date",
         type=str,
-        default=None,
+        default="2017-01-01",
         help="Enable walk-forward stage starting at this date (YYYY-MM-DD).",
+    )
+    p.add_argument(
+        "--walkforward-end-date",
+        type=str,
+        default="2023-12-31",
+        help="End date (inclusive) for auto window computation (num-windows<=0).",
     )
     p.add_argument(
         "--walkforward-num-windows",
         type=int,
         default=0,
-        help="Number of walk-forward windows (0 = skip walk-forward stage).",
+        help="Number of walk-forward windows (<=0 => auto-compute until end-date; 0 will still enable walk-forward).",
     )
     p.add_argument(
         "--walkforward-train-years",
@@ -474,14 +503,14 @@ def parse_args():
     p.add_argument(
         "--walkforward-epochs",
         type=int,
-        default=None,
+        default=50,
         help="Epochs per walk-forward window (default: use --train-epochs)",
     )
     p.add_argument(
         "--walkforward-resume-overlap",
         action="store_true",
         default=True,
-        help="Reuse checkpoint/replay buffer even when windows overlap (buffers must be train-only).",
+        help="Reuse checkpoint even when windows overlap (replay buffer is reset by default on resume).",
     )
     p.add_argument(
         "--no-walkforward-resume-overlap",
@@ -601,6 +630,7 @@ def main():
             valid_years=args.walkforward_valid_years,
             test_years=args.walkforward_test_years,
             step_years=args.walkforward_step_years,
+            end_date=args.walkforward_end_date,
             seeds=seeds,
             hparam_overrides=wf_overrides,
             resume_overlap=args.walkforward_resume_overlap,

@@ -21,28 +21,28 @@ echo "🚀 Starting MAFIA Training..."
 echo "⏰ Start: $(date)"
 echo ""
 
-# If RUN_MULTI_SEED=1 (default), run multi-seed experiment; otherwise run single entrance.py
-WALK_FORWARD="${WALK_FORWARD:-0}"
+# Default: run walk-forward. Set WALK_FORWARD=0 to use legacy multi-seed/single run.
+WALK_FORWARD="${WALK_FORWARD:-1}"
 if [ "$WALK_FORWARD" = "1" ]; then
-    WF_START_DATE="${WF_START_DATE:-}"
-    if [ -z "$WF_START_DATE" ]; then
-        echo "❌ WALK_FORWARD=1 nhưng WF_START_DATE chưa được set (định dạng YYYY-MM-DD)."
-        exit 1
-    fi
-    WF_NUM_WINDOWS="${WF_NUM_WINDOWS:-1}"
+    WF_START_DATE="${WF_START_DATE:-2017-01-01}"
+    WF_NUM_WINDOWS="${WF_NUM_WINDOWS:-0}"       # 0 => auto-compute windows until end-date in script
     WF_TRAIN_YEARS="${WF_TRAIN_YEARS:-3}"
     WF_VALID_YEARS="${WF_VALID_YEARS:-1}"
     WF_TEST_YEARS="${WF_TEST_YEARS:-1}"
     WF_STEP_YEARS="${WF_STEP_YEARS:-1}"
-    WF_NUM_SEEDS="${WF_NUM_SEEDS:-1}"
+    WF_NUM_SEEDS="${WF_NUM_SEEDS:-10}"
     WF_BASE_SEED="${WF_BASE_SEED:-2025}"
-    WF_RESUME_OVERLAP="${WF_RESUME_OVERLAP:-0}"
+    WF_RESUME_OVERLAP="${WF_RESUME_OVERLAP:-1}"
     RESUME_FLAG=""
     if [ "$WF_RESUME_OVERLAP" = "1" ]; then
         RESUME_FLAG="--resume-overlap"
+    else
+        RESUME_FLAG="--no-resume-overlap"
     fi
 
     echo "▶️ Running walk-forward training..."
+    echo "   WF_START_DATE=${WF_START_DATE}"
+    echo "   WF_NUM_WINDOWS=${WF_NUM_WINDOWS} (0 => auto)"
     python -u -W ignore::RuntimeWarning -W ignore::FutureWarning scripts/walk_forward.py \
         --start-date "$WF_START_DATE" \
         --num-windows "$WF_NUM_WINDOWS" \
@@ -59,6 +59,7 @@ if [ "$WALK_FORWARD" = "1" ]; then
     exit 0
 fi
 
+# If RUN_MULTI_SEED=1 (default), run multi-seed experiment; otherwise run single entrance.py
 RUN_MULTI_SEED="${RUN_MULTI_SEED:-1}"
 NUM_SEEDS="${NUM_SEEDS:-10}"
 BASE_SEED="${BASE_SEED:-2025}"
