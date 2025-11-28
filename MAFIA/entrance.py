@@ -235,6 +235,8 @@ def RLcontroller(config):
     original_learning_starts = getattr(config, "learning_starts", 0)
     prefilled_buffer_size = 0
     prefilled_buffer_capacity = None
+    buffer_loaded = False
+    reset_rb_on_resume = getattr(config, "reset_replay_buffer_on_resume", False)
     last_loaded_buffer_size = 0
     if checkpoint_to_resume is not None and isinstance(checkpoint_to_resume, str) and os.path.exists(checkpoint_to_resume):
         print(f"Resuming training from checkpoint: {checkpoint_to_resume}", flush=True)
@@ -268,6 +270,9 @@ def RLcontroller(config):
             checkpoint_type = checkpoint_info.get('type', 'epoch')
             day_in_epoch = checkpoint_info.get('day_in_epoch', 0)
             replay_buffer_path = checkpoint_info.get('replay_buffer_path', None)
+            if reset_rb_on_resume and replay_buffer_path:
+                print("[RESUME] reset_replay_buffer_on_resume=1 -> skip loading replay buffer from checkpoint", flush=True)
+                replay_buffer_path = None
             # Peek replay buffer size/capacity to align model buffer before init
             if replay_buffer_path and os.path.exists(replay_buffer_path):
                 try:
@@ -394,6 +399,7 @@ def RLcontroller(config):
                     if buffer_obj is None or buffer_size <= 0:
                         raise RuntimeError(f"Replay buffer empty after SB3 load (size={buffer_size})")
                     print(f"[RESUME] Replay buffer loaded from {replay_buffer_path} (size: {buffer_size})", flush=True)
+                    buffer_loaded = True
                 except Exception as e:
                     print(f"[RESUME] Warning: Failed to load replay buffer via SB3: {e}", flush=True)
                     if prefilled_buffer_size > 0:
@@ -402,18 +408,18 @@ def RLcontroller(config):
                             buffer_obj = getattr(po_model, 'replay_buffer', None)
                             buffer_size = buffer_obj.size() if hasattr(buffer_obj, 'size') else len(buffer_obj)
                             print(f"[RESUME] Manual replay buffer load succeeded (size: {buffer_size})", flush=True)
+                            buffer_loaded = True
                         except Exception as e2:
                             print(f"[RESUME] Manual replay buffer load failed: {e2}", flush=True)
-                # Force skip warm-up on resume
-                config.learning_starts = 0
-                if hasattr(po_model, 'learning_starts'):
-                    po_model.learning_starts = 0
                 buffer_obj = getattr(po_model, 'replay_buffer', None)
                 buffer_size = buffer_obj.size() if buffer_obj is not None and hasattr(buffer_obj, 'size') else (len(buffer_obj) if buffer_obj is not None else 0)
                 last_loaded_buffer_size = buffer_size
-                print(f"[RESUME] learning_starts set to 0 (buffer size now {buffer_size})", flush=True)
+                if buffer_loaded:
+                    print(f"[RESUME] learning_starts set to 0 (buffer size now {buffer_size})", flush=True)
             elif replay_buffer_path:
                 print(f"[RESUME] Replay buffer file not found at {replay_buffer_path}", flush=True)
+            else:
+                print("[RESUME] Replay buffer load skipped (reset_replay_buffer_on_resume=1 or no path present)", flush=True)
 
             # Load MAFIA observer from checkpoint if exists
             if (config.enable_market_observer and 
@@ -433,9 +439,14 @@ def RLcontroller(config):
         po_model.verbose = 1
     # Ensure learning_starts is zeroed when resuming (skip warm-up)
     if checkpoint_to_resume is not None and hasattr(po_model, "learning_starts"):
-        config.learning_starts = 0
-        po_model.learning_starts = 0
-        if replay_buffer_path and last_loaded_buffer_size <= 0:
+        if buffer_loaded:
+            config.learning_starts = 0
+            po_model.learning_starts = 0
+        else:
+            # Keep original warm-up when buffer is reset/not loaded
+            config.learning_starts = original_learning_starts
+            po_model.learning_starts = original_learning_starts
+        if replay_buffer_path and buffer_loaded and last_loaded_buffer_size <= 0:
             raise RuntimeError(f"Replay buffer at {replay_buffer_path} failed to load (size={last_loaded_buffer_size})")
     
     # Calculate remaining timesteps and epochs

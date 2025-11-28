@@ -22,6 +22,43 @@ echo "⏰ Start: $(date)"
 echo ""
 
 # If RUN_MULTI_SEED=1 (default), run multi-seed experiment; otherwise run single entrance.py
+WALK_FORWARD="${WALK_FORWARD:-0}"
+if [ "$WALK_FORWARD" = "1" ]; then
+    WF_START_DATE="${WF_START_DATE:-}"
+    if [ -z "$WF_START_DATE" ]; then
+        echo "❌ WALK_FORWARD=1 nhưng WF_START_DATE chưa được set (định dạng YYYY-MM-DD)."
+        exit 1
+    fi
+    WF_NUM_WINDOWS="${WF_NUM_WINDOWS:-1}"
+    WF_TRAIN_YEARS="${WF_TRAIN_YEARS:-3}"
+    WF_VALID_YEARS="${WF_VALID_YEARS:-1}"
+    WF_TEST_YEARS="${WF_TEST_YEARS:-1}"
+    WF_STEP_YEARS="${WF_STEP_YEARS:-1}"
+    WF_NUM_SEEDS="${WF_NUM_SEEDS:-1}"
+    WF_BASE_SEED="${WF_BASE_SEED:-2025}"
+    WF_RESUME_OVERLAP="${WF_RESUME_OVERLAP:-0}"
+    RESUME_FLAG=""
+    if [ "$WF_RESUME_OVERLAP" = "1" ]; then
+        RESUME_FLAG="--resume-overlap"
+    fi
+
+    echo "▶️ Running walk-forward training..."
+    python -u -W ignore::RuntimeWarning -W ignore::FutureWarning scripts/walk_forward.py \
+        --start-date "$WF_START_DATE" \
+        --num-windows "$WF_NUM_WINDOWS" \
+        --train-years "$WF_TRAIN_YEARS" \
+        --valid-years "$WF_VALID_YEARS" \
+        --test-years "$WF_TEST_YEARS" \
+        --step-years "$WF_STEP_YEARS" \
+        --num-seeds "$WF_NUM_SEEDS" \
+        --base-seed "$WF_BASE_SEED" \
+        $RESUME_FLAG
+    echo ""
+    echo "✅ Training Completed!"
+    echo "⏰ End: $(date)"
+    exit 0
+fi
+
 RUN_MULTI_SEED="${RUN_MULTI_SEED:-1}"
 NUM_SEEDS="${NUM_SEEDS:-10}"
 BASE_SEED="${BASE_SEED:-2025}"
