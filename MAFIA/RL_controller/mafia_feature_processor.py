@@ -246,8 +246,12 @@ class MAFIAFeatureProcessor:
     
     def _compute_sma(self, prices: np.ndarray, window: int) -> np.ndarray:
         """Compute Simple Moving Average."""
+<<<<<<< HEAD
         # TA-Lib expects float64 input; ensure dtype to avoid type errors
         prices = np.asarray(prices, dtype=np.float64)
+=======
+        prices = prices.astype(np.float64, copy=False)
+>>>>>>> main
         if TALIB_AVAILABLE:
             # Use TA-Lib if available
             result = talib.SMA(prices, timeperiod=window)
@@ -264,7 +268,11 @@ class MAFIAFeatureProcessor:
     
     def _compute_rsi(self, prices: np.ndarray, period: int) -> np.ndarray:
         """Compute Relative Strength Index."""
+<<<<<<< HEAD
         prices = np.asarray(prices, dtype=np.float64)
+=======
+        prices = prices.astype(np.float64, copy=False)
+>>>>>>> main
         if TALIB_AVAILABLE:
             result = talib.RSI(prices, timeperiod=period)
             # Fill NaN values with 50 (neutral RSI)
@@ -291,9 +299,15 @@ class MAFIAFeatureProcessor:
     
     def _compute_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
         """Compute Average True Range."""
+<<<<<<< HEAD
         high = np.asarray(high, dtype=np.float64)
         low = np.asarray(low, dtype=np.float64)
         close = np.asarray(close, dtype=np.float64)
+=======
+        high = high.astype(np.float64, copy=False)
+        low = low.astype(np.float64, copy=False)
+        close = close.astype(np.float64, copy=False)
+>>>>>>> main
         if TALIB_AVAILABLE:
             result = talib.ATR(high, low, close, timeperiod=period)
             # Fill NaN values with first valid value

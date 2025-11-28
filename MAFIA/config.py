@@ -40,7 +40,7 @@ class Config:
         self.benchmark_algo = "TD3-PR"  # TD3 Profit-Risk optimization
         self.market_name = "VNINDEX"  # Financial Index: 'DJIA', 'SP500', 'CSI300'
         self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
-        self.num_epochs = 100  # episodes for convergence
+        self.num_epochs = 50  # episodes for convergence
 
         # MAFIA configuration (fixed)
         self.rl_model_name = "TD3"  # RL agent implemented by TD3
@@ -106,8 +106,9 @@ class Config:
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
         )
-        # TD3 learning-rate schedule: 'linear', 'linear_per_epoch', or None
-        self.td3_lr_schedule = "linear_per_epoch"
+        # TD3 learning-rate schedule: 'linear', 'linear_per_epoch', 'cyclic_run_decay', or None
+        # cyclic_run_decay: LR decays across the full run and also tapers in the tail of each epoch (no per-epoch reset)
+        self.td3_lr_schedule = "cyclic_run_decay"
         self.td3_lr_end_factor = 0.2  # end_lr = start_lr * end_factor
         self.td3_lr_end_fraction = (
             0.5  # fraction of each epoch where end_lr reached (for linear_per_epoch)
@@ -242,6 +243,8 @@ class Config:
         self.max_checkpoints_to_keep = (
             1  # Applies to both epoch and step checkpoints when cleanup enabled
         )
+        # On resume: only load model weights/observer; skip replay buffer to avoid stale/overlapping samples
+        self.reset_replay_buffer_on_resume = True
         self.save_replay_buffer_on_step_checkpoints = (
             False  # Skip 3GB+ replay buffer for frequent step checkpoints
         )
@@ -536,11 +539,33 @@ class Config:
                     return start_lr + (phase / frac) * (end_lr - start_lr)
 
                 lr_value = _per_epoch_linear
+        elif schedule_mode == "cyclic_run_decay":
+            # Global decay across the full run AND per-epoch tail decay (no reset each epoch)
+            end_factor = getattr(self, "td3_lr_end_factor", 0.2)
+            frac = getattr(self, "td3_lr_end_fraction", 0.5)
+            total_epochs = max(1, getattr(self, "num_epochs", 1))
+            frac = max(1e-6, min(1.0, frac))
+
+            def _cyclic_decay(progress_remaining: float) -> float:
+                # progress: 0 at start -> 1 at end of run
+                progress = 1.0 - progress_remaining
+                # Global decay over the whole run
+                global_scale = 1.0 - (1.0 - end_factor) * progress
+                # Epoch-phase decay near the tail of each epoch
+                epoch_phase = (
+                    progress * total_epochs
+                ) % 1.0  # 0..1 within current epoch
+                tail_phase = min(epoch_phase / frac, 1.0)
+                epoch_scale = 1.0 - (1.0 - end_factor) * tail_phase
+                lr_curr = start_lr * max(0.0, global_scale * epoch_scale)
+                return lr_curr
+
+            lr_value = _cyclic_decay
 
         base_para = {
             "policy": policy_name,
             "learning_rate": lr_value,
-            "buffer_size": int(2.6 * 1e5),
+            "buffer_size": int(1.56 * 1e5),
             "learning_starts": self.learning_starts,
             "batch_size": self.batch_size,
             "tau": 0.005,
