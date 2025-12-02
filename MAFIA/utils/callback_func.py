@@ -68,7 +68,10 @@ class PoCallback(BaseCallback):
         self.save_replay_buffer_on_epoch_checkpoints = getattr(
             config, 'save_replay_buffer_on_epoch_checkpoints', True
         )
-        self.early_stop_patience = getattr(config, 'early_stop_patience', 0)
+        self.early_stop_patience = getattr(config, 'early_stop_patience', 0) or 0
+        self.early_stop_min_delta = getattr(config, 'early_stop_min_delta', 0.0) or 0.0
+        self.early_stop_warmup = getattr(config, 'early_stop_warmup', 0) or 0
+        self.early_stop_metric = getattr(config, 'early_stop_metric', 'reward_sum') or 'reward_sum'
         # Metrics logging
         default_metrics_path = getattr(self.config, 'metrics_history_path', None)
         if not default_metrics_path:
@@ -98,8 +101,9 @@ class PoCallback(BaseCallback):
         self._rollout_debug_logged = False
         self._training_ready = False
         self._warmup_notice_printed = False
-        # Track best validation reward_sum for checkpointing
+        # Track best validation metrics for checkpointing / early stop
         self.best_valid_reward_sum = -np.inf
+        self.best_valid_metric = -np.inf
         self.valid_no_improve_epochs = 0
         self._early_stop = False
         self.best_valid_checkpoint_path = None
@@ -707,9 +711,15 @@ class PoCallback(BaseCallback):
                 # Early stopping / best-valid tracking
                 if valid_profile is not None:
                     reward_val = valid_profile.get('reward_sum', None)
+                    metric_val = valid_profile.get(self.early_stop_metric, None)
+                    if metric_val is None or not np.isfinite(metric_val):
+                        metric_val = reward_val if reward_val is not None and np.isfinite(reward_val) else None
                     if reward_val is not None and np.isfinite(reward_val):
-                        if reward_val > self.best_valid_reward_sum + 1e-6:
-                            self.best_valid_reward_sum = reward_val
+                        self.best_valid_reward_sum = max(self.best_valid_reward_sum, reward_val)
+                    if metric_val is not None:
+                        improved = metric_val > (self.best_valid_metric + self.early_stop_min_delta)
+                        if improved:
+                            self.best_valid_metric = metric_val
                             self.valid_no_improve_epochs = 0
                             try:
                                 checkpoint_dir = self._save_checkpoint(
@@ -719,13 +729,21 @@ class PoCallback(BaseCallback):
                                     checkpoint_type='epoch_best_valid'
                                 )
                                 self.best_valid_checkpoint_path = checkpoint_dir
-                                print(f"[BEST VALID] reward_sum improved to {reward_val:.6f}. Saved best-valid checkpoint: {checkpoint_dir}", flush=True)
+                                print(f"[BEST VALID] {self.early_stop_metric} improved to {metric_val:.6f}. Saved best-valid checkpoint: {checkpoint_dir}", flush=True)
                             except Exception as e:
                                 print(f"[BEST VALID] Failed to save best-valid checkpoint: {e}", flush=True)
                         else:
                             self.valid_no_improve_epochs += 1
-                            if self.early_stop_patience and self.valid_no_improve_epochs >= self.early_stop_patience:
-                                print(f"[EARLY STOP] Validation reward_sum did not improve for {self.early_stop_patience} epochs (best={self.best_valid_reward_sum:.6f}). Stopping training.", flush=True)
+                            if (
+                                self.early_stop_patience
+                                and current_epoch_global >= self.early_stop_warmup
+                                and self.valid_no_improve_epochs >= self.early_stop_patience
+                            ):
+                                print(
+                                    f"[EARLY STOP] {self.early_stop_metric} did not improve for {self.valid_no_improve_epochs} epochs "
+                                    f"(best={self.best_valid_metric:.6f}, min_delta={self.early_stop_min_delta}). Stopping training.",
+                                    flush=True,
+                                )
                                 self._early_stop = True
 
             if run_test:
@@ -820,7 +838,12 @@ class PoCallback(BaseCallback):
         self.train_env.model_save_flag = False
         if self._early_stop:
             print(f"\n{'='*100}", flush=True)
-            print(f"🛑 Early stopping triggered (validation). Best valid reward_sum: {self.best_valid_reward_sum:.6f}", flush=True)
+            print(
+                f"🛑 Early stopping triggered (validation). "
+                f"Best {self.early_stop_metric}: {self.best_valid_metric:.6f} | "
+                f"Best reward_sum: {self.best_valid_reward_sum:.6f}",
+                flush=True,
+            )
             print(f"{'='*100}\n", flush=True)
             return False
         

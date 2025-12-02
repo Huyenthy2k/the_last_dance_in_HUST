@@ -1,4 +1,4 @@
-#！/usr/bin/python
+# ！/usr/bin/python
 # -*- coding: utf-8 -*-#
 
 """
@@ -11,6 +11,7 @@ This module handles feature preprocessing for MAFIA agents:
 Author: MASA
 See: Đặc Tả Kỹ Thuật (Technical Specification) - MAFIA.md
 """
+
 import numpy as np
 import pandas as pd
 import torch as th
@@ -19,25 +20,28 @@ from typing import Tuple, List, Optional
 # Try to import talib for technical indicators
 try:
     import talib
+
     TALIB_AVAILABLE = True
 except ImportError:
     TALIB_AVAILABLE = False
-    print("Warning: TA-Lib not available. Using fallback implementations for technical indicators.")
+    print(
+        "Warning: TA-Lib not available. Using fallback implementations for technical indicators."
+    )
 
 
 class MAFIAFeatureProcessor:
     """
     Feature processor for MAFIA agents.
-    
+
     Generates features for:
     - Technical Agent (i=0): Raw OCHLV + Technical Indicators (SMA, RSI, ATR)
     - DC Agents (i=1,2,3): Directional Change features (State, Magnitude, Duration, Volume_Ratio, Event_Flag)
     """
-    
+
     def __init__(self, config):
         """
         Initialize feature processor.
-        
+
         Args:
             config: Configuration object with MAFIA hyperparameters
         """
@@ -46,145 +50,143 @@ class MAFIAFeatureProcessor:
         self.DC_thresholds = config.mafia_DC_thresholds  # [0.005, 0.01, 0.02]
         self.M_tech = config.mafia_M_tech  # 8 features for Technical agent
         self.M_dc = config.mafia_M_dc  # 5 features for DC agents
-        
+
     def process_technical_features(self, ochlv_data: np.ndarray) -> np.ndarray:
         """
         Process features for Technical Agent (i=0).
-        
+
         Input: Raw OCHLV data
         - ochlv_data: (N, 5, T_w) where 5 = [open, close, high, low, volume]
-        
+
         Output: P_Tech ∈ ℝ^(N × T_w × 8)
         - 5 features: Open, Close, High, Low, Volume
         - 3 features: SMA(20), RSI(14), ATR(14)
-        
+
         Args:
             ochlv_data: (N, 5, T_w) numpy array
-        
+
         Returns:
             P_Tech: (N, T_w, 8) numpy array
         """
         N, M, T_w = ochlv_data.shape
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
         assert T_w == self.T_w, f"Expected window size {self.T_w}, got {T_w}"
-        
+
         # Extract individual features
         open_prices = ochlv_data[:, 0, :]  # (N, T_w)
         close_prices = ochlv_data[:, 1, :]  # (N, T_w)
         high_prices = ochlv_data[:, 2, :]  # (N, T_w)
         low_prices = ochlv_data[:, 3, :]  # (N, T_w)
         volumes = ochlv_data[:, 4, :]  # (N, T_w)
-        
+
         # Initialize output array
         P_Tech = np.zeros((N, T_w, self.M_tech), dtype=np.float32)
-        
+
         # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV)
-        raw_feat_stack = [
-            open_prices,
-            close_prices,
-            high_prices,
-            low_prices,
-            volumes
-        ]
+        raw_feat_stack = [open_prices, close_prices, high_prices, low_prices, volumes]
         for feat_idx, feat_vals in enumerate(raw_feat_stack):
             if feat_vals.shape[1] <= 1:
                 change = np.zeros_like(feat_vals)
             else:
                 prev_vals = feat_vals[:, :-1]
                 cur_vals = feat_vals[:, 1:]
-                change = np.divide(cur_vals, prev_vals, out=np.ones_like(cur_vals), where=prev_vals!=0)
+                change = np.divide(
+                    cur_vals,
+                    prev_vals,
+                    out=np.ones_like(cur_vals),
+                    where=prev_vals != 0,
+                )
                 change = change - 1.0
-                change = np.concatenate([np.zeros((N, 1), dtype=change.dtype), change], axis=1)
+                change = np.concatenate(
+                    [np.zeros((N, 1), dtype=change.dtype), change], axis=1
+                )
             P_Tech[:, :, feat_idx] = change.astype(np.float32)
-        
+
         # Compute technical indicators for each asset
         for n in range(N):
             # SMA(20) on Close
             sma_20 = self._compute_sma(close_prices[n, :], window=20)
             P_Tech[n, :, 5] = sma_20
-            
+
             # RSI(14) on Close
             rsi_14 = self._compute_rsi(close_prices[n, :], period=14)
             P_Tech[n, :, 6] = rsi_14
-            
+
             # ATR(14) on High, Low, Close
             atr_14 = self._compute_atr(
-                high_prices[n, :],
-                low_prices[n, :],
-                close_prices[n, :],
-                period=14
+                high_prices[n, :], low_prices[n, :], close_prices[n, :], period=14
             )
             P_Tech[n, :, 7] = atr_14
-        
+
         return P_Tech.astype(np.float32)
-    
-    def process_dc_features(self, ochlv_data: np.ndarray, dc_threshold: float) -> np.ndarray:
+
+    def process_dc_features(
+        self, ochlv_data: np.ndarray, dc_threshold: float
+    ) -> np.ndarray:
         """
         Process features for a DC Agent with given threshold.
-        
+
         Input: Raw price data
         - ochlv_data: (N, 5, T_w) where 5 = [open, close, high, low, volume]
-        
+
         Output: P_DC ∈ ℝ^(N × T_w × 5)
         - State: +1 (Up-trend), -1 (Down-trend)
         - Magnitude: % change from last DC event
         - Duration: Days since last DC event
         - Volume_Ratio: Volume[t] / Mean(Volume[0...T_w-1])
         - Event_Flag: 1.0 (DC event) or 0.5 (OS event)
-        
+
         Args:
             ochlv_data: (N, 5, T_w) numpy array
             dc_threshold: DC threshold (e.g., 0.005, 0.01, 0.02)
-        
+
         Returns:
             P_DC: (N, T_w, 5) numpy array
         """
         N, M, T_w = ochlv_data.shape
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
         assert T_w == self.T_w, f"Expected window size {self.T_w}, got {T_w}"
-        
+
         # Extract prices and volumes
         close_prices = ochlv_data[:, 1, :]  # (N, T_w)
         high_prices = ochlv_data[:, 2, :]  # (N, T_w)
         low_prices = ochlv_data[:, 3, :]  # (N, T_w)
         volumes = ochlv_data[:, 4, :]  # (N, T_w)
-        
+
         # Initialize output array
         P_DC = np.zeros((N, T_w, self.M_dc), dtype=np.float32)
-        
+
         # Compute DC features for each asset
         for n in range(N):
             state, magnitude, duration, event_flag = self._compute_dc_sequence(
-                close_prices[n, :],
-                high_prices[n, :],
-                low_prices[n, :],
-                dc_threshold
+                close_prices[n, :], high_prices[n, :], low_prices[n, :], dc_threshold
             )
-            
+
             P_DC[n, :, 0] = state  # State
             P_DC[n, :, 1] = magnitude  # Magnitude
             P_DC[n, :, 2] = duration  # Duration
-            
+
             # Volume_Ratio: Volume[t] / Mean(Volume[0...T_w-1])
             volume_mean = np.mean(volumes[n, :])
             if volume_mean > 0:
                 P_DC[n, :, 3] = volumes[n, :] / volume_mean
             else:
                 P_DC[n, :, 3] = 1.0
-            
+
             P_DC[n, :, 4] = event_flag  # Event_Flag
-        
+
         return P_DC.astype(np.float32)
-    
-    def _compute_dc_sequence(self, close: np.ndarray, high: np.ndarray, low: np.ndarray, 
-                            threshold: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+    def _compute_dc_sequence(
+        self, close: np.ndarray, high: np.ndarray, low: np.ndarray, threshold: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Compute DC sequence for a single asset.
-        
+
         DC Logic:
         - Upward DC: p_t >= p_{t-1}^l * (1 + threshold), where p_{t-1}^l is low in downward trend
         - Downward DC: p_t <= p_{t-1}^h * (1 - threshold), where p_{t-1}^h is high in upward trend
-        
+
         Returns:
             state: (T_w,) - Current trend state (+1 or -1)
             magnitude: (T_w,) - % change from last DC event
@@ -196,18 +198,18 @@ class MAFIAFeatureProcessor:
         magnitude = np.zeros(T_w)
         duration = np.zeros(T_w)
         event_flag = np.zeros(T_w)
-        
+
         # Initialize: start with upward trend
         current_trend = 1  # +1 for up, -1 for down
         current_extreme = close[0]  # Current extreme price (high for up, low for down)
         event_price = close[0]  # Price at last DC event
         event_time = 0  # Time of last DC event
-        
+
         state[0] = current_trend
         magnitude[0] = 0.0
         duration[0] = 0
         event_flag[0] = 1.0  # First point is considered an event
-        
+
         for t in range(1, T_w):
             if current_trend == 1:  # Upward trend
                 # Check for Downward DC
@@ -237,21 +239,17 @@ class MAFIAFeatureProcessor:
                     if low[t] < current_extreme:
                         current_extreme = low[t]
                     event_flag[t] = 0.5
-            
+
             state[t] = current_trend
             magnitude[t] = (close[t] / event_price) - 1.0 if event_price > 0 else 0.0
             duration[t] = t - event_time
-        
+
         return state, magnitude, duration, event_flag
-    
+
     def _compute_sma(self, prices: np.ndarray, window: int) -> np.ndarray:
         """Compute Simple Moving Average."""
-<<<<<<< HEAD
         # TA-Lib expects float64 input; ensure dtype to avoid type errors
         prices = np.asarray(prices, dtype=np.float64)
-=======
-        prices = prices.astype(np.float64, copy=False)
->>>>>>> main
         if TALIB_AVAILABLE:
             # Use TA-Lib if available
             result = talib.SMA(prices, timeperiod=window)
@@ -259,20 +257,18 @@ class MAFIAFeatureProcessor:
             if np.isnan(result[0]):
                 first_valid = np.where(~np.isnan(result))[0]
                 if len(first_valid) > 0:
-                    result[:first_valid[0]] = result[first_valid[0]]
+                    result[: first_valid[0]] = result[first_valid[0]]
         else:
             # Fallback: pandas rolling mean
-            result = pd.Series(prices).rolling(window=window, min_periods=1).mean().values
-        
+            result = (
+                pd.Series(prices).rolling(window=window, min_periods=1).mean().values
+            )
+
         return result
-    
+
     def _compute_rsi(self, prices: np.ndarray, period: int) -> np.ndarray:
         """Compute Relative Strength Index."""
-<<<<<<< HEAD
         prices = np.asarray(prices, dtype=np.float64)
-=======
-        prices = prices.astype(np.float64, copy=False)
->>>>>>> main
         if TALIB_AVAILABLE:
             result = talib.RSI(prices, timeperiod=period)
             # Fill NaN values with 50 (neutral RSI)
@@ -282,68 +278,75 @@ class MAFIAFeatureProcessor:
             delta = np.diff(prices)
             gain = np.where(delta > 0, delta, 0)
             loss = np.where(delta < 0, -delta, 0)
-            
+
             # Use exponential moving average
-            avg_gain = pd.Series(gain).ewm(alpha=1.0/period, adjust=False).mean().values
-            avg_loss = pd.Series(loss).ewm(alpha=1.0/period, adjust=False).mean().values
-            
-            rs = np.divide(avg_gain, avg_loss, out=np.ones_like(avg_gain), where=avg_loss!=0)
+            avg_gain = (
+                pd.Series(gain).ewm(alpha=1.0 / period, adjust=False).mean().values
+            )
+            avg_loss = (
+                pd.Series(loss).ewm(alpha=1.0 / period, adjust=False).mean().values
+            )
+
+            rs = np.divide(
+                avg_gain, avg_loss, out=np.ones_like(avg_gain), where=avg_loss != 0
+            )
             rsi = 100 - (100 / (1 + rs))
-            
+
             # Pad first value
             result = np.concatenate([[50.0], rsi])
             if len(result) < len(prices):
-                result = np.pad(result, (0, len(prices) - len(result)), mode='edge')
-        
+                result = np.pad(result, (0, len(prices) - len(result)), mode="edge")
+
         return result
-    
-    def _compute_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+
+    def _compute_atr(
+        self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int
+    ) -> np.ndarray:
         """Compute Average True Range."""
-<<<<<<< HEAD
         high = np.asarray(high, dtype=np.float64)
         low = np.asarray(low, dtype=np.float64)
         close = np.asarray(close, dtype=np.float64)
-=======
-        high = high.astype(np.float64, copy=False)
-        low = low.astype(np.float64, copy=False)
-        close = close.astype(np.float64, copy=False)
->>>>>>> main
         if TALIB_AVAILABLE:
             result = talib.ATR(high, low, close, timeperiod=period)
             # Fill NaN values with first valid value
             if np.isnan(result[0]):
                 first_valid = np.where(~np.isnan(result))[0]
                 if len(first_valid) > 0:
-                    result[:first_valid[0]] = result[first_valid[0]]
+                    result[: first_valid[0]] = result[first_valid[0]]
         else:
             # Fallback implementation
             tr = np.zeros(len(close))
             for i in range(1, len(close)):
                 tr[i] = max(
                     high[i] - low[i],
-                    abs(high[i] - close[i-1]),
-                    abs(low[i] - close[i-1])
+                    abs(high[i] - close[i - 1]),
+                    abs(low[i] - close[i - 1]),
                 )
             # Use exponential moving average
-            result = pd.Series(tr).ewm(alpha=1.0/period, adjust=False).mean().values
-        
+            result = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().values
+
         return result
-    
-    def process_market_index_features(self, ochlv_data: np.ndarray) -> np.ndarray:
+
+    def process_market_index_features(self, ochlv_data: np.ndarray, regime_feats: np.ndarray | None = None) -> np.ndarray:
         """
         Process features for Market-index Agent (VNINDEX).
-        
+
         Input: Raw OCHLV data for single asset (VNINDEX)
         - ochlv_data: (1, 5, T_w) where 5 = [open, close, high, low, volume]
-        
+        - regime_feats: Optional (T_w, R) or (1, T_w, R) array of precomputed regime features
+          (percentiles/trend/tail) already aligned to this window. If provided as (R,), it will
+          be broadcast across T_w.
+
         Output: P_Mkt ∈ ℝ^(1 × T_w × M_mkt)
         - 5 features: Change of OHLCV (ΔO, ΔC, ΔH, ΔL, ΔV)
         - 3 features: SMA(20), RSI(14), ATR(14)
         - 11 extended features: MACD_hist, BB_width, Stoch_K, Stoch_D, ADX14, OBV, MFI14, CCI20, Vol_std20, Drawdown60, Regime_sma20_60
-        
+        - Regime features (optional, appended): vol/drawdown percentiles, trend, ADX percentile,
+          autocorr, skew/kurtosis
+
         Args:
             ochlv_data: (1, 5, T_w) numpy array
-        
+
         Returns:
             P_Mkt: (1, T_w, M_mkt) numpy array where M_mkt = 19
         """
@@ -351,18 +354,52 @@ class MAFIAFeatureProcessor:
         assert N == 1, f"Market-index agent expects single asset (N=1), got {N}"
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
         assert T_w == self.T_w, f"Expected window size {self.T_w}, got {T_w}"
-        
+
         # Extract individual features (squeeze N dimension)
         open_prices = ochlv_data[0, 0, :]  # (T_w,)
         close_prices = ochlv_data[0, 1, :]  # (T_w,)
         high_prices = ochlv_data[0, 2, :]  # (T_w,)
         low_prices = ochlv_data[0, 3, :]  # (T_w,)
         volumes = ochlv_data[0, 4, :]  # (T_w,)
-        
-        # Total features: 5 (change) + 3 (basic) + 11 (extended) = 19
-        M_mkt = getattr(self.config, 'mafia_M_mkt', 19)  # Use config if available, default to 19
+
+        base_features = 19  # change(5) + basic(3) + extended(11)
+        extra_regime_dim = 0
+        regime_array = None
+        if regime_feats is not None:
+            regime_arr = np.array(regime_feats, dtype=np.float32)
+            # Accept shapes: (R,), (T_w, R), (1, T_w, R)
+            if regime_arr.ndim == 1:
+                regime_arr = np.tile(regime_arr.reshape(1, -1), (T_w, 1))
+            elif regime_arr.ndim == 2:
+                if regime_arr.shape[0] != T_w:
+                    # If provided with different time length, repeat last row/pad
+                    if regime_arr.shape[0] < T_w:
+                        last_row = regime_arr[-1:].copy()
+                        padding = np.tile(last_row, (T_w - regime_arr.shape[0], 1))
+                        regime_arr = np.vstack([regime_arr, padding])
+                    else:
+                        regime_arr = regime_arr[-T_w:]
+            elif regime_arr.ndim == 3:
+                # Expect (1, T_w, R)
+                regime_arr = regime_arr.reshape(-1, regime_arr.shape[-1])
+                if regime_arr.shape[0] < T_w:
+                    last_row = regime_arr[-1:].copy()
+                    padding = np.tile(last_row, (T_w - regime_arr.shape[0], 1))
+                    regime_arr = np.vstack([regime_arr, padding])
+                elif regime_arr.shape[0] > T_w:
+                    regime_arr = regime_arr[-T_w:]
+            else:
+                regime_arr = None
+            if regime_arr is not None:
+                regime_array = regime_arr.astype(np.float32)
+                extra_regime_dim = regime_array.shape[1]
+
+        M_mkt = base_features + extra_regime_dim
+        # Align config if needed to avoid shape mismatch downstream
+        if hasattr(self.config, "mafia_M_mkt"):
+            self.config.mafia_M_mkt = max(self.config.mafia_M_mkt, M_mkt)
         P_Mkt = np.zeros((1, T_w, M_mkt), dtype=np.float32)
-        
+
         # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV) - same as Technical Agent
         raw_feat_stack = [open_prices, close_prices, high_prices, low_prices, volumes]
         for feat_idx, feat_vals in enumerate(raw_feat_stack):
@@ -371,21 +408,26 @@ class MAFIAFeatureProcessor:
             else:
                 prev_vals = feat_vals[:-1]
                 cur_vals = feat_vals[1:]
-                change = np.divide(cur_vals, prev_vals, out=np.ones_like(cur_vals), where=prev_vals!=0)
+                change = np.divide(
+                    cur_vals,
+                    prev_vals,
+                    out=np.ones_like(cur_vals),
+                    where=prev_vals != 0,
+                )
                 change = change - 1.0
                 change = np.concatenate([np.zeros(1, dtype=change.dtype), change])
             P_Mkt[0, :, feat_idx] = change.astype(np.float32)
-        
+
         # Basic technical indicators (same as Technical Agent)
         sma_20 = self._compute_sma(close_prices, window=20)
         P_Mkt[0, :, 5] = sma_20
-        
+
         rsi_14 = self._compute_rsi(close_prices, period=14)
         P_Mkt[0, :, 6] = rsi_14
-        
+
         atr_14 = self._compute_atr(high_prices, low_prices, close_prices, period=14)
         P_Mkt[0, :, 7] = atr_14
-        
+
         # Extended indicators
         # MACD(12,26,9) histogram
         ema12 = pd.Series(close_prices).ewm(span=12, adjust=False).mean().values
@@ -394,7 +436,7 @@ class MAFIAFeatureProcessor:
         macd_signal = pd.Series(macd_line).ewm(span=9, adjust=False).mean().values
         macd_hist = macd_line - macd_signal
         P_Mkt[0, :, 8] = macd_hist
-        
+
         # Bollinger Band Width(20,2)
         bb_mid = pd.Series(close_prices).rolling(window=20, min_periods=1).mean()
         bb_std = pd.Series(close_prices).rolling(window=20, min_periods=1).std(ddof=0)
@@ -402,45 +444,64 @@ class MAFIAFeatureProcessor:
         bb_low = bb_mid - 2 * bb_std
         bb_width = (bb_up - bb_low) / (bb_mid.replace(0, np.nan)).replace(np.nan, 1.0)
         P_Mkt[0, :, 9] = np.nan_to_num(bb_width.values, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         # Stochastic %K/%D(14,3)
-        rolling_high14 = pd.Series(high_prices).rolling(window=14, min_periods=1).max().values
-        rolling_low14 = pd.Series(low_prices).rolling(window=14, min_periods=1).min().values
-        stoch_k = np.divide(close_prices - rolling_low14, rolling_high14 - rolling_low14, 
-                           out=np.zeros_like(close_prices), where=(rolling_high14 - rolling_low14)!=0) * 100.0
+        rolling_high14 = (
+            pd.Series(high_prices).rolling(window=14, min_periods=1).max().values
+        )
+        rolling_low14 = (
+            pd.Series(low_prices).rolling(window=14, min_periods=1).min().values
+        )
+        stoch_k = (
+            np.divide(
+                close_prices - rolling_low14,
+                rolling_high14 - rolling_low14,
+                out=np.zeros_like(close_prices),
+                where=(rolling_high14 - rolling_low14) != 0,
+            )
+            * 100.0
+        )
         stoch_d = pd.Series(stoch_k).rolling(window=3, min_periods=1).mean().values
         P_Mkt[0, :, 10] = stoch_k
         P_Mkt[0, :, 11] = stoch_d
-        
+
         # ADX(14)
         plus_dm = np.zeros(len(close_prices))
         minus_dm = np.zeros(len(close_prices))
         for i in range(1, len(close_prices)):
-            up_move = high_prices[i] - high_prices[i-1]
-            down_move = low_prices[i-1] - low_prices[i]
+            up_move = high_prices[i] - high_prices[i - 1]
+            down_move = low_prices[i - 1] - low_prices[i]
             plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
             minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
         tr = np.zeros(len(close_prices))
         for i in range(1, len(close_prices)):
-            tr[i] = max(high_prices[i] - low_prices[i],
-                       abs(high_prices[i] - close_prices[i-1]),
-                       abs(low_prices[i] - close_prices[i-1]))
+            tr[i] = max(
+                high_prices[i] - low_prices[i],
+                abs(high_prices[i] - close_prices[i - 1]),
+                abs(low_prices[i] - close_prices[i - 1]),
+            )
         tr_series = pd.Series(tr)
-        atr14_series = tr_series.ewm(alpha=1.0/14, adjust=False).mean()
-        plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1.0/14, adjust=False).mean() / 
-                        atr14_series.replace(0, np.nan)).replace(np.nan, 0.0)
-        minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1.0/14, adjust=False).mean() / 
-                         atr14_series.replace(0, np.nan)).replace(np.nan, 0.0)
-        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).replace(np.nan, 0.0)
-        adx14 = dx.ewm(alpha=1.0/14, adjust=False).mean().values
+        atr14_series = tr_series.ewm(alpha=1.0 / 14, adjust=False).mean()
+        plus_di = 100 * (
+            pd.Series(plus_dm).ewm(alpha=1.0 / 14, adjust=False).mean()
+            / atr14_series.replace(0, np.nan)
+        ).replace(np.nan, 0.0)
+        minus_di = 100 * (
+            pd.Series(minus_dm).ewm(alpha=1.0 / 14, adjust=False).mean()
+            / atr14_series.replace(0, np.nan)
+        ).replace(np.nan, 0.0)
+        dx = 100 * (
+            abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
+        ).replace(np.nan, 0.0)
+        adx14 = dx.ewm(alpha=1.0 / 14, adjust=False).mean().values
         P_Mkt[0, :, 12] = adx14
-        
+
         # OBV
         price_diff = np.diff(close_prices, prepend=close_prices[0])
         vol_sign = np.where(price_diff > 0, 1, np.where(price_diff < 0, -1, 0))
         obv = np.cumsum(vol_sign * volumes)
         P_Mkt[0, :, 13] = obv
-        
+
         # MFI(14)
         typical_price = (high_prices + low_prices + close_prices) / 3.0
         tp_diff = np.diff(typical_price, prepend=typical_price[0])
@@ -452,28 +513,43 @@ class MAFIAFeatureProcessor:
         mfr = np.divide(pos_mf14, neg_mf14.replace(0, np.nan)).replace(np.nan, 1.0)
         mfi14 = 100 - (100 / (1 + mfr))
         P_Mkt[0, :, 14] = mfi14.values
-        
+
         # CCI(20)
         sma_tp20 = pd.Series(typical_price).rolling(window=20, min_periods=1).mean()
-        md20 = pd.Series(typical_price).rolling(window=20, min_periods=1).apply(
-            lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-        cci20 = (typical_price - sma_tp20) / (0.015 * md20.replace(0, np.nan)).replace(np.nan, 1.0)
+        md20 = (
+            pd.Series(typical_price)
+            .rolling(window=20, min_periods=1)
+            .apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+        )
+        cci20 = (typical_price - sma_tp20) / (0.015 * md20.replace(0, np.nan)).replace(
+            np.nan, 1.0
+        )
         P_Mkt[0, :, 15] = np.nan_to_num(cci20.values, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         # Volatility std of returns (20)
         returns = pd.Series(close_prices).pct_change(fill_method=None).fillna(0.0)
         vol_std20 = returns.rolling(window=20, min_periods=1).std(ddof=0).values
         P_Mkt[0, :, 16] = vol_std20
-        
+
         # Drawdown (relative to rolling 60-day peak)
-        rolling_peak60 = pd.Series(close_prices).rolling(window=60, min_periods=1).max().values
-        drawdown60 = np.divide(rolling_peak60 - close_prices, rolling_peak60, 
-                              out=np.zeros_like(close_prices), where=rolling_peak60!=0)
+        rolling_peak60 = (
+            pd.Series(close_prices).rolling(window=60, min_periods=1).max().values
+        )
+        drawdown60 = np.divide(
+            rolling_peak60 - close_prices,
+            rolling_peak60,
+            out=np.zeros_like(close_prices),
+            where=rolling_peak60 != 0,
+        )
         P_Mkt[0, :, 17] = drawdown60
-        
+
         # Regime proxy: SMA20 - SMA60 (raw difference)
         sma60 = pd.Series(close_prices).rolling(window=60, min_periods=1).mean().values
         regime = sma_20 - sma60
         P_Mkt[0, :, 18] = regime
-        
+
+        # Append optional regime-aware features (percentiles/trend/tail)
+        if regime_array is not None and extra_regime_dim > 0:
+            P_Mkt[0, :, 19:19 + extra_regime_dim] = regime_array
+
         return P_Mkt.astype(np.float32)

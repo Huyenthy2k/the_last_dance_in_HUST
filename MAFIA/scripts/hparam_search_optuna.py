@@ -35,9 +35,6 @@ def run_one_trial(trial, mini_epochs=10):
     trial.set_user_attr("res_dir", cfg.res_dir)
     trial.set_user_attr("trial_ts", cfg.cur_datetime)
 
-    # No auto-resume during search; keep patience off for consistency
-    cfg.early_stop_patience = 0  # disable early stop for fair comparison
-
     # Hyperparameters to tune (scales aligned with reward_sum/Sharpe)
     cfg.lambda_1 = trial.suggest_float("lambda_1", 100.0, 1000.0, log=True)
     cfg.lambda_2 = trial.suggest_float("lambda_2", 10.0, 200.0, log=True)
@@ -81,8 +78,6 @@ def run_one_trial(trial, mini_epochs=10):
     cfg.save_replay_buffer_on_step_checkpoints = save_rb_step
     cfg.enable_checkpoint_cleanup = True
     cfg.max_checkpoints_to_keep = max_ckpt_keep
-    # Skip best-valid checkpointing / early-stop to avoid extra I/O during search
-    cfg.early_stop_patience = None
 
     print(
         f"[HSEARCH] Trial {trial.number} window: "

@@ -64,13 +64,14 @@ def test_walk_forward_resume_overlap(monkeypatch):
     monkeypatch.setattr(walk_forward, "RLcontroller", fake_rl)
     monkeypatch.setattr(entrance, "RLcontroller", fake_rl)
 
-    df, summary, metrics_csv, summary_csv = auto_pipeline.run_walk_forward_stage(
+    df, summary, metrics_csv, summary_csv, last_summary_csv = auto_pipeline.run_walk_forward_stage(
         start_date="2017-01-01",
         num_windows=2,
         train_years=3,
         valid_years=1,
         test_years=1,
         step_years=1,  # Overlaps windows; resume requires resume_overlap=True
+        end_date=None,
         seeds=[1],
         hparam_overrides={"num_epochs": 2},
         resume_overlap=True,
@@ -89,6 +90,7 @@ def test_walk_forward_resume_overlap(monkeypatch):
     assert not df.empty
     assert metrics_csv and Path(metrics_csv).exists()
     assert summary_csv and Path(summary_csv).exists()
+    assert last_summary_csv and Path(last_summary_csv).exists()
     assert "sharpeRatio" in df.columns
     assert not summary.empty
 
@@ -99,13 +101,14 @@ def test_walk_forward_overlap_without_resume(monkeypatch):
     monkeypatch.setattr(walk_forward, "RLcontroller", fake_rl)
     monkeypatch.setattr(entrance, "RLcontroller", fake_rl)
 
-    df, summary, _, _ = auto_pipeline.run_walk_forward_stage(
+    df, summary, _, _, _ = auto_pipeline.run_walk_forward_stage(
         start_date="2017-01-01",
         num_windows=2,
         train_years=3,
         valid_years=1,
         test_years=1,
         step_years=1,  # Overlaps windows
+        end_date=None,
         seeds=[42],
         hparam_overrides=None,
         resume_overlap=False,

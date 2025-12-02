@@ -8,6 +8,7 @@
 '''
 from collections import deque
 import numpy as np
+import sys
 import os
 import pandas as pd
 import time
@@ -1063,6 +1064,53 @@ class StockPortfolioEnv(gym.Env):
             norm_weights = norm_weights * abs(self.bound_flag)
         return norm_weights
 
+    def _estimate_min_variance_risk_for_mask(self, mask=None):
+        """
+        Estimate daily min-variance risk (sqrt(w^T Σ w)) for a given asset mask.
+        mask: bool array length stock_num; if None uses all assets.
+        """
+        key = f"DAILYRETURNS-{self.config.dailyRetun_lookback}"
+        daily_returns = self.ctl_state.get(key, None)
+        if daily_returns is None:
+            return None
+        try:
+            daily_returns = np.array(daily_returns, dtype=float)
+            daily_returns = np.nan_to_num(daily_returns, nan=0.0, posinf=0.0, neginf=0.0)
+            if daily_returns.ndim == 1:
+                daily_returns = daily_returns.reshape(1, -1)
+            if daily_returns.shape[0] != self.stock_num and daily_returns.shape[1] == self.stock_num:
+                daily_returns = daily_returns.T
+            # Only compute once enough history is available; skip to avoid cov warnings
+            required_cols = max(2, getattr(self.config, "dailyRetun_lookback", 2))
+            if daily_returns.shape[1] < required_cols:
+                return None
+            if mask is not None:
+                mask = np.array(mask, dtype=bool)
+                if mask.shape[0] != self.stock_num or not np.any(mask):
+                    return None
+                daily_returns = daily_returns[mask]
+            cov_matrix = np.cov(daily_returns)
+            cov_matrix = np.nan_to_num(cov_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            if cov_matrix.ndim == 0:
+                cov_matrix = np.array([[cov_matrix]])
+            elif cov_matrix.ndim == 1:
+                cov_matrix = np.diag(cov_matrix)
+            cov_matrix = 0.5 * (cov_matrix + cov_matrix.T)
+            cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-6
+            ones = np.ones(cov_matrix.shape[0])
+            inv_cov = np.linalg.pinv(cov_matrix)
+            w = inv_cov @ ones
+            if np.sum(w) <= 1e-10:
+                return None
+            w = np.maximum(w, 0.0)
+            if np.sum(w) <= 1e-10:
+                return None
+            w = w / np.sum(w)
+            risk_val = float(np.matmul(w, np.matmul(cov_matrix, w.T)))
+            return float(np.sqrt(max(risk_val, 0.0)))
+        except Exception:
+            return None
+
     def save_action_memory(self):
 
         action_arr = np.array(self.actions_memory)
@@ -1518,6 +1566,17 @@ class StockPortfolioEnv(gym.Env):
         
         try:
             phist_df = pd.DataFrame(self.profile_hist_ep, columns=self.profile_hist_field_lst)
+            # Ensure numeric fields are proper dtype before computing best metrics
+            numeric_fields = [
+                "reward_sum",
+                "final_capital",
+                "sharpeRatio",
+                "volatility",
+                "mdd",
+            ]
+            for nf in numeric_fields:
+                if nf in phist_df.columns:
+                    phist_df[nf] = pd.to_numeric(phist_df[nf], errors="coerce")
             profile_path = os.path.join(self.config.res_dir, '{}_profile.csv'.format(self.mode))
             phist_df.to_csv(profile_path, index=False)
             print(f"Profile saved to: {profile_path} (epoch {self.epoch}, {len(phist_df)} rows)", flush=True)
@@ -1706,22 +1765,23 @@ class StockPortfolioEnv(gym.Env):
                 else:
                     sample_weights = self.actions_memory[sample_idx]
                 if isinstance(sample_weights, np.ndarray) and len(sample_weights) == len(self.stock_lst):
+                    top_k_log = getattr(self.config, "topK", 10)
                     # Use weight_symbol_mapper if available
                     if get_top_stocks is not None:
                         try:
-                            top_10_stocks = get_top_stocks(sample_weights, self.stock_lst, top_k=10)
-                            print("  Top 10 stocks (day {}):".format(sample_idx))
-                            for i, (symbol, weight) in enumerate(top_10_stocks, 1):
+                            top_stocks = get_top_stocks(sample_weights, self.stock_lst, top_k=top_k_log)
+                            print(f"  Top {top_k_log} stocks (day {sample_idx}):")
+                            for i, (symbol, weight) in enumerate(top_stocks, 1):
                                 print("    {}. {}: {:.4f} ({:.2f}%)".format(i, symbol, weight, weight * 100))
                         except Exception as e:
                             # Fallback to simple printing if mapping fails
-                            print("  Top 10 stocks (day {}): (mapping error: {})".format(sample_idx, str(e)))
+                            print(f"  Top {top_k_log} stocks (day {sample_idx}): (mapping error: {e})")
                     else:
                         # Fallback: print top 10 by weight manually
                         weight_stock_pairs = list(zip(sample_weights, self.stock_lst))
                         weight_stock_pairs.sort(key=lambda x: x[0], reverse=True)
-                        print("  Top 10 stocks (day {}):".format(sample_idx))
-                        for i, (weight, symbol) in enumerate(weight_stock_pairs[:10], 1):
+                        print(f"  Top {top_k_log} stocks (day {sample_idx}):")
+                        for i, (weight, symbol) in enumerate(weight_stock_pairs[:top_k_log], 1):
                             print("    {}. {}: {:.4f} ({:.2f}%)".format(i, symbol, weight, weight * 100))
         # Create DataFrame and ensure no NaN values (we already handled NaN above, but double-check)
         bestmodel_df = pd.DataFrame([bestmodel_dict])
@@ -1967,6 +2027,14 @@ class StockPortfolioEnv(gym.Env):
                 self.latest_stock_ma_price = full_ma_price
                 
             input_kwargs = {'mode': self.mode, 'env': self}  # Pass environment for market-index data extraction
+            # Precompute market regime vector for this date (past-only stats)
+            market_regime_vec = self._get_market_regime_vector(cur_date)
+            if market_regime_vec is not None:
+                input_kwargs['market_regime_feats'] = market_regime_vec
+                if self._regime_dim is None:
+                    self._regime_dim = market_regime_vec.shape[1] if market_regime_vec.ndim == 2 else market_regime_vec.shape[-1]
+                # Keep latest regime vector for RL global context (use last row = current day)
+                self.last_regime_vec = market_regime_vec[-1] if market_regime_vec.ndim == 2 else market_regime_vec.reshape(-1)
             (
                 market_vector_np,
                 boundary_risk_np,
@@ -2035,8 +2103,11 @@ class StockPortfolioEnv(gym.Env):
             
             # Handle continuous boundary_risk from MAFIA
             if self.config.is_enable_dynamic_risk_bound:
+                # Warmup: ignore direction logits for first N steps, use continuous risk or hold default
+                warmup_steps = getattr(self.config, "risk_bound_warmup_steps", 0)
+                in_warmup = isinstance(self.curTradeDay, (int, np.integer)) and self.curTradeDay < warmup_steps
                 direction_idx = None
-                if sigma_val_np is not None and len(sigma_val_np) > 0:
+                if not in_warmup and sigma_val_np is not None and len(sigma_val_np) > 0:
                     try:
                         direction_idx = int(np.clip(sigma_val_np[-1], 0, 2))
                     except Exception:
@@ -2051,15 +2122,57 @@ class StockPortfolioEnv(gym.Env):
                         cur_risk_boundary = self.config.risk_down_bound
                 else:
                     # boundary_risk is continuous (ℝ^+)
-                    boundary_risk_raw = float(boundary_risk_np[-1])  # Get scalar value
-                    # Clip to reasonable range
-                    cur_risk_boundary = np.clip(
-                        boundary_risk_raw,
-                        self.config.risk_up_bound,
-                        self.config.risk_down_bound
-                    )
+                    boundary_risk_raw = None
+                    if boundary_risk_np is not None and len(boundary_risk_np) > 0:
+                        try:
+                            boundary_risk_raw = float(boundary_risk_np[-1])
+                        except Exception:
+                            boundary_risk_raw = None
+                    # Convert annualized sigma to daily if flagged
+                    if boundary_risk_raw is not None and getattr(self.config, "risk_bound_is_annualized", False):
+                        boundary_risk_raw = boundary_risk_raw / np.sqrt(252.0)
+                    if boundary_risk_raw is None or np.isnan(boundary_risk_raw) or np.isinf(boundary_risk_raw) or boundary_risk_raw <= 0:
+                        boundary_risk_raw = self.config.risk_hold_bound
+                    # Clip to consistent daily-vol range [risk_down_bound, risk_up_bound]
+                    lower = min(self.config.risk_down_bound, self.config.risk_up_bound)
+                    upper = max(self.config.risk_down_bound, self.config.risk_up_bound)
+                    cur_risk_boundary = np.clip(boundary_risk_raw, lower, upper)
             else:
                 cur_risk_boundary = self.config.risk_default
+
+            # Align risk_bound with Top-K universe if available
+            bound_before_minvar = cur_risk_boundary
+            min_var_k = None
+            if hasattr(self, "observer_topk_indices") and self.observer_topk_indices is not None:
+                mask = np.zeros(self.stock_num, dtype=bool)
+                indices = np.clip(self.observer_topk_indices, 0, self.stock_num - 1).astype(int)
+                mask[indices] = True
+                min_var_k = self._estimate_min_variance_risk_for_mask(mask)
+            if min_var_k is not None:
+                eps = getattr(self.config, "risk_bound_minvar_eps", 0.0)
+                cur_risk_boundary = max(cur_risk_boundary, min_var_k * (1.0 + eps))
+                # Re-clip to bounds after min-variance alignment
+                lower = min(self.config.risk_down_bound, self.config.risk_up_bound)
+                upper = max(self.config.risk_down_bound, self.config.risk_up_bound)
+                cur_risk_boundary = np.clip(cur_risk_boundary, lower, upper)
+                # Log alignment for debugging
+                try:
+                    print(
+                        f"[RISK-BOUND] day={self.curTradeDay} | bound_raw={bound_before_minvar:.4f} | "
+                        f"min_var_k={min_var_k:.4f} | eps={eps:.4f} | bound_eff={cur_risk_boundary:.4f}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+            # Smooth risk boundary to reduce abrupt controller swings
+            try:
+                alpha_smooth = getattr(self.config, "risk_bound_smoothing_alpha", 0.0)
+            except Exception:
+                alpha_smooth = 0.0
+            if alpha_smooth > 0 and hasattr(self, "risk_adj_lst") and len(self.risk_adj_lst) > 0:
+                prev_bound = self.risk_adj_lst[-1]
+                cur_risk_boundary = alpha_smooth * prev_bound + (1 - alpha_smooth) * cur_risk_boundary
 
             # Build compact state for MAFIA optimized: [market_vector(K), portfolio_value, (optional) risk_boundary]
             # Removed market_index_state - rely on Observer's learned representation
@@ -2176,22 +2289,18 @@ class StockPortfolioEnv(gym.Env):
         """
         import os
         from utils.data_validator import get_index_data_file
-        
-        # Get index data file path
-        fpath, error_msg = get_index_data_file(self.config, freq='1d')
-        if fpath is None:
-            raise ValueError(f"Cannot extract market index OCHLV: {error_msg}")
-        
-        # Load index data if not already cached
+        # Ensure index data is loaded and augmented with regime features (past-only)
         if not hasattr(self, '_index_data_cache') or self._index_data_cache is None:
+            fpath, error_msg = get_index_data_file(self.config, freq='1d')
+            if fpath is None:
+                raise ValueError(f"Cannot extract market index OCHLV: {error_msg}")
             index_data = pd.read_csv(fpath, header=0)
             index_data['date'] = pd.to_datetime(index_data['date'])
-            # Normalize timezone: remove timezone info to match config dates (naive datetime)
             if index_data['date'].dt.tz is not None:
                 index_data['date'] = index_data['date'].dt.tz_localize(None)
             index_data = index_data.sort_values('date', ascending=True, ignore_index=True)
+            index_data = self._augment_index_regime_features(index_data)
             self._index_data_cache = index_data
-        
         index_data = self._index_data_cache
         
         # Find current date in index data
@@ -2243,6 +2352,124 @@ class StockPortfolioEnv(gym.Env):
         ochlv_array[0, :, :] = window_values.T
         
         return ochlv_array
+
+    def _rolling_percentile(self, series: np.ndarray, window: int) -> np.ndarray:
+        """
+        Compute trailing percentile rank of the latest value within a rolling window.
+        Uses only past data (inclusive) to avoid leakage.
+        """
+        n = len(series)
+        out = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            start = max(0, i - window + 1)
+            window_vals = series[start:i + 1]
+            if len(window_vals) == 0:
+                out[i] = 0.0
+                continue
+            current = window_vals[-1]
+            rank = np.sum(window_vals <= current)
+            out[i] = rank / float(len(window_vals))
+        return out
+
+    def _compute_adx(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+        """
+        Lightweight ADX computation (trailing, no future leakage).
+        """
+        plus_dm = np.zeros_like(close, dtype=np.float32)
+        minus_dm = np.zeros_like(close, dtype=np.float32)
+        tr = np.zeros_like(close, dtype=np.float32)
+        for i in range(1, len(close)):
+            up_move = high[i] - high[i - 1]
+            down_move = low[i - 1] - low[i]
+            plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+            minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+            tr[i] = max(
+                high[i] - low[i],
+                abs(high[i] - close[i - 1]),
+                abs(low[i] - close[i - 1]),
+            )
+        # Smooth with exponential moving average
+        alpha = 1.0 / period
+        atr = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
+        plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan)).replace(np.nan, 0.0)
+        minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, np.nan)).replace(np.nan, 0.0)
+        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).replace(np.nan, 0.0)
+        adx = dx.ewm(alpha=alpha, adjust=False).mean().values.astype(np.float32)
+        return np.nan_to_num(adx, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _augment_index_regime_features(self, index_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add regime-aware features to index_data using trailing windows only (no look-ahead).
+        """
+        df = index_data.copy()
+        df['ret'] = df['close'].pct_change().fillna(0.0)
+        df['vol20'] = df['ret'].rolling(window=20, min_periods=2).std(ddof=0).fillna(0.0)
+        # Drawdown vs trailing peak
+        rolling_peak = df['close'].cummax().replace(0, np.nan)
+        df['drawdown'] = ((rolling_peak - df['close']) / rolling_peak).replace(np.nan, 0.0)
+        # Percentiles using trailing windows
+        df['vol_pct_252'] = self._rolling_percentile(df['vol20'].to_numpy(), window=252)
+        df['vol_pct_756'] = self._rolling_percentile(df['vol20'].to_numpy(), window=756)
+        df['dd_pct_252'] = self._rolling_percentile(df['drawdown'].to_numpy(), window=252)
+        df['dd_pct_756'] = self._rolling_percentile(df['drawdown'].to_numpy(), window=756)
+        # Trend proxies
+        df['ma20'] = df['close'].rolling(window=20, min_periods=1).mean()
+        df['ma200'] = df['close'].rolling(window=200, min_periods=1).mean()
+        df['ma20_ma200_diff'] = (df['ma20'] - df['ma200']).fillna(0.0)
+        # ADX and percentile
+        adx_vals = self._compute_adx(df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), period=14)
+        df['adx14'] = adx_vals
+        df['adx_pct_252'] = self._rolling_percentile(adx_vals, window=252)
+        # Autocorr of returns (lag1) rolling
+        df['autocorr_ret_60'] = df['ret'].rolling(window=60, min_periods=10).apply(lambda x: pd.Series(x).autocorr(lag=1), raw=False).fillna(0.0)
+        df['autocorr_ret_120'] = df['ret'].rolling(window=120, min_periods=10).apply(lambda x: pd.Series(x).autocorr(lag=1), raw=False).fillna(0.0)
+        # Tail shape
+        df['skew20'] = df['ret'].rolling(window=20, min_periods=5).skew().fillna(0.0)
+        df['kurt20'] = df['ret'].rolling(window=20, min_periods=5).kurt().fillna(0.0)
+        # Clamp extremes to keep gating stable
+        clamp_cols = ['vol_pct_252', 'vol_pct_756', 'dd_pct_252', 'dd_pct_756', 'adx_pct_252']
+        for col in clamp_cols:
+            df[col] = df[col].clip(0.0, 1.0)
+        skew_kurt_cols = ['skew20', 'kurt20', 'autocorr_ret_60', 'autocorr_ret_120', 'ma20_ma200_diff']
+        for col in skew_kurt_cols:
+            df[col] = np.nan_to_num(df[col], nan=0.0, posinf=0.0, neginf=0.0)
+        df[['vol20', 'drawdown']] = df[['vol20', 'drawdown']].fillna(0.0)
+        return df
+
+    def _get_market_regime_vector(self, cur_date):
+        """
+        Build regime feature vector for the current date using precomputed trailing stats.
+        """
+        if not hasattr(self, '_index_data_cache') or self._index_data_cache is None:
+            return None
+        idx_df = self._index_data_cache
+        date_mask = idx_df['date'] == cur_date
+        if not date_mask.any():
+            date_diffs = (idx_df['date'] - cur_date).abs()
+            closest_idx = date_diffs.idxmin()
+            if date_diffs[closest_idx] > pd.Timedelta(days=7):
+                return None
+            row = idx_df.iloc[[closest_idx]]
+        else:
+            row = idx_df.loc[date_mask]
+        cols = getattr(
+            self.config,
+            "mafia_regime_feature_names",
+            [
+                'vol_pct_252', 'vol_pct_756',
+                'dd_pct_252', 'dd_pct_756',
+                'ma20_ma200_diff',
+                'adx_pct_252',
+                'autocorr_ret_60', 'autocorr_ret_120',
+                'skew20', 'kurt20',
+            ],
+        )
+        missing = [c for c in cols if c not in row.columns]
+        if missing:
+            return None
+        vec = row[cols].iloc[0].astype(np.float32).to_numpy()
+        # Repeat across T_w when fed into observer
+        return np.tile(vec.reshape(1, -1), (self.config.mafia_T_w, 1)).astype(np.float32)
     
     def _build_mafia_state(self, market_vector_np, finemkt_feat, cur_date, cur_risk_boundary):
         """
@@ -2328,7 +2555,14 @@ class StockPortfolioEnv(gym.Env):
              'log_capital', 'last_turnover', 'drawdown']
         )
         # global dim = market_context(D) + market_direction(1) + selected scalars
-        self.rl_global_dim = self.config.mafia_D + 1 + len(self.rl_global_scalar_items)
+        # regime features will be appended dynamically if available
+        self._regime_dim = getattr(self.config, "mafia_regime_dim", None)
+        if self._regime_dim is not None:
+            try:
+                self._regime_dim = max(0, int(self._regime_dim))
+            except Exception:
+                self._regime_dim = 0
+        self.rl_global_dim = self.config.mafia_D + 1 + len(self.rl_global_scalar_items) + (self._regime_dim or 0)
         self.market_context_vec = np.zeros(self.config.mafia_D, dtype=np.float32)
         self._reset_rl_multibranch_buffers()
 
@@ -2343,6 +2577,8 @@ class StockPortfolioEnv(gym.Env):
         self.peak_capital = self.initial_asset
         self.latest_stock_ma_price = np.ones(self.stock_num, dtype=np.float32)
         self.per_stock_embedding = np.zeros((self.stock_num, self.config.mafia_D), dtype=np.float32)
+        regime_dim = self._regime_dim or 0
+        self.last_regime_vec = np.zeros(regime_dim, dtype=np.float32) if regime_dim > 0 else None
 
     def _log_reward_debug(
         self,
@@ -2360,6 +2596,8 @@ class StockPortfolioEnv(gym.Env):
         if debug_steps <= 0 or self.mode != 'train' or self.curTradeDay > debug_steps:
             return
         try:
+            # Clear any live status line before printing to avoid concatenation
+            sys.stdout.write("\r\033[2K")
             print(
                 "[REWARD-DEBUG] day={} j_return={:.6f} scaled_profit={:.4f} "
                 "js={:.6f} scaled_js={:.4f} turnover={:.4f} turnover_pen={:.4f} "
@@ -2412,14 +2650,31 @@ class StockPortfolioEnv(gym.Env):
         for key in self.rl_global_scalar_items:
             scalars.append(float(scalar_lookup.get(key, 0.0)))
         padded_scalars = np.array(scalars, dtype=np.float32)
-        return np.concatenate(
+        # Optional regime features (trailing, no look-ahead)
+        regime_vec = getattr(self, 'last_regime_vec', None)
+        if regime_vec is None and self._regime_dim:
+            regime_vec = np.zeros(self._regime_dim, dtype=np.float32)
+        regime_vec = regime_vec.astype(np.float32) if regime_vec is not None else np.array([], dtype=np.float32)
+        full_vec = np.concatenate(
             [
                 market_context.astype(np.float32),
                 np.array([market_direction_val], dtype=np.float32),
                 padded_scalars,
+                regime_vec,
             ],
             axis=0,
         )
+        target_dim = int(self.rl_global_dim)
+        if full_vec.shape[0] != target_dim:
+            # Keep buffer shapes stable for DummyVecEnv by padding/trimming as needed
+            if full_vec.shape[0] > target_dim:
+                full_vec = full_vec[:target_dim]
+            else:
+                full_vec = np.concatenate(
+                    [full_vec, np.zeros(target_dim - full_vec.shape[0], dtype=np.float32)],
+                    axis=0,
+                )
+        return full_vec.astype(np.float32)
 
     def _compose_per_stock_features(self):
         scores = self.market_scores_full if isinstance(self.market_scores_full, np.ndarray) else np.zeros(self.stock_num)

@@ -594,7 +594,7 @@ class TD3Controller(OffPolicyAlgorithm):
         def _log_rollout_status(timestep: int, episode: int, collected_steps: int) -> None:
             nonlocal status_last_time, status_last_step
             # Throttle status updates to reduce spam
-            status_interval = getattr(self, "_rollout_status_interval", 10)
+            status_interval = getattr(self, "_rollout_status_interval", 50)
             if collected_steps > 0 and collected_steps % status_interval != 0:
                 return
 

@@ -898,7 +898,12 @@ class MAFIAModel(nn.Module):
         # Dense MoE Signal Generator
         self.signal_generator = DenseMoESignalGenerator(config)
     
-    def forward(self, ochlv_data: th.Tensor, market_index_ochlv_data: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
+    def forward(
+        self,
+        ochlv_data: th.Tensor,
+        market_index_ochlv_data: Optional[th.Tensor] = None,
+        market_regime_feats: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor], th.Tensor]:
         """
         Forward pass through MAFIA model with Dense MoE.
         
@@ -914,6 +919,7 @@ class MAFIAModel(nn.Module):
             gate_weights: (batch, 4) - Expert weights from Dense MoE gating
             market_context: (batch, D) - Market condition embedding from the gating encoder
             fused_stock_embedding: (batch, N, D) or None - Fused per-stock embedding from expert ST outputs
+            sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
         """
         batch_size, N, M, T_w = ochlv_data.shape
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
@@ -970,11 +976,18 @@ class MAFIAModel(nn.Module):
         if use_market_index and market_index_ochlv_data is not None:
             # Process market-index features
             mkt_batches = []
+            regime_batches = []
             for b in range(batch_size):
                 mkt_sample_np = market_index_ochlv_data[b].detach().cpu().numpy()  # (1, 5, T_w)
                 if mkt_sample_np.shape[1] != 5 and mkt_sample_np.shape[2] == 5:
                     mkt_sample_np = mkt_sample_np.transpose(0, 2, 1)
-                P_mkt_np = self.feature_processor.process_market_index_features(mkt_sample_np)  # (1, T_w, M_mkt)
+                regime_np = None
+                if market_regime_feats is not None:
+                    regime_np = market_regime_feats[b].detach().cpu().numpy()
+                P_mkt_np = self.feature_processor.process_market_index_features(
+                    mkt_sample_np,
+                    regime_feats=regime_np,
+                )  # (1, T_w, M_mkt)
                 mkt_batches.append(P_mkt_np)
             
             P_mkt = th.from_numpy(np.stack(mkt_batches, axis=0)).to(dtype=dtype, device=device)  # (batch, 1, T_w, M_mkt)

@@ -26,7 +26,7 @@ import argparse
 import datetime
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,7 +56,12 @@ HYPERPARAM_KEYS = [
 
 def parse_args():
     p = argparse.ArgumentParser(description="Walk-forward/sliding-window training")
-    p.add_argument("--start-date", required=True, help="Start date for first window (YYYY-MM-DD)")
+    p.add_argument(
+        "--start-date",
+        required=False,
+        default=None,
+        help="Start date for first window (YYYY-MM-DD). Default: Config.train_date_start.",
+    )
     p.add_argument(
         "--num-windows",
         type=int,
@@ -66,8 +71,8 @@ def parse_args():
     p.add_argument(
         "--end-date",
         type=str,
-        default="2023-12-31",
-        help="Upper bound for auto window computation (YYYY-MM-DD, inclusive)",
+        default=None,
+        help="Upper bound for auto window computation (YYYY-MM-DD, inclusive). Default: Config.test_date_end (or valid/test fallback).",
     )
     p.add_argument("--train-years", type=int, default=3, help="Years for training window")
     p.add_argument("--valid-years", type=int, default=1, help="Years for validation window")
@@ -95,6 +100,33 @@ def parse_args():
 
 def make_seed_list(num_seeds: int, base_seed: int) -> List[int]:
     return [base_seed + i for i in range(num_seeds)]
+
+
+def _infer_default_dates(
+    start_date_arg: Optional[str], end_date_arg: Optional[str], base_seed: int
+) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Infer start/end dates from Config defaults when flags are missing.
+    Falls back to simple constants if Config cannot be instantiated.
+    """
+    if start_date_arg and end_date_arg:
+        return pd.Timestamp(start_date_arg), pd.Timestamp(end_date_arg)
+    try:
+        cfg_probe = Config(seed_num=base_seed, current_date="walkforward-defaults")
+        start_ts = (
+            pd.Timestamp(start_date_arg) if start_date_arg else cfg_probe.train_date_start
+        )
+        end_candidate = (
+            cfg_probe.test_date_end
+            or cfg_probe.valid_date_end
+            or cfg_probe.train_date_end
+        )
+        end_ts = pd.Timestamp(end_date_arg) if end_date_arg else pd.Timestamp(end_candidate)
+        return start_ts, end_ts
+    except Exception:
+        start_ts = pd.Timestamp(start_date_arg) if start_date_arg else pd.Timestamp("2017-01-01")
+        end_ts = pd.Timestamp(end_date_arg) if end_date_arg else start_ts + datetime.timedelta(days=365 * 5)
+        return start_ts, end_ts
 
 
 def compute_max_windows(
@@ -227,14 +259,26 @@ def run_one_window(
 
 def main():
     args = parse_args()
-    start_date = pd.Timestamp(args.start_date)
-    end_date = pd.Timestamp(args.end_date)
+    start_date, end_date = _infer_default_dates(args.start_date, args.end_date, args.base_seed)
+    used_default_start = args.start_date is None
+    used_default_end = args.end_date is None
     train_years = datetime.timedelta(days=365 * args.train_years)
     valid_years = datetime.timedelta(days=365 * args.valid_years)
     test_years = datetime.timedelta(days=365 * args.test_years)
     step_years = datetime.timedelta(days=365 * args.step_years)
     seeds = make_seed_list(args.num_seeds, args.base_seed)
     num_windows = args.num_windows
+    print(
+        "[WF] Resolved dates | "
+        f"start={start_date.date()} ({'default' if used_default_start else 'arg'}) | "
+        f"end={end_date.date()} ({'default' if used_default_end else 'arg'})",
+        flush=True,
+    )
+    print(
+        f"[WF] Settings | train/valid/test={args.train_years}/{args.valid_years}/{args.test_years} years | "
+        f"step={args.step_years} years | seeds={seeds} | resume_overlap={args.resume_overlap}",
+        flush=True,
+    )
     if num_windows <= 0:
         num_windows = compute_max_windows(
             start_date=start_date,
@@ -250,6 +294,8 @@ def main():
             f"train/valid/test={args.train_years}/{args.valid_years}/{args.test_years}y)",
             flush=True,
         )
+    else:
+        print(f"[WF] Using provided num_windows={num_windows}", flush=True)
 
     print(
         f"[WF] Plan: windows={num_windows}, seeds={seeds}, "
@@ -271,6 +317,10 @@ def main():
         test_end = test_start + test_years - datetime.timedelta(days=1)
 
         print(
+            f"[WF] Resolved train window {win}: start={train_start.date()} end={train_end.date()}",
+            flush=True,
+        )
+        print(
             f"[WF] Window {win} dates | "
             f"train {train_start.date()}→{train_end.date()} | "
             f"valid {valid_start.date()}→{valid_end.date()} | "
@@ -290,7 +340,8 @@ def main():
                     resume_ckpt = prev_ckpt
             print(
                 f"[WF] >>> Window {win + 1}/{num_windows} | seed={seed} | "
-                f"resume={'yes' if resume_ckpt else 'no'}",
+                f"resume={'yes' if resume_ckpt else 'no'}"
+                f"{' | ckpt=' + resume_ckpt if resume_ckpt else ''}",
                 flush=True,
             )
             m = run_one_window(
@@ -308,6 +359,11 @@ def main():
             last_ckpt_by_seed[seed] = m.get("next_checkpoint")
             last_window_end_by_seed[seed] = test_end
             all_metrics.append(m)
+            print(
+                f"[WF] <<< Window {win + 1}/{num_windows} | seed={seed} complete | "
+                f"next_checkpoint={m.get('next_checkpoint')}",
+                flush=True,
+            )
 
     # Aggregate and print summary
     if all_metrics:

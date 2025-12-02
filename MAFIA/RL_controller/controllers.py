@@ -11,6 +11,8 @@
 
 import numpy as np
 import cvxpy as cp
+import sys
+
 def _select_topk_from_scores(market_scores_full, method='topk', k=10, threshold=0.01):
     """
     Select Top-K stocks from market_scores_full based on method.
@@ -47,11 +49,12 @@ def _select_topk_from_scores(market_scores_full, method='topk', k=10, threshold=
 def _apply_market_scores_to_rl_action(a_rl, market_scores_full, config, env=None):
     """
     Apply Top-K selection to RL action based on mode.
-    
+
     Mode-specific behavior (automatic, no flag needed):
     - 'compact': RL automatically uses Top-K from Observer (filter RL action to only keep Observer's Top-K stocks)
     - 'full-score': RL automatically self-selects Top-K from market_scores_full
-    
+    - If config.mafia_action_full_universe=True: bypass Top-K masking and use full-universe weights from RL
+
     Args:
         a_rl: (N,) array - RL action
         market_scores_full: (N,) array - Full market scores from MAFIA
@@ -63,6 +66,16 @@ def _apply_market_scores_to_rl_action(a_rl, market_scores_full, config, env=None
         rl_selected_mask: (N,) bool array - Mask of stocks selected by RL/Observer (None if not applicable)
     """
     state_mode = getattr(config, 'mafia_state_mode', 'compact')
+
+    # Bypass masking if full-universe mode is enabled (RL outputs full N weights)
+    if getattr(config, 'mafia_action_full_universe', False):
+        a_full = np.array(a_rl, dtype=float)
+        a_full = np.nan_to_num(a_full, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.sum(np.abs(a_full)) > 1e-8:
+            a_full = a_full / np.sum(np.abs(a_full))
+        else:
+            a_full = np.ones(len(a_full)) / len(a_full)
+        return a_full, None
     
     if state_mode == 'compact':
         # In compact mode: RL automatically uses Top-K from Observer
@@ -281,7 +294,7 @@ def RL_withController(a_rl, env=None):
         pred_dict = {'shortterm': pred_prices_change}
     else:
         raise ValueError("Cannot find the price prediction model [{}]..".format(env.config.pricePredModel))
-    optimized_action, is_solvable_status = cbf_opt(env=env, a_rl=a_rl, pred_dict=pred_dict)
+    optimized_action, is_solvable_status = cbf_opt(env=env, a_rl=a_rl, pred_dict=pred_dict, rl_selected_mask=rl_selected_mask)
     if is_solvable_status and optimized_action is not None:
         a_final = optimized_action
         a_cbf = a_final - a_rl
@@ -434,10 +447,48 @@ def _compute_observer_bias(env):
     return -bias_weight * scores
 
 
-def cbf_opt(env, a_rl, pred_dict):
+def _estimate_min_variance_risk(cov_matrix: np.ndarray):
     """
-    Solve QP: minimize 0.5 x^T Σ x + q^T x + λ_reg ||x - a_RL||^2
-    subject to sum(x)=1, x>=0, and optional risk boundary.
+    Approximate minimum achievable portfolio risk (volatility) under sum(x)=1.
+    Used to quickly detect risk bounds that are too tight to satisfy.
+    """
+    try:
+        ones = np.ones(cov_matrix.shape[0])
+        inv_cov = np.linalg.pinv(cov_matrix)
+        weights = inv_cov @ ones
+        if np.sum(weights) <= 1e-10:
+            return None
+        weights = weights / np.sum(weights)
+        risk_val = float(np.matmul(weights, np.matmul(cov_matrix, weights.T)))
+        return float(np.sqrt(max(risk_val, 0.0)))
+    except Exception:
+        return None
+
+
+def _min_variance_weights(cov_matrix: np.ndarray):
+    """
+    Compute non-negative min-variance weights under sum(x)=1.
+    """
+    try:
+        n = cov_matrix.shape[0]
+        ones = np.ones(n)
+        inv_cov = np.linalg.pinv(cov_matrix)
+        w = inv_cov @ ones
+        # Enforce non-negativity and renormalize
+        w = np.maximum(w, 0.0)
+        if np.sum(w) <= 1e-10:
+            w = np.ones(n)
+        w = w / np.sum(w)
+        return w
+    except Exception:
+        return None
+
+
+def cbf_opt(env, a_rl, pred_dict, rl_selected_mask=None):
+    """
+    Solve-based agent (spec-aligned):
+    minimize 0.5 (a_RL + Δ)^T Σ (a_RL + Δ) + bias^T (a_RL + Δ) + λ_reg ||Δ||^2
+    s.t. sum(Δ)=0, a_RL+Δ>=0, and risk bound from Market Observer.
     """
     del pred_dict  # Price predictions are unused in the deterministic QP objective
     a_rl = np.array(a_rl, dtype=float)
@@ -446,86 +497,193 @@ def cbf_opt(env, a_rl, pred_dict):
     else:
         a_rl = a_rl / np.sum(a_rl)
 
-    cov_matrix = _build_covariance_matrix(env)
-    q_vec = _compute_observer_bias(env)
+    cov_matrix_full = _build_covariance_matrix(env)
+    bias_vec_full = _compute_observer_bias(env)
     lambda_reg = max(getattr(env.config, 'controller_reg_lambda', 0.0), 0.0)
 
-    # Risk boundary from observer (sigma)
-    risk_bound = None
+    # Restrict optimization to RL-selected Top-K (full-score mode) if configured
+    active_indices = None
+    if (
+        rl_selected_mask is not None
+        and np.any(rl_selected_mask)
+        and getattr(env.config, 'mafia_solver_use_rl_topk_only', False)
+    ):
+        active_indices = np.where(np.array(rl_selected_mask, dtype=bool))[0]
+    if active_indices is None or len(active_indices) == 0:
+        active_indices = np.arange(env.stock_num)
+
+    # Slice to active subset for optimization
+    a_rl_opt = a_rl[active_indices]
+    cov_matrix = cov_matrix_full[np.ix_(active_indices, active_indices)]
+    bias_vec = bias_vec_full[active_indices]
+
+    # Risk boundary from observer (sigma_s,t)
+    risk_bound_raw = None
     if hasattr(env, 'risk_adj_lst') and len(env.risk_adj_lst) > 0:
-        risk_bound = env.risk_adj_lst[-1]
-    if risk_bound is not None:
+        risk_bound_raw = env.risk_adj_lst[-1]
+    risk_bound = None
+    if risk_bound_raw is not None:
         try:
-            risk_bound = float(risk_bound)
+            risk_bound = float(risk_bound_raw)
             if risk_bound <= 0 or np.isnan(risk_bound) or np.isinf(risk_bound):
                 risk_bound = None
         except Exception:
             risk_bound = None
 
-    x = cp.Variable(env.stock_num)
+    # Helper to emit single-line status updates (avoid log spam)
+    def _emit_status_line(msg: str, end_newline: bool):
+        """Emit status on a single updating line; newline only on failures."""
+        try:
+            pad = getattr(_emit_status_line, "prev_len", 0)
+            clear_pad = " " * max(0, pad - len(msg))
+            sys.stdout.write("\r" + msg + clear_pad + ("\n" if end_newline else ""))
+            sys.stdout.flush()
+            _emit_status_line.prev_len = len(msg)
+        except Exception:
+            print(msg, flush=True)
 
-    def _build_objective():
-        obj = 0.5 * cp.quad_form(x, cov_matrix) + q_vec @ x
-        if lambda_reg > 0:
-            obj += lambda_reg * cp.sum_squares(x - a_rl)
-        return obj
+    n_opt = len(active_indices)
 
-    installed = set(cp.installed_solvers())
-    conic_solvers = [s for s in ('ECOS', 'SCS') if s in installed]
-    qp_solvers = [s for s in ('OSQP',) if s in installed]
-    if not (conic_solvers or qp_solvers):
+    installed = list(cp.installed_solvers())
+    solver_priority = ['ECOS', 'SCS', 'CLARABEL', 'ECOS_BB', 'MOSEK', 'GUROBI', 'OSQP', 'SCIPY']
+    solver_pool = [s for s in solver_priority if s in installed]
+    # Drop QP-only solvers when quadratic risk constraint is present
+    if risk_bound is not None:
+        qp_only = {'OSQP', 'SCIPY'}
+        solver_pool = [s for s in solver_pool if s not in qp_only]
+    if not solver_pool:
+        solver_pool = [s for s in installed if (risk_bound is None or s not in {'OSQP', 'SCIPY'})]
+    if not solver_pool:
+        solver_pool = installed
+    if not solver_pool:
         print("[Controller] Warning: No suitable QP solver available in cvxpy installation.", flush=True)
-        return False, None
+        return a_rl, False
 
-    def _solve_problem(include_risk_constraint):
-        constraints = [cp.sum(x) == 1, x >= 0]
-        if include_risk_constraint and (risk_bound is not None):
-            constraints.append(cp.quad_form(x, cov_matrix) <= (risk_bound ** 2))
-            constraints.append(cp.norm1(x - a_rl) <= (risk_bound * 2.0))
-        problem = cp.Problem(cp.Minimize(_build_objective()), constraints)
-        solver_pool = []
-        if include_risk_constraint:
-            solver_pool.extend(conic_solvers)
-        else:
-            solver_pool.extend(conic_solvers)
-            solver_pool.extend(qp_solvers)
-        if not solver_pool:
-            return False, None
+    delta_var = cp.Variable(n_opt)
+    a_final_var = a_rl_opt + delta_var
+    constraints = [
+        cp.sum(delta_var) == 0.0,  # spec: sum adjustment = 0
+        a_final_var >= 0,
+    ]
+    if risk_bound is not None:
+        constraints.append(cp.quad_form(a_final_var, cov_matrix) <= (risk_bound ** 2))
+
+    objective_expr = 0.5 * cp.quad_form(a_final_var, cov_matrix)
+    if bias_vec is not None and np.any(np.abs(bias_vec) > 0):
+        objective_expr += bias_vec.T @ a_final_var
+    if lambda_reg > 0:
+        objective_expr += lambda_reg * cp.sum_squares(delta_var)
+
+    problem = cp.Problem(cp.Minimize(objective_expr), constraints)
+
+    solved = False
+    solution = None
+    solver_used = None
+    solver_errors = []
+    min_var_risk = _estimate_min_variance_risk(cov_matrix)
+
+    infeasible_risk = False
+    infeasible_reason = None
+    risk_bound_effective = risk_bound
+    if risk_bound is not None and min_var_risk is not None:
+        if min_var_risk > risk_bound * (1.0 + 1e-5):
+            infeasible_risk = True
+            infeasible_reason = f"risk_bound {risk_bound:.4f} below min-variance {min_var_risk:.4f}"
+            # Clamp to achievable bound to avoid repeated FAIL during warm-up
+            risk_bound_effective = min_var_risk
+    if risk_bound_effective is not None and not solver_pool:
+        infeasible_reason = "no conic solver available for risk constraint"
+
+    # If no solver available or risk bound infeasible, fall back immediately to min-variance blend
+    if (not solver_pool) or infeasible_risk:
+        minvar_w = _min_variance_weights(cov_matrix)
+        a_final_opt = minvar_w if minvar_w is not None else a_rl_opt
+        solved = True  # treat as handled to avoid FAIL spam during warm-up
+        solver_used = "fallback-minvar" if minvar_w is not None else "-"
+    else:
         for solver in solver_pool:
             try:
+                # Update constraint if risk bound was clamped
+                if risk_bound_effective is not None and risk_bound_effective != risk_bound:
+                    constraints[-1] = cp.quad_form(a_final_var, cov_matrix) <= (risk_bound_effective ** 2)
+                    problem = cp.Problem(cp.Minimize(objective_expr), constraints)
                 problem.solve(solver=solver, warm_start=True, verbose=False)
-            except Exception as solver_error:
-                print(f"[Controller] Solver {solver} failed: {solver_error}", flush=True)
+            except Exception as exc:
+                solver_errors.append((solver, str(exc)))
                 continue
-            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-                return True, np.array(x.value).flatten()
-        return False, None
+            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and delta_var.value is not None:
+                solved = True
+                solver_used = solver
+                solution = np.array(delta_var.value).flatten()
+                break
 
-    solved, solution = _solve_problem(include_risk_constraint=True)
-    if not solved:
-        solved, solution = _solve_problem(include_risk_constraint=False)
+    if not solved and solver_errors:
+        first_solver, first_err = solver_errors[0]
+        print(f"[Controller] Solver attempts failed. First error ({first_solver}): {first_err}", flush=True)
 
     if solved and solution is not None:
-        a_final = np.nan_to_num(solution, nan=0.0, posinf=0.0, neginf=0.0)
-        a_final = np.maximum(a_final, 0.0)
-        if np.sum(a_final) > 1e-8:
-            a_final = a_final / np.sum(a_final)
+        a_final_opt = a_rl_opt + solution
+    else:
+        # Heuristic fallback: lean toward minimum-variance weights when solver cannot satisfy constraints
+        minvar_w = _min_variance_weights(cov_matrix)
+        if minvar_w is not None and len(minvar_w) == n_opt:
+            a_final_opt = minvar_w
         else:
-            a_final = np.ones(env.stock_num) / env.stock_num
+            a_final_opt = a_rl_opt
+
+    a_final_opt = np.nan_to_num(a_final_opt, nan=0.0, posinf=0.0, neginf=0.0)
+    a_final_opt = np.maximum(a_final_opt, 0.0)
+    if np.sum(a_final_opt) > 1e-8:
+        a_final_opt = a_final_opt / np.sum(a_final_opt)
+    else:
+        a_final_opt = np.ones(n_opt) / n_opt
+    # Map back to full asset universe (keep zeros for non-selected)
+    a_final = np.zeros(env.stock_num)
+    a_final[active_indices] = a_final_opt
+
+    if solved:
         env.solver_stat['solvable'] = env.solver_stat.get('solvable', 0) + 1
         env.solvable_flag.append(0)
     else:
-        a_final = a_rl
-        solved = False
         env.solver_stat['insolvable'] = env.solver_stat.get('insolvable', 0) + 1
         env.solvable_flag.append(1)
 
     # Track predicted risk for logging
     try:
-        risk_value = float(np.matmul(np.matmul(a_final, cov_matrix), a_final.T))
+        risk_value = float(np.matmul(np.matmul(a_final, cov_matrix_full), a_final.T))
         risk_value = np.sqrt(max(risk_value, 0.0))
     except Exception:
         risk_value = env.config.risk_market
     env.risk_pred_lst.append(risk_value)
+
+    # Emit compact single-line status (avoid multi-line spam)
+    try:
+        cur_day = getattr(env, "curTradeDay", None)
+        cur_date = None
+        if hasattr(env, "curData") and env.curData is not None and "date" in env.curData:
+            try:
+                cur_date = env.curData["date"].iloc[0]
+            except Exception:
+                cur_date = None
+        risk_bound_str = f"{risk_bound:.4f}" if risk_bound is not None else "None"
+        risk_bound_eff_str = f"{risk_bound_effective:.4f}" if risk_bound_effective is not None else risk_bound_str
+        status = "OK" if solved else "FAIL"
+        delta_used = float(np.sum(np.abs(a_final - a_rl)))
+        msg = (
+            f"[Controller] {status} | day={cur_day} | date={cur_date} | "
+            f"risk_bound={risk_bound_str} | risk_bound_eff={risk_bound_eff_str} | "
+            f"bound_min_var={min_var_risk if min_var_risk is not None else 'n/a'} | "
+            f"solver={solver_used or '-'} | risk_val={risk_value:.4f} | "
+            f"l1_used={delta_used:.4f}"
+        )
+        if infeasible_reason is not None:
+            msg += f" | note={infeasible_reason}"
+        log_interval = max(1, int(getattr(env.config, 'controller_log_interval', 5)))
+        cur_day_int = cur_day if isinstance(cur_day, (int, np.integer)) else 0
+        if (cur_day_int % log_interval == 0) or (not solved):
+            # Update in-place when solved; print newline on failures for visibility
+            _emit_status_line(msg, end_newline=not solved)
+    except Exception:
+        pass
 
     return a_final, solved

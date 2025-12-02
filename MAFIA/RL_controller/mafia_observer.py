@@ -116,6 +116,7 @@ class MAFIAObserver:
         
         # Training buffers (for Policy Gradient)
         self.market_vector_lst = []  # Store market_vector for each step (with gradient)
+        self.market_scores_full_lst = []  # Store full soft scores for each step (with gradient)
         self.boundary_risk_lst = []   # Store boundary_risk for each step
         self.rate_of_price_change_lst = []  # Store rate_of_price_change for reward calculation
         self.mkt_direction_lst = []   # Store market direction labels
@@ -134,8 +135,59 @@ class MAFIAObserver:
         for param in required_params:
             if not hasattr(self.config, param):
                 raise ValueError(f"Config missing required MAFIA parameter: {param}")
+
+    def _ensure_temp_embeddings_from_state(self, state_dict: dict):
+        """
+        Materialize temporary embedding layers (e.g., when market-index features use fewer
+        dimensions than config.mafia_M_mkt) before loading a checkpoint.
+
+        During training, TAModule creates `_temp_embedding` on-the-fly if the runtime token
+        dimension differs from the configured one. Those parameters are saved into the
+        checkpoint, but a freshly constructed model does not have the attribute yet, which
+        causes `load_state_dict` to raise `Unexpected key(s)`. This method inspects the
+        checkpoint and recreates the missing modules with the correct shapes so the weights
+        can be loaded.
+        """
+        temp_prefixes = {
+            key.split('._temp_embedding.')[0]
+            for key in state_dict.keys()
+            if '._temp_embedding.' in key
+        }
+        if not temp_prefixes:
+            return
+
+        module_map = dict(self.mafia_model.named_modules())
+        for prefix in temp_prefixes:
+            module = module_map.get(prefix)
+            # Only TAModules carry D_h/D attributes; skip anything else
+            if module is None or not hasattr(module, 'D_h') or not hasattr(module, 'D'):
+                continue
+            # If temp embedding already exists, leave it as-is
+            existing = getattr(module, '_temp_embedding', None)
+            if isinstance(existing, nn.Module):
+                continue
+
+            w1 = state_dict.get(f"{prefix}._temp_embedding.0.weight")
+            w2 = state_dict.get(f"{prefix}._temp_embedding.2.weight")
+            if w1 is None or w2 is None:
+                continue
+
+            in_features = w1.shape[1]
+            hidden_dim = w1.shape[0]
+            out_features = w2.shape[0]
+
+            module._temp_embedding = nn.Sequential(
+                nn.Linear(in_features, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, out_features),
+            ).to(self.device)
+            print(
+                f"[MAFIA] Recreated temp embedding for {prefix} "
+                f"(in={in_features}, hidden={hidden_dim}, out={out_features})",
+                flush=True,
+            )
     
-    def predict(self, finemkt_feat=None, finestock_feat=None, raw_ochlv_data=None, **kwargs):
+    def predict(self, finemkt_feat=None, finestock_feat=None, raw_ochlv_data=None, market_regime_feats=None, **kwargs):
         """
         Predict market_vector and boundary_risk.
         
@@ -192,9 +244,15 @@ class MAFIAObserver:
         
         # Extract market-index OCHLV data if available
         market_index_ochlv_tensor = None
+        market_regime_tensor = None
         if 'market_index_ochlv_data' in kwargs and kwargs['market_index_ochlv_data'] is not None:
             # Direct market-index data provided
             market_index_ochlv_tensor = self._prepare_market_index_ochlv_tensor(kwargs['market_index_ochlv_data'])
+            if market_regime_feats is not None:
+                regime_np = np.array(market_regime_feats, dtype=np.float32)
+                if regime_np.ndim == 2:
+                    regime_np = regime_np[np.newaxis, ...]
+                market_regime_tensor = th.from_numpy(regime_np).to(th.float32)
         elif 'env' in kwargs and kwargs['env'] is not None:
             # Try to extract from environment
             env = kwargs['env']
@@ -203,6 +261,13 @@ class MAFIAObserver:
                     cur_date = env.curData['date'].iloc[0] if hasattr(env.curData, 'iloc') else env.curData['date'][0]
                     market_index_ochlv_np = env._extract_market_index_ochlv_window(cur_date, window_size=self.config.mafia_T_w)
                     market_index_ochlv_tensor = self._prepare_market_index_ochlv_tensor(market_index_ochlv_np)
+                    if market_regime_feats is None and hasattr(env, "_get_market_regime_vector"):
+                        regime_vec = env._get_market_regime_vector(cur_date)
+                        if regime_vec is not None:
+                            regime_np = np.array(regime_vec, dtype=np.float32)
+                            if regime_np.ndim == 2:
+                                regime_np = regime_np[np.newaxis, ...]
+                            market_regime_tensor = th.from_numpy(regime_np).to(th.float32)
                 except Exception as e:
                     # If extraction fails, skip market-index agent
                     print(f"Warning: Could not extract market-index OCHLV data: {e}")
@@ -220,7 +285,9 @@ class MAFIAObserver:
                 stock_embedding,
                 sigma_logits,
             ) = self.mafia_model(
-                ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
+                ochlv_tensor,
+                market_index_ochlv_data=market_index_ochlv_tensor,
+                market_regime_feats=market_regime_tensor,
             )
         else:
             self.mafia_model.eval()
@@ -235,7 +302,9 @@ class MAFIAObserver:
                     stock_embedding,
                     sigma_logits,
                 ) = self.mafia_model(
-                    ochlv_tensor, market_index_ochlv_data=market_index_ochlv_tensor
+                    ochlv_tensor,
+                    market_index_ochlv_data=market_index_ochlv_tensor,
+                    market_regime_feats=market_regime_tensor,
                 )
         
         # Market direction prediction
@@ -248,6 +317,7 @@ class MAFIAObserver:
         if mode == 'train':
             # Store for training (keep gradient for Policy Gradient)
             self.market_vector_lst.append(market_vector)  # Don't detach - need gradient
+            self.market_scores_full_lst.append(market_scores_full)  # Full-universe soft scores
             self.boundary_risk_lst.append(boundary_risk.detach())
         
         # Store gate_weights for analysis/visualization (optional)
@@ -441,20 +511,20 @@ class MAFIAObserver:
                 - ori_risk: Original risk values
                 - adj_risk: Adjusted risk values
         """
-        if len(self.market_vector_lst) == 0 or len(self.rate_of_price_change_lst) == 0:
+        if len(self.market_scores_full_lst) == 0 or len(self.rate_of_price_change_lst) == 0:
             # No data collected, skip training
             return
         
         self.mafia_model.train()
         mode = label_kwargs.get('mode', 'train')
         
-        # Compute rewards from market_vectors with gradient
-        # This allows gradients to flow through the computation graph
+        # Compute rewards from full market scores (soft distribution) with gradient
+        # This allows gradients to flow through the computation graph across the whole universe
         reward_list = []
-        for market_vector, rate_of_price_change in zip(self.market_vector_lst, self.rate_of_price_change_lst):
-            # Compute reward: log(1 + sum((rate - 1) * market_vector))
-            # This measures how well market_vector predicted the actual returns
-            portfolio_return = th.sum((rate_of_price_change - 1.0) * market_vector, dim=-1)  # (batch,)
+        for market_scores_full, rate_of_price_change in zip(self.market_scores_full_lst, self.rate_of_price_change_lst):
+            # Compute reward: log(1 + sum((rate - 1) * market_scores_full))
+            # Use full soft scores to let gradients flow across the entire universe
+            portfolio_return = th.sum((rate_of_price_change - 1.0) * market_scores_full, dim=-1)  # (batch,)
             step_reward = th.log(portfolio_return + 1.0)  # (batch,)
             reward_list.append(step_reward)
         
@@ -538,6 +608,7 @@ class MAFIAObserver:
     def reset(self):
         """Reset training buffers at start of new episode."""
         self.market_vector_lst = []
+        self.market_scores_full_lst = []
         self.boundary_risk_lst = []
         self.rate_of_price_change_lst = []
         self.mkt_direction_lst = []
@@ -558,19 +629,24 @@ class MAFIAObserver:
         if mode != 'train':
             return
         
-        # Get last market_vector (from predict() call)
-        if len(self.market_vector_lst) == 0:
+        # Get last market scores (from predict() call)
+        if len(self.market_vector_lst) == 0 and len(self.market_scores_full_lst) == 0:
             return
         
-        last_market_vector = self.market_vector_lst[-1]  # (batch, N)
+        # Prefer full scores for reward; fallback to market_vector if unavailable
+        last_market_scores = (
+            self.market_scores_full_lst[-1]
+            if len(self.market_scores_full_lst) > 0
+            else self.market_vector_lst[-1]
+        )
         rate_of_price_change = th.from_numpy(rate_of_price_change).to(th.float32).to(self.device)
         
-        # Remove cash (first element) to match market_vector shape
+        # Remove cash (first element) to match market scores shape
         rate_of_price_change_stocks = rate_of_price_change[:, 1:]  # (batch, N_actual)
         
-        # Handle size mismatch: rate_of_price_change_stocks may have different size than market_vector
+        # Handle size mismatch: rate_of_price_change_stocks may have different size than market scores
         # This can happen if curData has different number of stocks than expected
-        expected_size = last_market_vector.shape[1]  # Expected number of stocks
+        expected_size = last_market_scores.shape[1]  # Expected number of stocks
         actual_size = rate_of_price_change_stocks.shape[1]  # Actual number of stocks
         
         if actual_size != expected_size:
@@ -587,7 +663,7 @@ class MAFIAObserver:
                 rate_of_price_change_stocks = rate_of_price_change_stocks[:, :expected_size]
         
         # Store rate_of_price_change for reward calculation in train()
-        # We'll compute reward from market_vector with gradient in train() method
+        # We'll compute reward from full market scores with gradient in train() method
         self.rate_of_price_change_lst.append(rate_of_price_change_stocks)
         mkt_direction_tensor = th.from_numpy(mkt_direction).to(self.device)
         self.mkt_direction_lst.append(mkt_direction_tensor)
@@ -642,7 +718,10 @@ class MAFIAObserver:
         checkpoint = th.load(checkpoint_path, map_location=self.device)
         
         # Load model state
-        self.mafia_model.load_state_dict(checkpoint['mafia_model_state_dict'])
+        mafia_state = checkpoint['mafia_model_state_dict']
+        # Ensure dynamically created temp embeddings exist before strict load
+        self._ensure_temp_embeddings_from_state(mafia_state)
+        self.mafia_model.load_state_dict(mafia_state)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         try:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])

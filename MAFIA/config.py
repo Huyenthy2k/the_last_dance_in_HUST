@@ -39,7 +39,7 @@ class Config:
         # MAFIA-only configuration (Legacy TD3-only and old MASA variants removed)
         self.benchmark_algo = "TD3-PR"  # TD3 Profit-Risk optimization
         self.market_name = "VNINDEX"  # Financial Index: 'DJIA', 'SP500', 'CSI300'
-        self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
+        self.topK = 15  # Number of assets in a portfolio (10, 20, 30)
         self.num_epochs = 50  # episodes for convergence
 
         # MAFIA configuration (fixed)
@@ -57,7 +57,7 @@ class Config:
         self.mafia_use_gumbel_topk = (
             False  # Disable Gumbel-TopK, pass raw market vector to RL
         )
-        self.mafia_top_k = 10
+        self.mafia_top_k = 15
         self.mafia_gumbel_temperature = 1.0
         self.mafia_hard_topk_inference = True  # use hard Top-K at eval
         self.mafia_include_risk_boundary_in_state = True
@@ -81,6 +81,18 @@ class Config:
             False  # If True, CBF uses market_scores_full as prior
         )
         self.mafia_cbf_prior_weight = 0.3  # Weight for prior distribution (0.0-1.0)
+        # Allow RL to output full-universe weights (skip Top-K masking); controller will consume full vector
+        # Default False to keep RL selecting Top-K and avoid covariance mismatch vs K
+        self.mafia_action_full_universe = False
+        # Solver: in 'full-score' mode, restrict optimization to RL-selected Top-K only (zero others)
+        # Default True to keep optimization aligned to RL Top-K
+        self.mafia_solver_use_rl_topk_only = True
+        # Risk bound handling
+        self.risk_bound_warmup_steps = 30
+        self.risk_bound_is_annualized = False  # Set True if observer outputs annualized sigma; will be scaled to daily
+        self.risk_bound_minvar_eps = 0.0  # Safety margin when kẹp bound to min_var_K (risk_bound = max(bound, min_var_K*(1+eps)))
+        # Risk-bound handling: number of steps to ignore direction logits and use continuous risk/safe defaults
+        self.risk_bound_warmup_steps = 30
 
         # Solver boost behavior (only active in 'full-score' mode when RL has selected Top-K)
         # In 'full-score' mode: Solver can boost stocks already selected by RL, or keep original logic
@@ -89,6 +101,12 @@ class Config:
             "blend"  # Options: 'blend' or 'proportional' (same as boost methods)
         )
         self.mafia_solver_boost_factor = 0.3  # Weight for blending/boosting (0.0-1.0)
+        # Solve-Based Agent L1 limits by market regime (Solve spec §4.4)
+        self.solver_alpha_up = 0.05
+        self.solver_alpha_hold = 0.12
+        self.solver_alpha_down = 0.15
+        # Auto-relax L1 cap when risk bound is infeasible under current alpha (keeps controller from giving up)
+        self.solver_alpha_relax_factor = 1.05
 
         # Market-index Agent and Self-Attention configuration
         self.mafia_use_market_index_agent = (
@@ -101,8 +119,8 @@ class Config:
         self.lambda_1 = 500  # return reward weight
         self.lambda_2 = 30  # Tăng λ₂ nghĩa là phạt nặng hơn khi RL khác xa controller → khuyến khích RL bám sát/quy phục hành động của controller (ít lệch, ít “liều” theo hướng riêng), thường dẫn đến phân bổ ổn định hơn và ít turnover thay đổi mạnh.
         # Encourage diversified actions (entropy regularizer on policy output)
-        self.entropy_coef = 0.002  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
-        self.controller_reg_lambda = 0.6  # λ_reg: controller regularization weight ||x - a_RL||^2,  λ_reg lớn → bám sát RL, nhỏ → cho solver chỉnh mạnh hơn
+        self.entropy_coef = 0.2  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
+        self.controller_reg_lambda = 1.5  # λ_reg: controller regularization weight ||x - a_RL||^2,  λ_reg lớn → bám sát RL, nhỏ → cho solver chỉnh mạnh hơn
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
         )
@@ -119,12 +137,14 @@ class Config:
             0.001  # Penalty weight for membership change (Top-K symmetric difference)
         )
         # Debug: log reward components for first N train steps (0 = disable)
-        self.reward_debug_steps = 20
+        self.reward_debug_steps = 30
         self.train_freq = [1, "step"]  # Update every trading step
         self.risk_default = 0.015
-        self.risk_up_bound = 0.025  # bull market
-        self.risk_down_bound = 0.009  # bear market
-        self.risk_hold_bound = 0.013  # sideways
+        self.risk_hold_bound = 0.0225  # sideways
+        self.risk_up_bound = 0.0290  # bull
+        self.risk_down_bound = 0.0205  # bear
+        # Smooth risk_bound over time to avoid abrupt jumps that cause large controller moves (0 = no smoothing)
+        self.risk_bound_smoothing_alpha = 0.5
 
         self.period_mode = 1
         self.tmp_name = "Cls3_{}_{}_K{}_M{}_{}_{}".format(
@@ -251,6 +271,11 @@ class Config:
         self.save_replay_buffer_on_epoch_checkpoints = (
             True  # Save replay buffer on epoch checkpoints (uses float16 compression)
         )
+        # Early stopping (validation-based)
+        self.early_stop_patience = 3
+        self.early_stop_min_delta = 0.02
+        self.early_stop_warmup = 3
+        self.early_stop_metric = "sharpeRatio"  # fallback to reward_sum if missing
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21
         self.seed_num = seed_num
@@ -370,7 +395,23 @@ class Config:
         self.mafia_encoder_heads = 4  # Number of attention heads
         self.mafia_M_tech = 8  # Features for Technical agent (5 OCHLV + 3 indicators)
         self.mafia_M_dc = 5  # Features for DC agents
-        self.mafia_M_mkt = 19  # Features for Market-index agent (5 change + 3 basic + 11 extended indicators)
+        # Market-index agent features:
+        # 5 change + 3 basic + 11 extended + 10 regime features (percentiles/trend/tail)
+        self.mafia_M_mkt = 29
+        # Regime feature list for market index (used by observer and RL global context)
+        self.mafia_regime_feature_names = [
+            "vol_pct_252",
+            "vol_pct_756",
+            "dd_pct_252",
+            "dd_pct_756",
+            "ma20_ma200_diff",
+            "adx_pct_252",
+            "autocorr_ret_60",
+            "autocorr_ret_120",
+            "skew20",
+            "kurt20",
+        ]
+        self.mafia_regime_dim = len(self.mafia_regime_feature_names)
         self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
         # Match TD3-style LR schedule for observer (linear decay)
         self.mafia_lr_schedule = (

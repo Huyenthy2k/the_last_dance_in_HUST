@@ -223,7 +223,7 @@ def test_signal_generator():
     O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
     
     # Forward pass
-    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = signal_gen(
+    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding, sigma_logits = signal_gen(
         expert_outputs, expert_ta_outputs, O_mkt_TA, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)]
     )
     
@@ -257,6 +257,8 @@ def test_signal_generator():
         assert fused_stock_embedding.shape == (batch_size, N, D), \
             f"Expected fused stock embedding shape ({batch_size}, {N}, {D}), got {fused_stock_embedding.shape}"
         print(f"✓ fused_stock_embedding shape: {fused_stock_embedding.shape}")
+    assert sigma_logits.shape == (batch_size, 3), \
+        f"Expected sigma_logits shape ({batch_size}, 3), got {sigma_logits.shape}"
     print(f"✓ gate_weights sum: {gate_weights.sum(dim=-1).item():.4f}")
     print(f"✓ gate_weights values: {gate_weights[0].tolist()}")
     print("✓ Dense MoE Signal Generator: PASSED\n")
@@ -280,7 +282,7 @@ def test_mafia_model():
     market_index_ochlv_data = th.randn(batch_size, 1, M, T_w).to(device) * 50 + 1000  # VNINDEX prices
     
     with th.no_grad():
-        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding = mafia_model(
+        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding, sigma_logits = mafia_model(
             ochlv_data, market_index_ochlv_data=market_index_ochlv_data
         )
     
@@ -306,6 +308,8 @@ def test_mafia_model():
         "Gate weights should sum to 1"
     assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
         "Gate weights should be in [0, 1]"
+    assert sigma_logits.shape == (batch_size, 3), \
+        f"Expected sigma_logits shape ({batch_size}, 3), got {sigma_logits.shape}"
     
     print(f"✓ market_vector shape: {market_vector.shape}")
     print(f"✓ boundary_risk shape: {boundary_risk.shape}")

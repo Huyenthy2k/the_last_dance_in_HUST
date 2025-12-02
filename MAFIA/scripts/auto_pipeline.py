@@ -43,7 +43,19 @@ if SCRIPT_DIR not in sys.path:
 from config import Config
 from entrance import RLcontroller
 from scripts.hparam_search_optuna import run_one_trial
+import walk_forward
 from walk_forward import run_one_window as wf_run_one_window
+
+# Optional plotting (skip silently if matplotlib not installed)
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 
 def set_all_seeds(seed: int):
@@ -54,6 +66,52 @@ def set_all_seeds(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _get_numeric_metrics(df: pd.DataFrame, drop_cols: List[str]) -> List[str]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    return [c for c in numeric_cols if c not in drop_cols]
+
+
+def _plot_seed_metrics(df: pd.DataFrame, out_dir: str) -> None:
+    if not MATPLOTLIB_AVAILABLE or df.empty:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    metrics = _get_numeric_metrics(df, drop_cols=["window"])
+    for metric in metrics:
+        plt.figure()
+        df.plot(kind="bar", x="seed", y=metric, legend=False, title=f"Seed metrics: {metric}")
+        plt.xlabel("seed")
+        plt.ylabel(metric)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"seeds_{metric}.png"))
+        plt.close()
+
+
+def _plot_walkforward_metrics(df: pd.DataFrame, out_dir: str) -> None:
+    if not MATPLOTLIB_AVAILABLE or df.empty:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    metrics = _get_numeric_metrics(df, drop_cols=["seed"])
+    grouped_mean = df.groupby("window").mean(numeric_only=True)
+    grouped_std = df.groupby("window").std(numeric_only=True)
+    for metric in metrics:
+        if metric not in grouped_mean.columns:
+            continue
+        plt.figure()
+        plt.plot(grouped_mean.index, grouped_mean[metric], marker="o", label="mean")
+        if metric in grouped_std.columns:
+            mean_vals = grouped_mean[metric]
+            std_vals = grouped_std[metric].fillna(0)
+            plt.fill_between(grouped_mean.index, mean_vals - std_vals, mean_vals + std_vals, alpha=0.2, label="std band")
+        plt.title(f"Walk-forward {metric} by window")
+        plt.xlabel("window")
+        plt.ylabel(metric)
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"walkforward_{metric}.png"))
+        plt.close()
 
 
 def run_hparam_search(
@@ -155,7 +213,6 @@ def run_one_seed(
     cfg.num_epochs = train_epochs
     cfg.auto_resume_from_latest = True  # enable auto-resume from latest checkpoint
     cfg.resume_from_checkpoint = None
-    cfg.early_stop_patience = 0  # avoid early stop during multi-seed run
     cfg.reward_debug_steps = 0
 
     print("\n" + "-" * 80)
@@ -257,6 +314,10 @@ def run_walk_forward_stage(
         test_end = test_start + test_delta - datetime.timedelta(days=1)
 
         print(
+            f"[AUTO][WF] Resolved train window {win}: start={train_start.date()} end={train_end.date()}",
+            flush=True,
+        )
+        print(
             f"[AUTO][WF] Window {win} dates | "
             f"train {train_start.date()}→{train_end.date()} | "
             f"valid {valid_start.date()}→{valid_end.date()} | "
@@ -298,11 +359,16 @@ def run_walk_forward_stage(
         os.makedirs(log_dir, exist_ok=True)
         df.to_csv(metrics_csv, index=False)
         summary.to_csv(summary_csv)
-        print("[AUTO] Walk-forward stage produced no metrics (empty DataFrame).", flush=True)
+        print(
+            "[AUTO] Walk-forward stage produced no metrics (empty DataFrame).",
+            flush=True,
+        )
         return df, summary, metrics_csv, summary_csv
 
     numeric_cols = [
-        c for c in df.columns if c not in ("res_dir", "window", "seed", "next_checkpoint")
+        c
+        for c in df.columns
+        if c not in ("res_dir", "window", "seed", "next_checkpoint")
     ]
     summary = df.groupby("window")[numeric_cols].agg(["mean", "std"])
     last_win = df["window"].max()
@@ -327,6 +393,7 @@ def run_walk_forward_stage(
     print(summary)
     print(f"\n[AUTO] 🧊 Last window only (window={last_win}) mean/std across seeds:")
     print(summary_last)
+    _plot_walkforward_metrics(df, log_dir)
     return df, summary, metrics_csv, summary_csv, last_summary_csv
 
 
@@ -390,7 +457,7 @@ def upload_to_huggingface(
 ):
     """
     Upload checkpoint directory to Hugging Face Hub.
-    
+
     Args:
         local_dir: Path to the local directory containing checkpoint files
         repo_id: Hugging Face repo ID (e.g., 'username/model-name')
@@ -399,7 +466,7 @@ def upload_to_huggingface(
     """
     try:
         print(f"\n[HF] 📤 Uploading {local_dir} to {repo_id}...")
-        
+
         # Create repo if it doesn't exist
         api = HfApi(token=token)
         try:
@@ -407,7 +474,7 @@ def upload_to_huggingface(
             print(f"[HF] ✅ Repository {repo_id} is ready")
         except Exception as e:
             print(f"[HF] ⚠️ Repo creation note: {e}")
-        
+
         # Upload the entire folder
         url = upload_folder(
             folder_path=local_dir,
@@ -419,7 +486,9 @@ def upload_to_huggingface(
         return url
     except Exception as e:
         print(f"[HF] ❌ Upload failed: {e}")
-        print(f"[HF] 💡 Tip: Set HF_TOKEN environment variable or pass --hf-token argument")
+        print(
+            f"[HF] 💡 Tip: Set HF_TOKEN environment variable or pass --hf-token argument"
+        )
         return None
 
 
@@ -501,7 +570,6 @@ def parse_args():
         help="Keep epoch/timestep counters from checkpoint instead of resetting to 0",
     )
     p.add_argument(
-<<<<<<< HEAD
         "--hf-repo-id",
         type=str,
         default="",
@@ -517,73 +585,107 @@ def parse_args():
         "--hf-upload-official-only",
         action="store_true",
         help="Only upload the official run checkpoint (not seed runs)",
-=======
+    )
+    p.add_argument(
+        "--walkforward",
+        dest="walkforward_enabled",
+        action="store_true",
+        default=True,
+        help="Enable walk-forward stage (default: on).",
+    )
+    p.add_argument(
+        "--no-walkforward",
+        dest="walkforward_enabled",
+        action="store_false",
+        help="Disable walk-forward stage.",
+    )
+    p.add_argument(
         "--walkforward-start-date",
         type=str,
-        default="2017-01-01",
-        help="Enable walk-forward stage starting at this date (YYYY-MM-DD).",
+        default=None,
+        help="Start date for first walk-forward window (YYYY-MM-DD). Default: Config.train_date_start.",
     )
     p.add_argument(
         "--walkforward-end-date",
         type=str,
-        default="2023-12-31",
-        help="End date (inclusive) for auto window computation (num-windows<=0).",
+        default=None,
+        help="Upper bound for auto window computation (YYYY-MM-DD, inclusive). Default: Config.test_date_end (or valid/test fallback).",
     )
     p.add_argument(
         "--walkforward-num-windows",
         type=int,
         default=0,
-        help="Number of walk-forward windows (<=0 => auto-compute until end-date; 0 will still enable walk-forward).",
+        help="Number of walk-forward windows (<=0 -> auto-compute until end-date).",
     )
     p.add_argument(
         "--walkforward-train-years",
         type=int,
         default=3,
-        help="Years for training window in walk-forward stage",
+        help="Years for training window (default: 3).",
     )
     p.add_argument(
         "--walkforward-valid-years",
         type=int,
         default=1,
-        help="Years for validation window in walk-forward stage",
+        help="Years for validation window (default: 1).",
     )
     p.add_argument(
         "--walkforward-test-years",
         type=int,
         default=1,
-        help="Years for test window in walk-forward stage",
+        help="Years for test window (default: 1).",
     )
     p.add_argument(
         "--walkforward-step-years",
         type=int,
         default=1,
-        help="Slide step (years) between walk-forward windows",
+        help="How many years to slide the window each iteration (default: 1).",
     )
     p.add_argument(
         "--walkforward-epochs",
         type=int,
-        default=50,
-        help="Epochs per walk-forward window (default: use --train-epochs)",
+        default=None,
+        help="Epochs per walk-forward window (default: --train-epochs).",
     )
     p.add_argument(
         "--walkforward-resume-overlap",
+        dest="walkforward_resume_overlap",
         action="store_true",
         default=True,
-        help="Reuse checkpoint even when windows overlap (replay buffer is reset by default on resume).",
+        help="Reuse previous window checkpoint/buffer even when windows overlap (default: on).",
     )
     p.add_argument(
-        "--no-walkforward-resume-overlap",
+        "--walkforward-no-resume-overlap",
         dest="walkforward_resume_overlap",
         action="store_false",
-        help="Disable chaining when walk-forward windows overlap.",
-    )
-    p.add_argument(
-        "--skip-seed-stage",
-        action="store_true",
-        help="Skip the per-seed training stage (useful if only running walk-forward).",
->>>>>>> main
+        help="Disable chaining when windows overlap.",
     )
     return p.parse_args()
+
+
+def _infer_default_walkforward_dates(
+    start_date_arg: Optional[str], end_date_arg: Optional[str], base_seed: int
+) -> Tuple[str, str]:
+    """
+    Use Config defaults to infer start/end dates when flags are absent.
+    Falls back to simple constants if Config instantiation fails.
+    """
+    if start_date_arg and end_date_arg:
+        return start_date_arg, end_date_arg
+    try:
+        cfg_probe = Config(seed_num=base_seed, current_date="walkforward-defaults")
+        start_date = start_date_arg or cfg_probe.train_date_start.date().isoformat()
+        end_candidate = (
+            cfg_probe.test_date_end
+            or cfg_probe.valid_date_end
+            or cfg_probe.train_date_end
+        )
+        end_date = end_date_arg or end_candidate.date().isoformat()
+        return start_date, end_date
+    except Exception:
+        fallback_start = start_date_arg or "2017-01-01"
+        fallback_end = end_date_arg or fallback_start
+        return fallback_start, fallback_end
 
 
 def main():
@@ -626,7 +728,7 @@ def main():
         print(f"[AUTO]    epochs: {official_epochs}")
         print("=" * 80, flush=True)
         RLcontroller(cfg)
-        
+
         # Upload official run to Hugging Face if requested
         if args.hf_repo_id:
             upload_to_huggingface(
@@ -645,13 +747,12 @@ def main():
     print(f"[AUTO] 🌱 Running full training for seeds: {seeds}")
     print("=" * 80, flush=True)
 
-<<<<<<< HEAD
     # 3) Run per-seed trainings
     results = []
     for seed in seeds:
         metrics = run_one_seed(seed, best_params, train_epochs=args.train_epochs)
         results.append(metrics)
-        
+
         # Upload seed run to Hugging Face if requested (and not official-only mode)
         if args.hf_repo_id and not args.hf_upload_official_only:
             upload_to_huggingface(
@@ -660,20 +761,6 @@ def main():
                 token=args.hf_token,
                 commit_message=f"Seed {seed} training (epochs={args.train_epochs})",
             )
-=======
-    # 3) Run per-seed trainings (optional)
-    results: List[Dict[str, float]] = []
-    results_csv = None
-    summary_csv = None
-    if args.skip_seed_stage:
-        print("[AUTO] ⏭️ Skipping per-seed stage (--skip-seed-stage).")
-        df = pd.DataFrame()
-        summary = pd.DataFrame()
-    else:
-        for seed in seeds:
-            metrics = run_one_seed(seed, best_params, train_epochs=args.train_epochs)
-            results.append(metrics)
->>>>>>> main
 
         df, summary = aggregate_results(results)
         print("\n" + "=" * 80)
@@ -689,6 +776,10 @@ def main():
         df.to_csv(results_csv, index=False)
         summary.to_csv(summary_csv)
         print(f"[AUTO] 📝 Saved seed results & summary to {log_run_dir}")
+    # Seed-level plots
+    if results:
+        df = pd.DataFrame(results)
+        _plot_seed_metrics(df, log_run_dir)
 
     # 4) Optional walk-forward stage
     wf_metrics_csv = None
@@ -696,9 +787,11 @@ def main():
     wf_last_summary_csv = None
     wf_df = pd.DataFrame()
     wf_summary = pd.DataFrame()
-    run_walkforward = (
-        args.walkforward_start_date is not None and args.walkforward_num_windows > 0
+    wf_start_date, wf_end_date = _infer_default_walkforward_dates(
+        args.walkforward_start_date, args.walkforward_end_date, args.base_seed
     )
+    wf_num_windows = args.walkforward_num_windows
+    run_walkforward = bool(args.walkforward_enabled and wf_start_date)
     if run_walkforward:
         wf_epochs = args.walkforward_epochs or args.train_epochs
         wf_overrides = dict(best_params)
@@ -710,13 +803,13 @@ def main():
             wf_summary_csv,
             wf_last_summary_csv,
         ) = run_walk_forward_stage(
-            start_date=args.walkforward_start_date,
-            num_windows=args.walkforward_num_windows,
+            start_date=wf_start_date,
+            num_windows=wf_num_windows,
             train_years=args.walkforward_train_years,
             valid_years=args.walkforward_valid_years,
             test_years=args.walkforward_test_years,
             step_years=args.walkforward_step_years,
-            end_date=args.walkforward_end_date,
+            end_date=wf_end_date,
             seeds=seeds,
             hparam_overrides=wf_overrides,
             resume_overlap=args.walkforward_resume_overlap,
@@ -724,8 +817,7 @@ def main():
         )
     else:
         print(
-            "[AUTO] Walk-forward stage skipped "
-            "(set --walkforward-start-date and --walkforward-num-windows>0 to enable)."
+            "[AUTO] Walk-forward stage skipped (use --walkforward to enable, --no-walkforward to disable)."
         )
 
     # Persist run info
@@ -744,12 +836,13 @@ def main():
                 "seed_summary_csv": summary_csv,
                 "walkforward": {
                     "enabled": run_walkforward,
-                    "start_date": args.walkforward_start_date,
-                    "num_windows": args.walkforward_num_windows,
+                    "start_date": wf_start_date,
+                    "num_windows": wf_num_windows,
                     "train_years": args.walkforward_train_years,
                     "valid_years": args.walkforward_valid_years,
                     "test_years": args.walkforward_test_years,
                     "step_years": args.walkforward_step_years,
+                    "end_date": wf_end_date,
                     "epochs": args.walkforward_epochs or args.train_epochs,
                     "resume_overlap": args.walkforward_resume_overlap,
                     "metrics_csv": wf_metrics_csv,
@@ -761,9 +854,8 @@ def main():
             f,
             indent=2,
         )
-<<<<<<< HEAD
     print(f"[AUTO] 📝 Saved seed results & summary to {log_run_dir}")
-    
+
     # Upload aggregate logs to Hugging Face if requested
     if args.hf_repo_id:
         upload_to_huggingface(
@@ -772,9 +864,7 @@ def main():
             token=args.hf_token,
             commit_message=f"Pipeline logs and aggregate results",
         )
-    
-=======
->>>>>>> main
+
     print("[AUTO] PIPELINE DONE")
     print("=" * 80)
 

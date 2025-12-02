@@ -101,6 +101,11 @@ def test_state_dimensions():
         print(f"   - Reduction: {reduction_pct:.1f}%")
         print(f"   - Previous: {previous_state_dim} → New: {new_state_dim}")
     
+    # Summary assertions (fixed parameters -> deterministic)
+    assert previous_state_dim == 22
+    assert new_state_dim == 12
+    assert reduction == 10
+    assert abs(reduction_pct - 45.4545) < 0.1
     # Summary
     print("\n" + "="*80)
     print("SUMMARY")
@@ -129,10 +134,7 @@ def test_state_dimensions():
     print(f"   - Output market_vector encodes market intelligence implicitly")
     
     print(f"\n🎉 SUCCESS! All dimension calculations verified.")
-    
-    return True
 
 if __name__ == '__main__':
-    success = test_state_dimensions()
-    sys.exit(0 if success else 1)
-
+    test_state_dimensions()
+    sys.exit(0)
