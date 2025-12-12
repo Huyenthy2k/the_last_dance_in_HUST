@@ -1,4 +1,4 @@
-#！/usr/bin/python
+# ！/usr/bin/python
 # -*- coding: utf-8 -*-#
 
 """
@@ -8,12 +8,11 @@ This module contains the core neural network modules for MAFIA:
 - CSAModule: Cross-Sectional Analysis module
 - TAModule: Temporal Analysis module
 - STFusionModule: Spatial-Temporal Fusion module
-- SignalGenerator: Portfolio Generator (market_vector + boundary_risk)
+- SignalGenerator: Portfolio Generator (market_vector + eta)
 - MAFIAModel: Complete model integrating all agents
-
-Author: MASA
-See: Đặc Tả Kỹ Thuật (Technical Specification) - MAFIA.md
+- DenseMoEGatingRouter: Dense MoE Gating Router for expert weight computation
 """
+
 import numpy as np
 import torch as th
 import torch.nn as nn
@@ -24,50 +23,58 @@ import math
 
 class TransformerEncoderLayer(nn.Module):
     """Standard Transformer Encoder Layer."""
-    
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = None, dropout: float = 0.1):
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = None,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         if dim_feedforward is None:
             dim_feedforward = d_model * 4
-        
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, x: th.Tensor) -> th.Tensor:
         # Self-attention
         attn_out, _ = self.self_attn(x, x, x)
         x = self.norm1(x + self.dropout(attn_out))
-        
+
         # Feed-forward
         ffn_out = self.ffn(x)
         x = self.norm2(x + ffn_out)
-        
+
         return x
 
 
 class CSAModule(nn.Module):
     """
     Cross-Sectional Analysis (CSA) Module.
-    
+
     Learns spatial correlations between N assets.
-    
+
     Input: P_i ∈ ℝ^(N × T_w × M)
     Output: O_i^CSA ∈ ℝ^(N × D)
     """
-    
-    def __init__(self, config, agent_type: str = 'tech'):
+
+    def __init__(self, config, agent_type: str = "tech"):
         """
         Initialize CSA Module.
-        
+
         Args:
             config: Configuration object
             agent_type: 'tech' for Technical agent, 'dc' for DC agents
@@ -78,24 +85,22 @@ class CSAModule(nn.Module):
         self.T_w = config.mafia_T_w
         self.D = config.mafia_D
         self.D_h = config.mafia_D_h
-        
-        if agent_type == 'tech':
+
+        if agent_type == "tech":
             self.M = config.mafia_M_tech  # 8
             self.token_dim = self.T_w * self.M  # 30 * 8 = 240
         else:  # dc
             self.M = config.mafia_M_dc  # 5
             self.token_dim = self.T_w * self.M  # 30 * 5 = 150
-        
+
         # Token Generation: Reshape (N, T_w, M) -> (N, T_w*M)
         # This is done in forward pass
-        
+
         # Embedding MLP
         self.embedding = nn.Sequential(
-            nn.Linear(self.token_dim, self.D_h),
-            nn.GELU(),
-            nn.Linear(self.D_h, self.D)
+            nn.Linear(self.token_dim, self.D_h), nn.GELU(), nn.Linear(self.D_h, self.D)
         )
-        
+
         # Transformer Encoder
         encoder_layers = []
         for _ in range(config.mafia_encoder_layers):
@@ -104,51 +109,57 @@ class CSAModule(nn.Module):
                     d_model=self.D,
                     nhead=config.mafia_encoder_heads,
                     dim_feedforward=self.D_h * 2,
-                    dropout=0.1
+                    dropout=0.1,
                 )
             )
         self.encoder = nn.Sequential(*encoder_layers)
-    
+
     def forward(self, P_i: th.Tensor) -> th.Tensor:
         """
         Forward pass through CSA module.
-        
+
         Args:
             P_i: (batch, N, T_w, M) tensor
-        
+
         Returns:
             O_i^CSA: (batch, N, D) tensor
         """
         batch_size, N, T_w, M = P_i.shape
-        
+
         # Token Generation: Reshape (N, T_w, M) -> (N, T_w*M)
         # Reshape: (batch, N, T_w, M) -> (batch, N, T_w*M)
         tokens = P_i.reshape(batch_size, N, self.token_dim)
-        
+
         # Embedding
         embedded = self.embedding(tokens)  # (batch, N, D)
-        
+
         # Transformer Encoder
         # Encoder expects (batch, seq_len, d_model)
         encoded = self.encoder(embedded)  # (batch, N, D)
-        
+
         return encoded
 
 
 class TAModule(nn.Module):
     """
     Temporal Analysis (TA) Module.
-    
+
     Learns temporal correlations between T_w time points.
-    
+
     Input: P_i ∈ ℝ^(N × T_w × M)
     Output: O_i^TA ∈ ℝ^(T_w × D)
     """
-    
-    def __init__(self, config, agent_type: str = 'tech', shared_mlp: Optional[nn.Module] = None, N: Optional[int] = None):
+
+    def __init__(
+        self,
+        config,
+        agent_type: str = "tech",
+        shared_mlp: Optional[nn.Module] = None,
+        N: Optional[int] = None,
+    ):
         """
         Initialize TA Module.
-        
+
         Args:
             config: Configuration object
             agent_type: 'tech' for Technical agent, 'dc' for DC agents
@@ -158,42 +169,42 @@ class TAModule(nn.Module):
         super().__init__()
         self.config = config
         self.agent_type = agent_type
-        self.T_w = config.mafia_T_w
-        self.D = config.mafia_D
-        self.D_h = config.mafia_D_h
-        
+        self.T_w = int(config.mafia_T_w)
+        self.D = int(config.mafia_D)
+        self.D_h = int(config.mafia_D_h)
+
         # Use actual N if provided, otherwise use config.topK
         actual_N = N if N is not None else config.topK
-        
-        if agent_type == 'tech':
-            self.M = config.mafia_M_tech  # 8
-            self.token_dim = actual_N * self.M  # N * M
-        elif agent_type == 'mkt':
-            self.M = config.mafia_M_mkt  # 19
-            self.token_dim = actual_N * self.M  # N * M (N=1 for market-index)
+
+        if agent_type == "tech":
+            self.M = int(config.mafia_M_tech)  # 8
+            self.token_dim = int(actual_N * self.M)  # N * M
+        elif agent_type == "mkt":
+            self.M = int(config.mafia_M_mkt)  # 19
+            self.token_dim = int(actual_N * self.M)  # N * M (N=1 for market-index)
         else:  # dc
-            self.M = config.mafia_M_dc  # 5
-            self.token_dim = actual_N * self.M  # N * M
-        
+            self.M = int(config.mafia_M_dc)  # 5
+            self.token_dim = int(actual_N * self.M)  # N * M
+
         # Embedding MLP
-        if shared_mlp is not None and agent_type == 'dc':
+        if shared_mlp is not None and agent_type == "dc":
             self.embedding = shared_mlp
         else:
             self.embedding = nn.Sequential(
                 nn.Linear(self.token_dim, self.D_h),
                 nn.GELU(),
-                nn.Linear(self.D_h, self.D)
+                nn.Linear(self.D_h, self.D),
             )
-        
+
         # Positional Encoding
         self.pos_encoding = PositionalEncoding(self.D, self.T_w)
-        
+
         # Event Detector (only for DC agents)
-        if agent_type == 'dc':
+        if agent_type == "dc":
             self.event_detector = EventDetector(self.D)
         else:
             self.event_detector = None
-        
+
         # Transformer Encoder
         encoder_layers = []
         for _ in range(config.mafia_encoder_layers):
@@ -202,58 +213,69 @@ class TAModule(nn.Module):
                     d_model=self.D,
                     nhead=config.mafia_encoder_heads,
                     dim_feedforward=self.D_h * 2,
-                    dropout=0.1
+                    dropout=0.1,
                 )
             )
         self.encoder = nn.Sequential(*encoder_layers)
-    
-    def forward(self, P_i: th.Tensor, dc_features: Optional[th.Tensor] = None) -> th.Tensor:
+
+    def forward(
+        self, P_i: th.Tensor, dc_features: Optional[th.Tensor] = None
+    ) -> th.Tensor:
         """
         Forward pass through TA module.
-        
+
         Args:
             P_i: (batch, N, T_w, M) tensor
             dc_features: (batch, N, T_w, 5) tensor - DC features for Event Detector (DC agents only)
-        
+
         Returns:
             O_i^TA: (batch, T_w, D) tensor
         """
         batch_size, N, T_w, M = P_i.shape
-        
+
         # Calculate actual token_dim from input shape (N may differ from initialization)
         actual_token_dim = N * M
-        
+
         # Token Generation: Permute and reshape
         # (batch, N, T_w, M) -> (batch, T_w, N, M) -> (batch, T_w, N*M)
         P_permuted = P_i.permute(0, 2, 1, 3)  # (batch, T_w, N, M)
-        tokens = P_permuted.reshape(batch_size, T_w, actual_token_dim)  # (batch, T_w, N*M)
-        
+        tokens = P_permuted.reshape(
+            batch_size, T_w, actual_token_dim
+        )  # (batch, T_w, N*M)
+
         # If token_dim changed, we need to handle embedding differently
         # For now, use a linear projection if needed
         if actual_token_dim != self.token_dim:
             # Create a temporary embedding layer if dimensions don't match
-            if not hasattr(self, '_temp_embedding') or self._temp_embedding[0].in_features != actual_token_dim:
+            if (
+                not hasattr(self, "_temp_embedding")
+                or self._temp_embedding[0].in_features != actual_token_dim
+            ):
                 self._temp_embedding = nn.Sequential(
                     nn.Linear(actual_token_dim, self.D_h),
                     nn.GELU(),
-                    nn.Linear(self.D_h, self.D)
+                    nn.Linear(self.D_h, self.D),
                 ).to(tokens.device)
             embedded = self._temp_embedding(tokens)  # (batch, T_w, D)
         else:
             embedded = self.embedding(tokens)  # (batch, T_w, D)
-        
+
         # Signal Merging: Add positional encoding
         PE_time = self.pos_encoding(embedded)  # (batch, T_w, D)
         input_ta = embedded + PE_time
-        
+
         # Add high-order DC signals (DC agents only)
-        if self.agent_type == 'dc' and self.event_detector is not None and dc_features is not None:
+        if (
+            self.agent_type == "dc"
+            and self.event_detector is not None
+            and dc_features is not None
+        ):
             H_DC = self.event_detector(dc_features)  # (batch, T_w, D)
             input_ta = input_ta + H_DC
-        
+
         # Transformer Encoder
         encoded = self.encoder(input_ta)  # (batch, T_w, D)
-        
+
         return encoded
 
 
@@ -262,33 +284,35 @@ class PositionalEncoding(nn.Module):
     Positional encoding for temporal sequences.
     Uses sin(t') where t' is linearly mapped from [0, T_w-1] to [0, π/2].
     """
-    
+
     def __init__(self, d_model: int, max_len: int = 30):
         super().__init__()
         self.d_model = d_model
         self.max_len = max_len
-        
+
         # Create learnable positional encoding
         pe = th.zeros(max_len, d_model)
         position = th.arange(0, max_len, dtype=th.float32).unsqueeze(1)
-        
+
         # Map position to [0, π/2]
         t_prime = (position / (max_len - 1)) * (math.pi / 2)
-        
+
         # Create sinusoidal encoding
-        div_term = th.exp(th.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = th.exp(
+            th.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = th.sin(t_prime * div_term)
         pe[:, 1::2] = th.cos(t_prime * div_term)
-        
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
-    
+
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+
     def forward(self, x: th.Tensor) -> th.Tensor:
         """
         Add positional encoding to input.
-        
+
         Args:
             x: (batch, seq_len, d_model) tensor
-        
+
         Returns:
             PE: (batch, seq_len, d_model) positional encoding
         """
@@ -301,54 +325,56 @@ class EventDetector(nn.Module):
     Event Detector for DC agents.
     Extracts high-order signals from DC features: Δ(State) and Δ(Duration).
     """
-    
+
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
-        
+
         # Embedding for event signals
         # Input: (batch, T_w, 2) - [Δ(State), Δ(Duration)]
         # Output: (batch, T_w, d_model)
         self.event_embedding = nn.Sequential(
-            nn.Linear(2, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model)
+            nn.Linear(2, d_model // 2), nn.GELU(), nn.Linear(d_model // 2, d_model)
         )
-    
+
     def forward(self, dc_features: th.Tensor) -> th.Tensor:
         """
         Extract event signals from DC features.
-        
+
         Args:
             dc_features: (batch, N, T_w, 5) - DC features [State, Magnitude, Duration, Volume_Ratio, Event_Flag]
-        
+
         Returns:
             H_DC: (batch, T_w, d_model) - High-order DC signals
         """
         batch_size, N, T_w, _ = dc_features.shape
-        
+
         # Extract State and Duration
         state = dc_features[:, :, :, 0]  # (batch, N, T_w)
         duration = dc_features[:, :, :, 2]  # (batch, N, T_w)
-        
+
         # Average across assets
         state_avg = th.mean(state, dim=1)  # (batch, T_w)
         duration_avg = th.mean(duration, dim=1)  # (batch, T_w)
-        
+
         # Compute Δ(State) and Δ(Duration)
         # Pad first element with zeros
         state_padded = th.cat([state_avg[:, 0:1], state_avg], dim=1)  # (batch, T_w+1)
-        duration_padded = th.cat([duration_avg[:, 0:1], duration_avg], dim=1)  # (batch, T_w+1)
-        
+        duration_padded = th.cat(
+            [duration_avg[:, 0:1], duration_avg], dim=1
+        )  # (batch, T_w+1)
+
         delta_state = state_avg - state_padded[:, :-1]  # (batch, T_w)
         delta_duration = duration_avg - duration_padded[:, :-1]  # (batch, T_w)
-        
+
         # Combine event signals
-        event_signals = th.stack([delta_state, delta_duration], dim=-1)  # (batch, T_w, 2)
-        
+        event_signals = th.stack(
+            [delta_state, delta_duration], dim=-1
+        )  # (batch, T_w, 2)
+
         # Embed to d_model
         H_DC = self.event_embedding(event_signals)  # (batch, T_w, d_model)
-        
+
         return H_DC
 
 
@@ -356,48 +382,48 @@ class STFusionModule(nn.Module):
     """
     Spatial-Temporal Fusion Module.
     Fuses CSA and TA outputs using attention mechanism.
-    
+
     Input: O_i^CSA ∈ ℝ^(N × D), O_i^TA ∈ ℝ^(T_w × D)
     Output: O_i ∈ ℝ^(N × 1) (logits)
     """
-    
+
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
         self.scale = 1.0 / math.sqrt(d_model)
-        
+
         # Final MLP: (N, D) -> (N, 1)
         self.output_proj = nn.Linear(d_model, 1, bias=True)
-    
+
     def forward(self, O_CSA: th.Tensor, O_TA: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         """
         Forward pass through ST-Fusion.
-        
+
         Args:
             O_CSA: (batch, N, D) - CSA output
             O_TA: (batch, T_w, D) - TA output
-        
+
         Returns:
             O_i: (batch, N, 1) - Agent logits
             O_i_ST: (batch, N, D) - ST-Fusion embedding (before projection)
         """
         batch_size, N, D = O_CSA.shape
         T_w = O_TA.size(1)
-        
+
         # Attention: O_CSA as Query, O_TA as Key and Value
         # Compute attention scores: (batch, N, D) @ (batch, D, T_w) -> (batch, N, T_w)
         attention_scores = th.bmm(O_CSA, O_TA.transpose(1, 2))  # (batch, N, T_w)
-        
+
         # Scale and softmax
         attention_scores = attention_scores * self.scale
         attention_weights = F.softmax(attention_scores, dim=-1)  # (batch, N, T_w)
-        
+
         # Weighted sum: (batch, N, T_w) @ (batch, T_w, D) -> (batch, N, D)
         fused = th.bmm(attention_weights, O_TA)  # (batch, N, D)
-        
+
         # Final projection: (batch, N, D) -> (batch, N, 1)
         output = self.output_proj(fused)  # (batch, N, 1)
-        
+
         return output, fused
 
 
@@ -405,59 +431,59 @@ class AttentionBasedTemporalEncoder(nn.Module):
     """
     Attention-based Temporal Encoder for Dense MoE Gating.
     Uses learnable CLS token with cross-attention to aggregate temporal information.
-    
+
     Input: O_mkt_TA (batch, T_w, D) - Temporal market index embedding
     Output: market_context (batch, D) - Aggregated market condition representation
     """
-    
+
     def __init__(self, config):
         super().__init__()
         self.D = config.mafia_D
-        self.num_heads = getattr(config, 'mafia_gating_num_heads', 4)
-        self.dropout = getattr(config, 'mafia_gating_dropout', 0.1)
-        
+        self.num_heads = getattr(config, "mafia_gating_num_heads", 4)
+        self.dropout = getattr(config, "mafia_gating_dropout", 0.1)
+
         # Learnable CLS token - learns what information to extract from temporal sequence
         self.cls_token = nn.Parameter(th.randn(1, 1, self.D))
         nn.init.normal_(self.cls_token, std=0.02)
-        
+
         # Multi-head cross-attention: CLS token queries the temporal sequence
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=self.D,
             num_heads=self.num_heads,
             dropout=self.dropout,
-            batch_first=True
+            batch_first=True,
         )
-        
+
         # Layer normalization
         self.layer_norm = nn.LayerNorm(self.D)
-        
+
     def forward(self, O_mkt_TA: th.Tensor) -> Tuple[th.Tensor, Optional[th.Tensor]]:
         """
         Args:
             O_mkt_TA: (batch, T_w, D) - Temporal market index embedding
-        
+
         Returns:
             market_context: (batch, D) - Aggregated market condition
             attn_weights: (batch, num_heads, 1, T_w) - Attention weights for visualization
         """
         batch_size = O_mkt_TA.size(0)
-        
+
         # Expand CLS token for batch
         cls_tokens = self.cls_token.expand(batch_size, 1, self.D)  # (batch, 1, D)
-        
+
         # Cross-attention: CLS token attends to temporal sequence
         attn_output, attn_weights = self.cross_attn(
-            query=cls_tokens,      # (batch, 1, D) - "What market info to extract?"
-            key=O_mkt_TA,          # (batch, T_w, D) - "Where to look?"
-            value=O_mkt_TA,        # (batch, T_w, D) - "What to extract?"
+            query=cls_tokens,  # (batch, 1, D) - "What market info to extract?"
+            key=O_mkt_TA,  # (batch, T_w, D) - "Where to look?"
+            value=O_mkt_TA,  # (batch, T_w, D) - "What to extract?"
             need_weights=True,
-            average_attn_weights=False  # Return per-head weights
+            average_attn_weights=False,  # Return per-head weights
         )
-        
+
         # Extract CLS token output and normalize
         market_context = attn_output.squeeze(1)  # (batch, D)
         market_context = self.layer_norm(market_context)
-        
+
         return market_context, attn_weights
 
 
@@ -465,17 +491,17 @@ class TemporalConvolutionEncoder(nn.Module):
     """
     Temporal Convolution Encoder for Dense MoE Gating.
     Uses multi-scale 1D convolutions to capture patterns at different time scales.
-    
+
     Input: O_mkt_TA (batch, T_w, D) - Temporal market index embedding
     Output: market_context (batch, D) - Aggregated market condition representation
     """
-    
+
     def __init__(self, config):
         super().__init__()
         self.D = config.mafia_D
-        self.dropout = getattr(config, 'mafia_gating_dropout', 0.1)
-        self.kernel_sizes = getattr(config, 'mafia_gating_conv_kernels', [3, 5, 7])
-        
+        self.dropout = getattr(config, "mafia_gating_dropout", 0.1)
+        self.kernel_sizes = getattr(config, "mafia_gating_conv_kernels", [3, 5, 7])
+
         # Multi-scale 1D convolutions
         self.conv_layers = nn.ModuleList()
         for kernel_size in self.kernel_sizes:
@@ -483,91 +509,96 @@ class TemporalConvolutionEncoder(nn.Module):
             self.conv_layers.append(
                 nn.Conv1d(self.D, self.D, kernel_size=kernel_size, padding=padding)
             )
-        
+
         # Batch normalization and activation
         self.conv_norm = nn.BatchNorm1d(self.D * len(self.kernel_sizes))
         self.conv_act = nn.GELU()
-        
+
         # Projection network to output dimension
         self.proj = nn.Sequential(
-            nn.Linear(self.D * len(self.kernel_sizes) * 2, self.D * 2),  # *2 for max+avg pooling
+            nn.Linear(
+                self.D * len(self.kernel_sizes) * 2, self.D * 2
+            ),  # *2 for max+avg pooling
             nn.LayerNorm(self.D * 2),
             nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.D * 2, self.D),
-            nn.LayerNorm(self.D)
+            nn.LayerNorm(self.D),
         )
-        
+
     def forward(self, O_mkt_TA: th.Tensor) -> Tuple[th.Tensor, None]:
         """
         Args:
             O_mkt_TA: (batch, T_w, D) - Temporal market index embedding
-        
+
         Returns:
             market_context: (batch, D) - Aggregated market condition
             None - No attention weights for conv encoder
         """
         batch_size = O_mkt_TA.size(0)
-        
+
         # Reshape for Conv1D: (batch, D, T_w)
         x = O_mkt_TA.transpose(1, 2)  # (batch, D, T_w)
-        
+
         # Multi-scale convolutions
         conv_outputs = []
         for conv_layer in self.conv_layers:
             conv_out = conv_layer(x)  # (batch, D, T_w)
             conv_outputs.append(conv_out)
-        
+
         # Concatenate multi-scale features
         multi_scale = th.cat(conv_outputs, dim=1)  # (batch, D*num_kernels, T_w)
-        
+
         # Normalize and activate
         multi_scale = self.conv_norm(multi_scale)
         multi_scale = self.conv_act(multi_scale)
-        
+
         # Temporal pooling: max and average
         max_pool = th.max(multi_scale, dim=2)[0]  # (batch, D*num_kernels)
-        avg_pool = th.mean(multi_scale, dim=2)     # (batch, D*num_kernels)
-        
+        avg_pool = th.mean(multi_scale, dim=2)  # (batch, D*num_kernels)
+
         # Concatenate pooled features
         pooled = th.cat([max_pool, avg_pool], dim=1)  # (batch, D*num_kernels*2)
-        
+
         # Project to D dimension
         market_context = self.proj(pooled)  # (batch, D)
-        
+
         return market_context, None
 
 
-class BidirectionalLSTMEncoder(nn.Module):
+class UnidirectionalLSTMEncoder(nn.Module):
     """
-    Bidirectional LSTM Encoder for Dense MoE Gating.
-    Uses BiLSTM with optional temporal attention for sequential modeling.
-    
+    Unidirectional LSTM Encoder for Dense MoE Gating.
+    Uses forward-only LSTM for causal sequential modeling (Spec 3.6.3).
+
+    CAUSALITY FIX: Uses bidirectional=False to ensure state h_t is only
+    computed from past information x_{0...t}, not future data.
+
     Input: O_mkt_TA (batch, T_w, D) - Temporal market index embedding
     Output: market_context (batch, D) - Aggregated market condition representation
     """
-    
+
     def __init__(self, config):
         super().__init__()
         self.D = config.mafia_D
-        self.num_layers = getattr(config, 'mafia_gating_lstm_layers', 2)
-        self.dropout = getattr(config, 'mafia_gating_dropout', 0.1)
-        
-        # Bidirectional LSTM
-        self.bilstm = nn.LSTM(
+        self.num_layers = getattr(config, "mafia_gating_lstm_layers", 2)
+        self.dropout = getattr(config, "mafia_gating_dropout", 0.1)
+
+        # Unidirectional LSTM (Spec 3.6.3: MUST NOT use bidirectional=True)
+        self.lstm = nn.LSTM(
             input_size=self.D,
-            hidden_size=self.D // 2,  # Because bidirectional doubles the output
+            hidden_size=self.D,  # Unidirectional: output dim = hidden_size
             num_layers=self.num_layers,
             batch_first=True,
-            bidirectional=True,
-            dropout=self.dropout if self.num_layers > 1 else 0
+            bidirectional=False,  # CAUSALITY FIX: Forward-only
+            dropout=self.dropout if self.num_layers > 1 else 0,
         )
-        
+
         # Temporal attention for weighted aggregation
         self.use_attention = True
         if self.use_attention:
             self.attn_proj = nn.Linear(self.D, 1)
-        
+
         # Post-processing MLP
         self.refine = nn.Sequential(
             nn.Linear(self.D, self.D * 2),
@@ -575,119 +606,390 @@ class BidirectionalLSTMEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.D * 2, self.D),
-            nn.LayerNorm(self.D)
+            nn.LayerNorm(self.D),
         )
-        
+
+        # Continuous state (Spec 3.6.2): carry (h_t, c_t) across timesteps
+        self._cached_state: Optional[Tuple[th.Tensor, th.Tensor]] = None
+        self._reset_to_zero: bool = False
+
+    def reset_state(
+        self, batch_size: Optional[int] = None, device: Optional[th.device] = None
+    ):
+        """
+        Reset cached LSTM hidden/cell states (e.g., at episode boundaries).
+
+        Spec 3.6.3: set (h, c) ← 0.
+        If batch_size/device provided, materialize zero tensors now; otherwise
+        defer to next forward (will zero-init based on incoming batch).
+        """
+        self._reset_to_zero = True
+        if batch_size is not None:
+            if device is None:
+                device = (
+                    self._cached_state[0].device
+                    if self._cached_state is not None
+                    else th.device("cpu")
+                )
+            h0 = th.zeros(
+                self.num_layers, batch_size, self.D, device=device
+            )
+            c0 = th.zeros(
+                self.num_layers, batch_size, self.D, device=device
+            )
+            self._cached_state = (h0, c0)
+        else:
+            self._cached_state = None
+
+    def detach_state(self):
+        """
+        Detach cached hidden/cell states to truncate backprop graph (Spec 3.6.3).
+        Call before feeding state into next step when running TBPTT/collect loop.
+        """
+        if self._cached_state is None:
+            return
+        h, c = self._cached_state
+        self._cached_state = (h.detach(), c.detach())
+
+    def _prepare_state(self, batch_size: int, device: th.device):
+        """
+        Validate cached state against incoming batch size/device.
+        Returns state tuple or None when shape mismatch (fallback: cold start).
+        """
+        if self._reset_to_zero:
+            # Explicit zero-init request from reset_state()
+            self._reset_to_zero = False
+            h0 = th.zeros(
+                self.num_layers, batch_size, self.D, device=device
+            )
+            c0 = th.zeros(
+                self.num_layers, batch_size, self.D, device=device
+            )
+            self._cached_state = (h0, c0)
+            return self._cached_state
+        if self._cached_state is None:
+            return None
+        h, c = self._cached_state
+        if h.size(1) != batch_size:
+            # Batch size changed (e.g., new trajectory) → reset state
+            return None
+        if h.device != device:
+            h = h.to(device)
+            c = c.to(device)
+            self._cached_state = (h, c)
+        return self._cached_state
+
     def forward(self, O_mkt_TA: th.Tensor) -> Tuple[th.Tensor, Optional[th.Tensor]]:
         """
         Args:
             O_mkt_TA: (batch, T_w, D) - Temporal market index embedding
-        
+
         Returns:
             market_context: (batch, D) - Aggregated market condition
             attn_weights: (batch, T_w, 1) - Temporal attention weights (if use_attention=True)
         """
         batch_size = O_mkt_TA.size(0)
-        
-        # BiLSTM processing
-        lstm_out, (h_n, c_n) = self.bilstm(O_mkt_TA)
+
+        # TBPTT: ensure cached state is detached before reuse
+        self.detach_state()
+
+        # Unidirectional LSTM processing with continuous state carry-over (Spec 3.6.2)
+        init_state = self._prepare_state(batch_size, O_mkt_TA.device)
+        lstm_out, (h_n, c_n) = self.lstm(O_mkt_TA, init_state)
         # lstm_out: (batch, T_w, D) - hidden states for all timesteps
-        # h_n: (num_layers*2, batch, D/2) - final hidden states
-        
+        # h_n: (num_layers, batch, D) - final hidden states
+        # Cache new state (detach to avoid backprop across long horizons)
+        self._cached_state = (h_n.detach(), c_n.detach())
+
         attn_weights = None
         if self.use_attention:
             # Weighted aggregation with learned attention
             attn_scores = self.attn_proj(lstm_out)  # (batch, T_w, 1)
             attn_weights = F.softmax(attn_scores, dim=1)  # (batch, T_w, 1)
-            
+
             # Weighted sum
-            market_context = th.sum(
-                attn_weights * lstm_out, 
-                dim=1
-            )  # (batch, D)
+            market_context = th.sum(attn_weights * lstm_out, dim=1)  # (batch, D)
         else:
             # Simple: take last timestep
             market_context = lstm_out[:, -1, :]  # (batch, D)
-        
+
         # Refine with MLP
         market_context = self.refine(market_context)
-        
+
         return market_context, attn_weights
 
 
 class DenseMoEGatingRouter(nn.Module):
     """
     Dense MoE Gating Router for computing expert weights.
-    Uses temporal encoder to extract market condition, then MLP to generate gate weights.
-    
-    Input: O_mkt_TA (batch, T_w, D) - Temporal market index embedding
+    Uses configurable temporal encoder to extract market condition, then MLP to generate gate weights.
+
+    Input: x_mkt_seq (batch, T, D_m) raw/feature market sequence OR O_mkt_TA (batch, T, D) pre-embedded
     Output: gate_weights (batch, num_experts=4) - Weights for each expert
+
+    Temporal Context Augmentation (Spec 3.6):
+        When enabled, input to gate_network is augmented from D to 3D:
+        C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt]
+        - C_mkt^(t): Current market context (D)
+        - C_bar_mkt: Rolling mean over context window (D)
+        - Delta_C_mkt: Drift = C_mkt^(t) - C_mkt^(t-W+1) (D)
     """
-    
+
     def __init__(self, config, num_experts=4):
         super().__init__()
         self.config = config
         self.num_experts = num_experts
         self.D = config.mafia_D
-        self.dropout = getattr(config, 'mafia_gating_dropout', 0.1)
-        
+        self.dropout = getattr(config, "mafia_gating_dropout", 0.1)
+        self.mkt_input_dim = getattr(config, "mafia_M_mkt", self.D)
+
+        # Temporal Context Augmentation (Spec 3.6)
+        self.use_temporal_augmentation = getattr(
+            config, "router_use_temporal_augmentation", True
+        )
+        self.augmented_dim = self.D * 3 if self.use_temporal_augmentation else self.D
+
         # Select temporal encoder based on config
-        encoder_type = getattr(config, 'mafia_gating_encoder_type', 'attention_based_aggregation')
-        
-        if encoder_type == 'attention_based_aggregation':
+        encoder_type = getattr(
+            config, "mafia_gating_encoder_type", "attention_based_aggregation"
+        )
+
+        if encoder_type == "attention_based_aggregation":
             self.temporal_encoder = AttentionBasedTemporalEncoder(config)
-        elif encoder_type == 'temporal_convolution':
+        elif encoder_type == "temporal_convolution":
             self.temporal_encoder = TemporalConvolutionEncoder(config)
-        elif encoder_type == 'bidirectional_lstm':
-            self.temporal_encoder = BidirectionalLSTMEncoder(config)
+        elif encoder_type == "bidirectional_lstm":
+            self.temporal_encoder = UnidirectionalLSTMEncoder(config)
         else:
             raise ValueError(
                 f"Unknown gating encoder type: {encoder_type}. "
                 f"Must be one of: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'"
             )
-        
+        self._stateful_encoder = isinstance(
+            self.temporal_encoder, UnidirectionalLSTMEncoder
+        )
+
+        # Projection for market sequence when feature dim != D
+        if self.mkt_input_dim != self.D:
+            self.mkt_proj = nn.Linear(self.mkt_input_dim, self.D)
+        else:
+            self.mkt_proj = nn.Identity()
+        self._temp_proj = None
+
         # Gate weight generator MLP
+        # Input dimension: augmented_dim (3D if temporal augmentation, else D)
         self.gate_network = nn.Sequential(
-            nn.Linear(self.D, self.D * 2),
+            nn.Linear(self.augmented_dim, self.D * 2),
             nn.LayerNorm(self.D * 2),
             nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.D * 2, num_experts),
-            nn.Softmax(dim=-1)  # Normalize weights to sum to 1
+            nn.Softmax(dim=-1),  # Normalize weights to sum to 1
         )
-        
-    def forward(self, O_mkt_TA: Optional[th.Tensor]) -> Tuple[th.Tensor, th.Tensor]:
+
+    def reset_temporal_state(self):
+        """Reset temporal encoder state (Spec 3.6.2) when encoder is stateful."""
+        if self._stateful_encoder:
+            self.temporal_encoder.reset_state()
+
+    def detach_temporal_state(self):
+        """Detach temporal encoder state to enforce TBPTT boundaries (Spec 3.6.3)."""
+        if self._stateful_encoder and hasattr(self.temporal_encoder, "detach_state"):
+            self.temporal_encoder.detach_state()
+
+    def _maybe_project(self, x: th.Tensor) -> th.Tensor:
+        """
+        Project market sequence to model dimension if needed.
+        """
+        batch, seq_len, dim = x.shape
+        if dim == self.D:
+            return x
+        if dim == self.mkt_input_dim:
+            return self.mkt_proj.to(x.device)(x)
+        # Fallback projection when runtime dim differs from configured dim
+        if self._temp_proj is None or self._temp_proj.in_features != dim:
+            self._temp_proj = nn.Linear(dim, self.D).to(x.device)
+        return self._temp_proj(x)
+
+    def forward(
+        self,
+        x_mkt_seq: Optional[th.Tensor] = None,  # (batch, T, D_m)
+        O_mkt_TA: Optional[th.Tensor] = None,  # (batch, T, D)
+        context_buffer: Optional[th.Tensor] = None,  # (W, D) or (batch, W, D) - historical context
+    ) -> Tuple[th.Tensor, th.Tensor]:
         """
         Args:
-            O_mkt_TA: Optional (batch, T_w, D) - Temporal market index embedding
-                      If None, returns uniform weights
-        
+            x_mkt_seq: Optional (batch, T, D_m) raw/feature market sequence (preferred)
+            O_mkt_TA: Optional (batch, T, D) pre-embedded market temporal features
+            context_buffer: Optional (W, D) or (batch, W, D) historical market_context buffer
+                           Used for temporal augmentation (Spec 3.6)
+
         Returns:
             gate_weights: (batch, num_experts) - Weights for each expert (sum to 1)
             market_context: (batch, D) - Market condition embedding
         """
-        if O_mkt_TA is None:
+        device = next(self.parameters()).device
+        if x_mkt_seq is None and O_mkt_TA is None:
             # Fallback: uniform weights when market index is not available
             batch_size = 1  # Will be broadcasted if needed
-            device = next(self.parameters()).device
-            gate_weights = th.ones(batch_size, self.num_experts, device=device) / self.num_experts
+            gate_weights = (
+                th.ones(batch_size, self.num_experts, device=device) / self.num_experts
+            )
             market_context = th.zeros(batch_size, self.D, device=device)
             return gate_weights, market_context
-        
+
+        market_tokens = None
+        if x_mkt_seq is not None:
+            market_tokens = self._maybe_project(x_mkt_seq)
+        elif O_mkt_TA is not None:
+            market_tokens = O_mkt_TA
+
         # Extract market condition from temporal sequence
-        market_context, _ = self.temporal_encoder(O_mkt_TA)  # (batch, D)
-        
-        # Generate gate weights from market context
-        gate_weights = self.gate_network(market_context)  # (batch, num_experts)
-        
+        market_context, _ = self.temporal_encoder(market_tokens)  # (batch, D)
+
+        # ===== Temporal Context Augmentation (Spec 3.6) =====
+        # Augment gate input: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt]
+        if self.use_temporal_augmentation:
+            if context_buffer is not None:
+                # Ensure buffer has batch dimension
+                if context_buffer.dim() == 2:  # (W, D)
+                    context_buffer = context_buffer.unsqueeze(0)  # (1, W, D)
+
+                # Expand buffer to match batch size if needed
+                batch_size = market_context.size(0)
+                if context_buffer.size(0) == 1 and batch_size > 1:
+                    context_buffer = context_buffer.expand(batch_size, -1, -1)
+
+                # Construct rolling window inclusive of current step: [t-W+1, ..., t]
+                # context_buffer is [t-W, ..., t-1] (history)
+                # Take last W-1 from buffer and append current C_mkt
+                # buffer shape: (batch, W, D)
+                history_part = context_buffer[:, 1:, :]  # (batch, W-1, D)
+                current_part = market_context.unsqueeze(1)  # (batch, 1, D)
+                rolling_window = th.cat([history_part, current_part], dim=1)  # (batch, W, D)
+
+                # C_bar: Rolling mean over window W ending at t
+                C_bar_mkt = rolling_window.mean(dim=1)  # (batch, D)
+
+                # Delta_C: Drift = C_mkt^(t) - C_mkt^(t-W+1) (start of window)
+                C_oldest = rolling_window[:, 0, :]  # (batch, D)
+                Delta_C_mkt = market_context - C_oldest  # (batch, D)
+
+                # Concatenate: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt]
+                gate_input = th.cat(
+                    [market_context, C_bar_mkt, Delta_C_mkt], dim=-1
+                )  # (batch, 3D)
+            else:
+                # No buffer available (cold start): zero-pad C_bar and Delta_C
+                zeros = th.zeros_like(market_context)
+                gate_input = th.cat([market_context, zeros, zeros], dim=-1)  # (batch, 3D)
+        else:
+            # Augmentation disabled: use raw market_context
+            gate_input = market_context
+
+        # Generate gate weights from (augmented) context
+        gate_weights = self.gate_network(gate_input)  # (batch, num_experts)
+
         return gate_weights, market_context
+
+
+class DirectionHead(nn.Module):
+    """
+    Context-Augmented Residual Direction Head (Spec 3.5)
+
+    Solves two core challenges in market regime classification:
+    1. Information Asymmetry: Uses momentum (Δ_C_mkt) + explicit signals
+       to provide velocity information for future prediction
+    2. Representation Conflict: Decouples from Gating via Residual architecture
+       with direct gradient paths
+
+    Input: X_dir = [C_mkt^(t), Δ_C_mkt, Explicit_Signals]
+    Output: logits for 3 classes (Bear/Side/Bull)
+
+    Architecture (Spec 3.5.2):
+    - Input Projection: Linear(2D+k → D)
+    - Residual Block: LayerNorm → Linear → GELU → Dropout → Linear + Skip
+    - Classification: Linear(D → 3)
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.D = config.mafia_D
+        self.num_classes = 3
+        self.dropout_rate = getattr(config, "direction_head_dropout", 0.2)
+
+        # Explicit signals: vol_shock(1) + dc_event(1) = 2 dims
+        self.explicit_dim = 2
+
+        # Total input: C_mkt(D) + Delta_C(D) + Explicit(2) = 2D + 2
+        self.input_dim = self.D * 2 + self.explicit_dim
+
+        # 1. Input Projection (Spec 3.5.2)
+        self.input_proj = nn.Linear(self.input_dim, self.D)
+
+        # 2. Residual Block (Spec 3.5.2)
+        self.res_ln = nn.LayerNorm(self.D)
+        self.res_fc1 = nn.Linear(self.D, self.D)
+        self.res_fc2 = nn.Linear(self.D, self.D)
+        self.res_dropout = nn.Dropout(self.dropout_rate)
+
+        # 3. Classification Head
+        self.classifier = nn.Linear(self.D, self.num_classes)
+
+        # Initialize bias to log-priors matching data distribution
+        self._init_classifier_bias()
+
+    def _init_classifier_bias(self):
+        """
+        Initialize classifier bias to log-priors (Spec 3.5).
+        Distribution: Bear ~15%, Side ~50%, Bull ~35%
+        """
+        with th.no_grad():
+            self.classifier.bias.copy_(th.tensor([-1.9, -0.69, -1.05]))
+
+    def forward(
+        self,
+        c_mkt: th.Tensor,
+        delta_c_mkt: th.Tensor,
+        explicit_signals: th.Tensor,
+    ) -> th.Tensor:
+        """
+        Forward pass with augmented input.
+
+        Args:
+            c_mkt: (B, D) - Current market context from Temporal Encoder
+            delta_c_mkt: (B, D) - Momentum/Velocity from Shared Buffer (Spec 3.6)
+            explicit_signals: (B, 2) - [vol_shock_flag, dc_event_flag]
+
+        Returns:
+            logits: (B, 3) - Bear/Side/Bull classification logits
+        """
+        # Build X_dir (Spec 3.5.1)
+        x_dir = th.cat([c_mkt, delta_c_mkt, explicit_signals], dim=-1)  # (B, 2D+2)
+
+        # Input Projection
+        h = self.input_proj(x_dir)  # (B, D)
+
+        # Residual Block with Skip Connection (Spec 3.5.2)
+        # H_out = H_in + F(H_in)
+        h_res = self.res_ln(h)
+        h_res = F.gelu(self.res_fc1(h_res))
+        h_res = self.res_dropout(h_res)
+        h_res = self.res_fc2(h_res)
+
+        h = h + h_res  # Skip Connection
+
+        # Classification
+        logits = self.classifier(h)  # (B, 3)
+
+        return logits
 
 
 class DenseMoESignalGenerator(nn.Module):
     """
     Dense Mixture of Experts Signal Generator.
     Uses market-index agent O_mkt_TA to compute gating weights for 4 stock experts.
-    
+
     Architecture:
     - 4 Stock Experts (Tech + 3 DC agents) provide outputs
     - Market-index agent provides O_mkt_TA for gating
@@ -695,66 +997,97 @@ class DenseMoESignalGenerator(nn.Module):
     - Weighted combination of expert outputs
     - Gumbel-TopK selection for portfolio
     """
-    
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.D = config.mafia_D
         self.T_w = config.mafia_T_w
         self.K = config.mafia_top_k
-        self.tau_gumbel = getattr(config, 'mafia_gumbel_temperature', 1.0)
+        self.tau_gumbel = getattr(config, "mafia_gumbel_temperature", 1.0)
         self.num_direction_classes = 3
-        
+
         # Dense MoE Gating Router (for 4 stock experts: Tech + 3 DC)
         self.gating_router = DenseMoEGatingRouter(config, num_experts=4)
-        
+
         # Gumbel-TopK temperature (trainable or fixed)
         self.topk_temperature = nn.Parameter(
-            th.tensor(self.tau_gumbel), 
-            requires_grad=False
+            th.tensor(self.tau_gumbel), requires_grad=False
         )
-        
-        # Boundary risk network (from expert TA outputs)
+
+        # Boundary risk network (from market context + weighted Top-K portfolio context)
+        # Outputs a raw scalar that will be mapped to eta via tanh and clamped in forward()
         self.risk_network = nn.Sequential(
-            nn.Linear(self.T_w * self.D * 4, self.D),  # 4 experts' TA outputs
+            nn.Linear(self.D * 2, self.D),
             nn.LayerNorm(self.D),
             nn.GELU(),
             nn.Linear(self.D, 1),
-            nn.Softplus()  # Ensure positive risk value
         )
 
-        # Direction classification head (market direction: up/hold/down)
-        self.direction_head = nn.Sequential(
-            nn.Linear(self.T_w * self.D * 4, self.D),
-            nn.LayerNorm(self.D),
-            nn.GELU(),
-            nn.Linear(self.D, self.num_direction_classes)
-        )
-    
+        # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
+        # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
+        self.direction_head = DirectionHead(config)
+
+    def reset_router_state(self):
+        """Reset stateful components inside the gating router (BiLSTM hidden/cache)."""
+        self.gating_router.reset_temporal_state()
+
+    def detach_router_state(self):
+        """Detach gating router state (TBPTT boundary)."""
+        if hasattr(self.gating_router, "detach_temporal_state"):
+            self.gating_router.detach_temporal_state()
+
     def forward(
-        self, 
-        expert_outputs: list,      # [O_tech, O_dc1, O_dc2, O_dc3]
-        expert_ta_outputs: list,   # [O_tech_TA, O_dc1_TA, O_dc2_TA, O_dc3_TA]
-        O_mkt_TA: Optional[th.Tensor],  # Market-index TA output for gating
-        expert_st_embeddings: Optional[list] = None  # Optional per-stock embeddings per expert [(batch, N, D)]
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor], th.Tensor]:
+        self,
+        expert_outputs: list,  # [O_tech, O_dc1, O_dc2, O_dc3]
+        expert_ta_outputs: list,  # [O_tech_TA, O_dc1_TA, O_dc2_TA, O_dc3_TA]
+        x_mkt_seq: Optional[
+            th.Tensor
+        ] = None,  # Raw/feature market sequence for gating (batch, T, D_m)
+        O_mkt_TA: Optional[
+            th.Tensor
+        ] = None,  # Optional pre-embedded market TA output for gating
+        expert_st_embeddings: Optional[
+            list
+        ] = None,  # Optional per-stock embeddings per expert [(batch, N, D)]
+        force_topk_indices: Optional[
+            th.Tensor
+        ] = None,  # Optional forced Top-K indices to lock membership
+        router_context_buffer: Optional[
+            th.Tensor
+        ] = None,  # Historical market_context buffer for temporal augmentation (W, D)
+        explicit_signals: Optional[
+            th.Tensor
+        ] = None,  # (batch, 2) [vol_shock_flag, dc_event_flag] for Direction Head (Spec 3.5)
+    ) -> Tuple[
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        Optional[th.Tensor],
+        th.Tensor,
+    ]:
         """
         Dense MoE forward pass.
-        
+
         Args:
             expert_outputs: List of 4 tensors, each (batch, N, 1) - Stock expert logits
             expert_ta_outputs: List of 4 tensors, each (batch, T_w, D) - Expert TA outputs
+            x_mkt_seq: Optional (batch, T_w, D_m) - Market-index sequence for gating
             O_mkt_TA: Optional (batch, T_w, D) - Market-index TA output for gating
-        
+
         Returns:
             market_vector: (batch, N) - Portfolio weights (Top-K assets)
-            boundary_risk: (batch,) - Risk boundary value
-            topk_indices: (batch, K) - Indices of selected assets
+            eta: (batch,) - Risk tolerance factor
             market_scores_full: (batch, N) - Full softmax scores for all assets
-            gate_weights: (batch, 4) - Expert weights from gating router
             market_context: (batch, D) - Market condition embedding from gating encoder
-            fused_stock_embedding: (batch, N, D) or None - Weighted fusion of expert ST embeddings per stock
             sigma_logits: (batch, 3) - Logits for market direction classification (up/hold/down)
+            topk_indices: (batch, K) - Indices of selected assets
+            topk_embeddings: Optional (batch, K, D) - Embeddings of selected assets (for RL state)
+            topk_scores: (batch, K) - Market weights on selected assets
+            force_topk_indices: Optional tensor to override Top-K membership (keeps weights sorted by logits)
         """
         # Input validation
         num_experts = len(expert_outputs)
@@ -762,31 +1095,35 @@ class DenseMoESignalGenerator(nn.Module):
             raise ValueError(
                 f"DenseMoE expects exactly 4 stock experts (Tech + 3 DC), got {num_experts}"
             )
-        
+
         batch_size = expert_outputs[0].size(0)
         N = expert_outputs[0].size(1)
         device = expert_outputs[0].device
-        
+
         # Step 1: Compute gate weights from market condition
-        gate_weights, market_context = self.gating_router(O_mkt_TA)  # (batch, 4), (batch, D)
-        
+        # Pass context_buffer for temporal augmentation (Spec 3.6)
+        gate_weights, market_context = self.gating_router(
+            x_mkt_seq=x_mkt_seq,
+            O_mkt_TA=O_mkt_TA,
+            context_buffer=router_context_buffer,
+        )  # (batch, 4), (batch, D)
+
         # Expand gate_weights for batch if needed (when O_mkt_TA was None)
         if gate_weights.size(0) == 1 and batch_size > 1:
             gate_weights = gate_weights.expand(batch_size, -1)
-        
+            market_context = market_context.expand(batch_size, -1)
+
         # Step 2: Stack expert outputs and apply gating
         expert_logits_stacked = th.stack(
-            [o.squeeze(-1) for o in expert_outputs], 
-            dim=1
+            [o.squeeze(-1) for o in expert_outputs], dim=1
         )  # (batch, 4, N)
-        
+
         # Weighted combination using gate weights
         gate_weights_expanded = gate_weights.unsqueeze(-1)  # (batch, 4, 1)
         market_logits = th.sum(
-            gate_weights_expanded * expert_logits_stacked, 
-            dim=1
+            gate_weights_expanded * expert_logits_stacked, dim=1
         )  # (batch, N)
-        
+
         # Optional: fuse per-stock ST embeddings from experts using gate weights
         fused_stock_embedding = None
         if expert_st_embeddings is not None:
@@ -795,17 +1132,33 @@ class DenseMoESignalGenerator(nn.Module):
                     f"Expected {num_experts} expert ST embeddings, got {len(expert_st_embeddings)}"
                 )
             stacked_emb = th.stack(expert_st_embeddings, dim=1)  # (batch, 4, N, D)
-            gate_weights_exp = gate_weights.unsqueeze(-1).unsqueeze(-1)  # (batch, 4, 1, 1)
-            fused_stock_embedding = th.sum(gate_weights_exp * stacked_emb, dim=1)  # (batch, N, D)
+            gate_weights_exp = gate_weights.unsqueeze(-1).unsqueeze(
+                -1
+            )  # (batch, 4, 1, 1)
+            fused_stock_embedding = th.sum(
+                gate_weights_exp * stacked_emb, dim=1
+            )  # (batch, N, D)
 
         # Step 3: Gumbel-TopK selection
-        temperature = max(self.tau_gumbel, 1e-6)
-        market_scores_full = F.softmax(market_logits / temperature, dim=-1)  # (batch, N)
-        
-        # Determine if using hard or soft TopK
+        # Use dynamic temperature: tau_gumbel is updated by MAFIAObserver.update_temperature()
+        # In inference mode, use lower temperature for sharper decisions
         training_mode = self.training
-        hard_inference = getattr(self.config, 'mafia_hard_topk_inference', True)
-        
+        hard_inference = getattr(self.config, "mafia_hard_topk_inference", True)
+
+        if training_mode:
+            # Training: use annealed temperature (updated externally)
+            temperature = max(self.tau_gumbel, 1e-6)
+        else:
+            # Inference: use fixed low temperature for sharper decisions
+            temperature = max(
+                getattr(self.config, "mafia_gumbel_temp_inference", 0.1), 1e-6
+            )
+
+        # market_scores_full: Full softmax WITHOUT temperature (pure model distribution)
+        # Per spec 3.3: "market_scores_full = softmax toàn bộ (không mask)"
+        # Temperature τ is ONLY for Gumbel-TopK selection, NOT for full scores
+        market_scores_full = F.softmax(market_logits, dim=-1)  # (batch, N)
+
         if training_mode or not hard_inference:
             # Soft Gumbel-TopK with noise
             uniform = th.rand_like(market_logits).clamp_(min=1e-8, max=1 - 1e-8)
@@ -814,44 +1167,105 @@ class DenseMoESignalGenerator(nn.Module):
         else:
             # Hard TopK (deterministic)
             logits_for_topk = market_logits / temperature
-        
-        # Select top-K assets
+
+        # Select top-K assets (optionally override with provided indices)
         top_k = min(self.K, N)
-        topk_vals, topk_indices = th.topk(logits_for_topk, k=top_k, dim=-1)
-        
+        topk_vals = None
+        fallback_topk = None
+        if force_topk_indices is not None:
+            # Normalize shape: (batch, K)
+            if not isinstance(force_topk_indices, th.Tensor):
+                force_topk_indices = th.as_tensor(force_topk_indices, device=device)
+            if force_topk_indices.dim() == 1:
+                force_topk_indices = force_topk_indices.unsqueeze(0)
+            if force_topk_indices.size(0) == 1 and batch_size > 1:
+                force_topk_indices = force_topk_indices.expand(batch_size, -1)
+            force_topk_indices = force_topk_indices.long().clamp(min=0, max=N - 1)
+            if force_topk_indices.size(1) < top_k:
+                if fallback_topk is None:
+                    fallback_topk = th.topk(logits_for_topk, k=top_k, dim=-1).indices
+                pad = top_k - force_topk_indices.size(1)
+                force_topk_indices = th.cat(
+                    [force_topk_indices, fallback_topk[:, :pad]], dim=1
+                )
+            elif force_topk_indices.size(1) > top_k:
+                force_topk_indices = force_topk_indices[:, :top_k]
+            topk_indices = force_topk_indices
+            topk_vals = th.gather(logits_for_topk, 1, topk_indices)
+        else:
+            topk_vals, topk_indices = th.topk(logits_for_topk, k=top_k, dim=-1)
+
         # Create mask for selected indices
         mask = th.zeros_like(market_logits, dtype=th.bool)
         mask.scatter_(1, topk_indices, True)
-        
+
         # Apply mask and softmax to get portfolio weights
-        masked_logits = logits_for_topk.masked_fill(~mask, float('-inf'))
+        masked_logits = logits_for_topk.masked_fill(~mask, float("-inf"))
         market_vector = F.softmax(masked_logits, dim=-1)
-        
+
         # Enforce hard support at inference
         if not training_mode and hard_inference:
             market_vector = market_vector.masked_fill(~mask, 0.0)
-        
-        # Step 4: Compute boundary_risk from expert TA outputs
-        # Stack and flatten TA outputs from all 4 experts
-        expert_ta_stacked = th.stack(expert_ta_outputs, dim=1)  # (batch, 4, T_w, D)
-        expert_ta_flat = expert_ta_stacked.reshape(batch_size, -1)  # (batch, 4*T_w*D)
-        
-        # Compute risk
-        boundary_risk = self.risk_network(expert_ta_flat)  # (batch, 1)
-        boundary_risk = boundary_risk.squeeze(-1)  # (batch,)
 
-        # Market direction logits
-        sigma_logits = self.direction_head(expert_ta_flat)  # (batch, 3)
-        
+        # Step 4: Build portfolio context (weighted Top-K embeddings) and risk input
+        eps = 1e-8
+        # Renormalize weights strictly on selected assets for stability
+        mv_weights = market_vector * mask.float()
+        mv_weights = mv_weights / (mv_weights.sum(dim=1, keepdim=True) + eps)
+
+        topk_embeddings = None
+        portfolio_context = th.zeros(batch_size, self.D, device=device)
+        if fused_stock_embedding is not None:
+            portfolio_context = th.sum(
+                mv_weights.unsqueeze(-1) * fused_stock_embedding, dim=1
+            )  # (batch, D)
+            # Gather explicit Top-K embeddings for downstream consumers (not returned separately here)
+            topk_indices_exp = topk_indices.unsqueeze(-1).expand(-1, top_k, self.D)
+            topk_embeddings = th.gather(fused_stock_embedding, 1, topk_indices_exp)
+        topk_scores = th.gather(market_vector, 1, topk_indices)  # (batch, K)
+
+        # Compute risk from market + portfolio context
+        # GRADIENT FIREWALL: Detach portfolio_context to prevent L_Risk from
+        # backpropagating to Stock Experts (Selection Stream). This ensures:
+        # - Allowed: L_Risk → market_context → Macro Backbone (UPDATE)
+        # - Blocked: L_Risk → portfolio_context -X→ Stock Experts (FROZEN)
+        risk_input = th.cat([market_context, portfolio_context.detach()], dim=-1)  # (batch, 2D)
+        eta_raw = self.risk_network(risk_input).squeeze(-1)  # (batch,)
+        eta_base = getattr(self.config, "mafia_eta_base", 1.0)
+        eta_amp = getattr(self.config, "mafia_eta_amplitude", 0.3)
+        eta_min = getattr(self.config, "mafia_eta_min", eta_base - eta_amp)
+        eta_max = getattr(self.config, "mafia_eta_max", eta_base + eta_amp)
+        eta = eta_base + eta_amp * th.tanh(eta_raw)
+        eta = th.clamp(eta, min=eta_min, max=eta_max)
+
+        # === Direction Head with Augmented Input (Spec 3.5) ===
+        # Compute Delta_C_mkt (Momentum/Velocity) from context buffer
+        delta_c_mkt = th.zeros_like(market_context)  # Default: zeros (cold start)
+
+        if router_context_buffer is not None:
+            # router_context_buffer: (W, D) or (batch, W, D)
+            if router_context_buffer.dim() == 2:  # (W, D)
+                c_oldest = router_context_buffer[0:1].expand(batch_size, -1)  # (B, D)
+            else:  # (batch, W, D)
+                c_oldest = router_context_buffer[:, 0, :]  # (B, D)
+            delta_c_mkt = market_context - c_oldest  # Velocity = Current - Oldest
+
+        # Prepare explicit signals (vol_shock, dc_event)
+        if explicit_signals is None:
+            explicit_signals = th.zeros(batch_size, 2, device=device)
+
+        # Market direction logits (Spec 3.5: Context-Augmented Residual)
+        sigma_logits = self.direction_head(market_context, delta_c_mkt, explicit_signals)  # (batch, 3)
+
         return (
-            market_vector,
-            boundary_risk,
-            topk_indices,
-            market_scores_full,
-            gate_weights,
-            market_context,
-            fused_stock_embedding,
-            sigma_logits,
+            market_vector,  # (batch, N)
+            eta,  # (batch,)
+            market_scores_full,  # (batch, N)
+            sigma_logits,  # (batch, 3) - Direction classification
+            market_context,  # (batch, D)
+            topk_indices,  # (batch, K)
+            topk_embeddings,  # (batch, K, D) or None
+            topk_scores,  # (batch, K)
         )
 
 
@@ -860,165 +1274,262 @@ class MAFIAModel(nn.Module):
     Complete MAFIA Model.
     Consists of 1 Technical Agent + 3 DC Agents + 1 Market-index Agent (optional).
     """
-    
+
     def __init__(self, config, action_dim: int):
         super().__init__()
         self.config = config
         self.N = action_dim  # Number of assets
         self.T_w = config.mafia_T_w
         self.D = config.mafia_D
-        
+
         # Feature processor
         from RL_controller.mafia_feature_processor import MAFIAFeatureProcessor
+
         self.feature_processor = MAFIAFeatureProcessor(config)
-        
+
         # Technical Agent (i=0) - Use actual N (action_dim) instead of config.topK
-        self.tech_csa = CSAModule(config, agent_type='tech')
-        self.tech_ta = TAModule(config, agent_type='tech', N=self.N)
+        self.tech_csa = CSAModule(config, agent_type="tech")
+        self.tech_ta = TAModule(config, agent_type="tech", N=self.N)
         self.tech_st_fusion = STFusionModule(self.D)
-        
+
         # DC Agents (i=1,2,3) - Each agent has its own CSA/TA weights
-        self.dc_csa_list = nn.ModuleList([
-            CSAModule(config, agent_type='dc') for _ in range(len(self.config.mafia_DC_thresholds))
-        ])
-        self.dc_ta_list = nn.ModuleList([
-            TAModule(config, agent_type='dc', shared_mlp=None, N=self.N) for _ in range(len(self.config.mafia_DC_thresholds))
-        ])
-        self.dc_st_fusion_list = nn.ModuleList([
-            STFusionModule(self.D) for _ in range(3)
-        ])
-        
-        # Market-index Agent (VNINDEX) - Only TA module for gating
-        use_market_index = getattr(config, 'mafia_use_market_index_agent', True)
+        self.dc_csa_list = nn.ModuleList(
+            [
+                CSAModule(config, agent_type="dc")
+                for _ in range(len(self.config.mafia_DC_thresholds))
+            ]
+        )
+        self.dc_ta_list = nn.ModuleList(
+            [
+                TAModule(config, agent_type="dc", shared_mlp=None, N=self.N)
+                for _ in range(len(self.config.mafia_DC_thresholds))
+            ]
+        )
+        self.dc_st_fusion_list = nn.ModuleList(
+            [STFusionModule(self.D) for _ in range(3)]
+        )
+
+        # Market-index Agent (VNINDEX) - TA module for gating
+        use_market_index = getattr(config, "mafia_use_market_index_agent", True)
         if use_market_index:
-            self.mkt_ta = TAModule(config, agent_type='mkt', N=1)  # Only TA, N=1 for single asset, M=19
+            self.mkt_ta = TAModule(
+                config, agent_type="mkt", N=1
+            )  # Only TA, N=1 for single asset, M=19
+            # Market-DC Agent: TA modules per DC threshold (N=1)
+            self.mkt_dc_ta_list = nn.ModuleList(
+                [
+                    TAModule(config, agent_type="dc", N=1)
+                    for _ in range(len(self.config.mafia_DC_thresholds))
+                ]
+            )
         else:
             self.mkt_ta = None
-        
+            self.mkt_dc_ta_list = None
+
         # Dense MoE Signal Generator
         self.signal_generator = DenseMoESignalGenerator(config)
-    
+
+    def reset_temporal_state(self):
+        """
+        Reset temporal states for components that maintain running context
+        (e.g., BiLSTM inside the gating router).
+        """
+        if hasattr(self.signal_generator, "reset_router_state"):
+            self.signal_generator.reset_router_state()
+
+    def detach_temporal_state(self):
+        """
+        Detach temporal states to enforce TBPTT boundaries without losing memory.
+        """
+        if hasattr(self.signal_generator, "detach_router_state"):
+            self.signal_generator.detach_router_state()
+
     def forward(
         self,
         ochlv_data: th.Tensor,
         market_index_ochlv_data: Optional[th.Tensor] = None,
-        market_regime_feats: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor], th.Tensor]:
+        force_topk_indices: Optional[th.Tensor] = None,
+        router_context_buffer: Optional[th.Tensor] = None,  # (W, D) buffer for temporal augmentation
+        explicit_signals: Optional[th.Tensor] = None,  # (batch, 2) [vol_shock, dc_flag] for Direction Head (Spec 3.5)
+    ) -> Tuple[
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        th.Tensor,
+        Optional[th.Tensor],
+        th.Tensor,
+    ]:
         """
         Forward pass through MAFIA model with Dense MoE.
-        
+
         Args:
             ochlv_data: (batch, N, 5, T_w) - Raw OCHLV data for stocks
             market_index_ochlv_data: Optional (batch, 1, 5, T_w) - Raw OCHLV data for market index (VNINDEX)
-        
+
         Returns:
             market_vector: (batch, N) - Market trend vector (Top-K weights, zero elsewhere)
-            boundary_risk: (batch,) - Risk boundary value
-            topk_indices: (batch, K) - Indices of selected assets
+            eta: (batch,) - Risk tolerance factor
             market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
-            gate_weights: (batch, 4) - Expert weights from Dense MoE gating
             market_context: (batch, D) - Market condition embedding from the gating encoder
-            fused_stock_embedding: (batch, N, D) or None - Fused per-stock embedding from expert ST outputs
             sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
+            topk_indices: (batch, K) - Indices of selected assets
+            topk_embeddings: (batch, K, D) or None - Embeddings of selected assets
+            topk_scores: (batch, K) - Market weights on selected assets
         """
         batch_size, N, M, T_w = ochlv_data.shape
         assert M == 5, f"Expected 5 features (OCHLV), got {M}"
         assert T_w == self.T_w, f"Expected window size {self.T_w}, got {T_w}"
-        
+
         device = ochlv_data.device
         dtype = th.float32
-        
-        # Process each batch item 
+
+        # Process each batch item
         tech_batches = []
         dc_batches = [[] for _ in range(len(self.config.mafia_DC_thresholds))]
-        
+
         for b in range(batch_size):
             sample_np = ochlv_data[b].detach().cpu().numpy()  # (N, 5, T_w)
             if sample_np.shape[1] != 5 and sample_np.shape[2] == 5:
                 sample_np = sample_np.transpose(0, 2, 1)
-            
-            P_tech_np = self.feature_processor.process_technical_features(sample_np)  # (N, T_w, 8)
+
+            P_tech_np = self.feature_processor.process_technical_features(
+                sample_np
+            )  # (N, T_w, 8)
             tech_batches.append(P_tech_np)
-            
+
             for idx, threshold in enumerate(self.config.mafia_DC_thresholds):
-                P_dc_np = self.feature_processor.process_dc_features(sample_np, threshold)  # (N, T_w, 5)
+                P_dc_np = self.feature_processor.process_dc_features(
+                    sample_np, threshold
+                )  # (N, T_w, 5)
                 dc_batches[idx].append(P_dc_np)
-        
-        P_tech = th.from_numpy(np.stack(tech_batches, axis=0)).to(dtype=dtype, device=device)  # (batch, N, T_w, 8)
-        P_dc_list = [th.from_numpy(np.stack(dc_batches[idx], axis=0)).to(dtype=dtype, device=device)
-                     for idx in range(len(self.config.mafia_DC_thresholds))]  # Each: (batch, N, T_w, 5)
+
+        P_tech = th.from_numpy(np.stack(tech_batches, axis=0)).to(
+            dtype=dtype, device=device
+        )  # (batch, N, T_w, 8)
+        P_dc_list = [
+            th.from_numpy(np.stack(dc_batches[idx], axis=0)).to(
+                dtype=dtype, device=device
+            )
+            for idx in range(len(self.config.mafia_DC_thresholds))
+        ]  # Each: (batch, N, T_w, 5)
         dc_features_list = P_dc_list
-        
+
         # Technical Agent forward pass
         O_tech_CSA = self.tech_csa(P_tech)  # (batch, N, D)
         O_tech_TA = self.tech_ta(P_tech)  # (batch, T_w, D)
-        O_tech, O_tech_ST = self.tech_st_fusion(O_tech_CSA, O_tech_TA)  # (batch, N, 1), (batch, N, D)
-        
+        O_tech, O_tech_ST = self.tech_st_fusion(
+            O_tech_CSA, O_tech_TA
+        )  # (batch, N, 1), (batch, N, D)
+
         # DC Agents forward pass
         O_dc_list = []
         O_dc_TA_list = []
         O_dc_ST_list = []
         for i in range(len(self.config.mafia_DC_thresholds)):
             O_dc_CSA = self.dc_csa_list[i](P_dc_list[i])  # (batch, N, D)
-            O_dc_TA = self.dc_ta_list[i](P_dc_list[i], dc_features=P_dc_list[i])  # (batch, T_w, D)
-            O_dc, O_dc_ST = self.dc_st_fusion_list[i](O_dc_CSA, O_dc_TA)  # (batch, N, 1), (batch, N, D)
+            O_dc_TA = self.dc_ta_list[i](
+                P_dc_list[i], dc_features=P_dc_list[i]
+            )  # (batch, T_w, D)
+            O_dc, O_dc_ST = self.dc_st_fusion_list[i](
+                O_dc_CSA, O_dc_TA
+            )  # (batch, N, 1), (batch, N, D)
             O_dc_list.append(O_dc)
             O_dc_TA_list.append(O_dc_TA)
             O_dc_ST_list.append(O_dc_ST)
-        
+
         # Stock experts: Tech + 3 DC agents (no market-index)
         stock_expert_outputs = [O_tech] + O_dc_list
         stock_expert_ta_outputs = [O_tech_TA] + O_dc_TA_list
-        
-        # Market-index Agent: Only compute O_mkt_TA for gating
+
+        # Market-index Agent: build market sequence for gating (and optional TA embedding)
         O_mkt_TA = None
-        use_market_index = getattr(self.config, 'mafia_use_market_index_agent', True) and self.mkt_ta is not None
+        O_mkt_dc_TA_list = []
+        macro_tokens = None
+        use_market_index = (
+            getattr(self.config, "mafia_use_market_index_agent", True)
+            and self.mkt_ta is not None
+        )
         if use_market_index and market_index_ochlv_data is not None:
             # Process market-index features
             mkt_batches = []
-            regime_batches = []
+            mkt_dc_batches = [[] for _ in range(len(self.config.mafia_DC_thresholds))]
             for b in range(batch_size):
-                mkt_sample_np = market_index_ochlv_data[b].detach().cpu().numpy()  # (1, 5, T_w)
+                mkt_sample_np = (
+                    market_index_ochlv_data[b].detach().cpu().numpy()
+                )  # (1, 5, T_w)
                 if mkt_sample_np.shape[1] != 5 and mkt_sample_np.shape[2] == 5:
                     mkt_sample_np = mkt_sample_np.transpose(0, 2, 1)
-                regime_np = None
-                if market_regime_feats is not None:
-                    regime_np = market_regime_feats[b].detach().cpu().numpy()
                 P_mkt_np = self.feature_processor.process_market_index_features(
                     mkt_sample_np,
-                    regime_feats=regime_np,
                 )  # (1, T_w, M_mkt)
                 mkt_batches.append(P_mkt_np)
-            
-            P_mkt = th.from_numpy(np.stack(mkt_batches, axis=0)).to(dtype=dtype, device=device)  # (batch, 1, T_w, M_mkt)
-            
-            # Market-index Agent: ONLY TA output for gating
-            O_mkt_TA = self.mkt_ta(P_mkt)  # (batch, T_w, D)
-        
+                for idx, threshold in enumerate(self.config.mafia_DC_thresholds):
+                    P_dc_mkt_np = self.feature_processor.process_dc_features(
+                        mkt_sample_np, threshold
+                    )  # (1, T_w, 5)
+                    mkt_dc_batches[idx].append(P_dc_mkt_np)
+
+            P_mkt = th.from_numpy(np.stack(mkt_batches, axis=0)).to(
+                dtype=dtype, device=device
+            )  # (batch, 1, T_w, M_mkt)
+            # DC features for market index per threshold
+            P_dc_mkt_list = [
+                th.from_numpy(np.stack(mkt_dc_batches[idx], axis=0)).to(
+                    dtype=dtype, device=device
+                )
+                for idx in range(len(self.config.mafia_DC_thresholds))
+            ]  # Each: (batch, 1, T_w, 5)
+
+            # Optional: pre-embedded TA output (kept for backward compatibility)
+            O_mkt_TA = (
+                self.mkt_ta(P_mkt) if self.mkt_ta is not None else None
+            )  # (batch, T_w, D)
+            # Market-DC TA outputs (per threshold, kept separate)
+            if self.mkt_dc_ta_list is not None and len(P_dc_mkt_list) > 0:
+                for i in range(len(self.config.mafia_DC_thresholds)):
+                    O_dc = self.mkt_dc_ta_list[i](
+                        P_dc_mkt_list[i], dc_features=P_dc_mkt_list[i]
+                    )  # (batch, T_w, D)
+                    O_mkt_dc_TA_list.append(O_dc)
+
+        # Build macro tokens for gating (concat Market-Index TA + Market-DC TA)
+        tokens_list = []
+        if O_mkt_TA is not None:
+            tokens_list.append(O_mkt_TA)
+        if O_mkt_dc_TA_list:
+            tokens_list.extend(O_mkt_dc_TA_list)
+        if tokens_list:
+            macro_tokens = th.cat(tokens_list, dim=-1)
+
         # Dense MoE Signal Generator
         (
             market_vector,
-            boundary_risk,
-            topk_indices,
+            eta,
             market_scores_full,
-            gate_weights,
-            market_context,
-            fused_stock_embedding,
             sigma_logits,
+            market_context,
+            topk_indices,
+            topk_embeddings,
+            topk_scores,
         ) = self.signal_generator(
             stock_expert_outputs,
             stock_expert_ta_outputs,
-            O_mkt_TA,
+            x_mkt_seq=macro_tokens,
             expert_st_embeddings=[O_tech_ST] + O_dc_ST_list,
+            force_topk_indices=force_topk_indices,
+            router_context_buffer=router_context_buffer,  # Temporal augmentation (Spec 3.6)
+            explicit_signals=explicit_signals,  # Direction Head explicit signals (Spec 3.5)
         )
 
         return (
             market_vector,
-            boundary_risk,
-            topk_indices,
+            eta,
             market_scores_full,
-            gate_weights,
-            market_context,
-            fused_stock_embedding,
             sigma_logits,
+            market_context,
+            topk_indices,
+            topk_embeddings,
+            topk_scores,
         )

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAFIA Training Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+    <div id="dashboard">
+        <!-- HEADER -->
+        <header id="header">
+            <div class="title">
+                <span id="phase-icon">🔮</span>
+                <span id="phase-title">PHASE 1: OBSERVER TRAINING</span>
+            </div>
+            <div class="meta">
+                <span>Run: <span id="run-id">--</span></span>
+                <span>Seed: <span id="seed">2025</span></span>
+                <span>Window: <span id="window">0</span></span>
+            </div>
+        </header>
+
+        <!-- TRAINING PIPELINE (2-Phase Overview) -->
+        <section id="pipeline-section">
+            <div class="pipeline-phases">
+                <div id="phase1-indicator" class="phase-indicator active">
+                    <div class="phase-header">
+                        <span class="phase-icon">🔮</span>
+                        <span class="phase-name">PHASE 1</span>
+                        <span id="phase1-status" class="phase-status">● ACTIVE</span>
+                    </div>
+                    <div class="phase-desc">Observer Walk-Forward Training</div>
+                    <div class="phase-detail" id="phase1-detail">TD3 Frozen • Uniform Weights</div>
+                </div>
+                <div class="phase-arrow">→</div>
+                <div id="phase2-indicator" class="phase-indicator pending">
+                    <div class="phase-header">
+                        <span class="phase-icon">🎯</span>
+                        <span class="phase-name">PHASE 2</span>
+                        <span id="phase2-status" class="phase-status">⏳ PENDING</span>
+                    </div>
+                    <div class="phase-desc">TD3 Agent Training</div>
+                    <div class="phase-detail" id="phase2-detail">Observer Frozen • Static Expert</div>
+                </div>
+            </div>
+            <div class="status" id="status-text">
+                Waiting for data...
+            </div>
+        </section>
+
+        <!-- DATA SPLITS (Train/Valid/Infer dates) -->
+        <section id="data-splits-section">
+            <h3>📁 DATA SPLITS <span id="finetune-badge" class="badge hidden">[Finetune]</span></h3>
+            <div class="metric-row split-row">
+                <span>Train: <span id="train-range" class="cyan">--</span></span>
+            </div>
+            <div class="metric-row split-row">
+                <span>Valid: <span id="valid-range" class="yellow">--</span></span>
+                <span>Infer: <span id="infer-range" class="green">--</span></span>
+            </div>
+        </section>
+
+        <!-- PROGRESS -->
+        <section id="progress-section">
+            <h3>📅 PROGRESS</h3>
+            <div class="progress-row">
+                <span>Epoch: <span id="epoch">0</span>/<span id="total-epochs">50</span></span>
+                <span>Day: <span id="step">0</span>/<span id="total-steps">252</span></span>
+                <span>Date: <span id="date">--</span></span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+            </div>
+            <div class="timing-row">
+                <span>Speed: <span id="speed">0</span> st/s</span>
+                <span>Elapsed: <span id="elapsed">0s</span></span>
+                <span>ETA: <span id="eta">--</span></span>
+            </div>
+        </section>
+
+        <!-- MARKET & PORTFOLIO (side by side) -->
+        <div class="two-column">
+            <section id="market-section">
+                <h3>📊 MARKET</h3>
+                <div class="metric-row">
+                    <span>Direction: <span id="direction" class="flat">-- FLAT</span></span>
+                    <span>Z: <span id="trend-z">0.00</span></span>
+                </div>
+                <div class="metric-row">
+                    <span>η (Risk): <span id="eta-risk">1.00</span></span>
+                    <span>Vol: <span id="volatility">0.00%</span></span>
+                </div>
+                <div class="metric-row">
+                    <span>Regime Shifts: <span id="regime-shifts">0</span></span>
+                    <span>Last: <span id="last-regime">--</span></span>
+                </div>
+            </section>
+
+            <section id="portfolio-section">
+                <h3>💼 PORTFOLIO</h3>
+                <div class="metric-row">
+                    <span>Status: <span id="rebalance-status">💤 HOLD</span></span>
+                    <span>Rebals: <span id="rebalance-count">0</span></span>
+                </div>
+                <div class="metric-row">
+                    <span>Top-K: <span id="top-k">10</span></span>
+                    <span>Next: <span id="next-rebal">0/14 days</span></span>
+                </div>
+                <div class="metric-row">
+                    <span>Added: <span id="n-added" class="green">0</span></span>
+                    <span>Removed: <span id="n-removed" class="red">0</span></span>
+                    <span>Kept: <span id="n-kept">0</span></span>
+                </div>
+            </section>
+        </div>
+
+        <!-- OBSERVER SECTION -->
+        <section id="observer-section">
+            <h3>
+                <span>🧠 OBSERVER (MAFIA)</span>
+                <span id="obs-status" class="status-badge frozen">⏳ WAITING</span>
+            </h3>
+            <div id="obs-content">
+                <div class="metric-row dim">
+                    <span>Waiting for training to start...</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- TD3 SECTION -->
+        <section id="td3-section">
+            <h3>
+                <span>🤖 TD3 AGENT</span>
+                <span id="td3-status" class="status-badge pending">⏳ PENDING</span>
+            </h3>
+            <div id="td3-content">
+                <div class="metric-row dim">
+                    <span>⏳ Waiting for Phase 2 - Observer training must complete first</span>
+                </div>
+                <div class="metric-row dim">
+                    <span>Actions: Uniform weights [1/K, 1/K, ..., 1/K]</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- CBF CONTROLLER -->
+        <section id="cbf-section">
+            <h3>
+                <span>🛡️ CBF CONTROLLER</span>
+                <span id="cbf-status" class="status-badge enabled">● ENABLED</span>
+            </h3>
+            <div class="metric-row">
+                <span>α: <span id="cbf-alpha">0.1000</span></span>
+                <span>Safety: <span id="cbf-safety">0.0000</span></span>
+                <span>Max Pos: <span id="cbf-max-pos">0.25</span></span>
+            </div>
+            <div class="metric-row">
+                <span>σ: <span id="cbf-sigma">0.00 → 0.00</span></span>
+                <span>Interventions: <span id="cbf-interventions">0</span></span>
+            </div>
+        </section>
+
+        <!-- PERFORMANCE -->
+        <section id="performance-section">
+            <h3>💰 PERFORMANCE</h3>
+            <div class="metric-row">
+                <span>Capital: $<span id="capital">1,000,000</span></span>
+                <span>Daily: <span id="daily-return" class="dim">+0.00%</span></span>
+                <span>Cumul: <span id="cumul-return" class="dim">+0.00%</span></span>
+            </div>
+            <div class="metric-row">
+                <span>Sharpe: <span id="sharpe">0.00</span></span>
+                <span>MDD: <span id="mdd" class="dim">0.00%</span></span>
+                <span>Win: <span id="win-rate">0.0%</span></span>
+            </div>
+            <div class="metric-row">
+                <span>Annual: <span id="annual-return" class="dim">+0.00%</span></span>
+                <span>Net Profit: <span id="net-profit" class="dim">$0</span></span>
+            </div>
+        </section>
+
+        <!-- EVENT LOG -->
+        <section id="events-section">
+            <h3>📋 LAST 20 EVENTS</h3>
+            <div id="event-log">
+                <div class="dim">No events yet...</div>
+            </div>
+        </section>
+
+        <!-- CONNECTION STATUS -->
+        <div id="connection-status">
+            <span id="connection-indicator">●</span>
+            <span id="connection-text">Connecting...</span>
+            <span id="last-update">--</span>
+        </div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

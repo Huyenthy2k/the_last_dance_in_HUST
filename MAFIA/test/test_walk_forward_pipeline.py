@@ -64,28 +64,35 @@ def test_walk_forward_resume_overlap(monkeypatch):
     monkeypatch.setattr(walk_forward, "RLcontroller", fake_rl)
     monkeypatch.setattr(entrance, "RLcontroller", fake_rl)
 
-    df, summary, metrics_csv, summary_csv, last_summary_csv = auto_pipeline.run_walk_forward_stage(
-        start_date="2017-01-01",
-        num_windows=2,
-        train_years=3,
-        valid_years=1,
-        test_years=1,
-        step_years=1,  # Overlaps windows; resume requires resume_overlap=True
-        end_date=None,
-        seeds=[1],
-        hparam_overrides={"num_epochs": 2},
-        resume_overlap=True,
-        log_dir=str(Path(os.environ["MAFIA_RES_ROOT"]) / "logs"),
+    df, summary, metrics_csv, summary_csv, last_summary_csv = (
+        auto_pipeline.run_walk_forward_stage(
+            start_date="2017-01-01",
+            num_windows=2,
+            train_years=3,
+            valid_years=1,
+            test_years=1,
+            step_years=1,  # Overlaps windows; resume requires resume_overlap=True
+            end_date=None,
+            seeds=[1],
+            hparam_overrides={"num_epochs": 2},
+            resume_overlap=True,
+            log_dir=str(Path(os.environ["MAFIA_RES_ROOT"]) / "logs"),
+        )
     )
 
     assert len(call_log) == 2, "Should run one call per window"
     assert call_log[0]["num_epochs"] == 2
 
     first_ckpt = (
-        Path(call_log[0]["res_dir"]) / "checkpoints" / "checkpoint_final" / "checkpoint_info.json"
+        Path(call_log[0]["res_dir"])
+        / "checkpoints"
+        / "checkpoint_final"
+        / "checkpoint_info.json"
     )
     assert first_ckpt.exists()
-    assert call_log[1]["resume_from_checkpoint"] == str(first_ckpt), "Should reuse checkpoint when resume_overlap=1"
+    assert call_log[1]["resume_from_checkpoint"] == str(first_ckpt), (
+        "Should reuse checkpoint when resume_overlap=1"
+    )
 
     assert not df.empty
     assert metrics_csv and Path(metrics_csv).exists()
@@ -96,6 +103,10 @@ def test_walk_forward_resume_overlap(monkeypatch):
 
 
 def test_walk_forward_overlap_without_resume(monkeypatch):
+    """
+    Test that walk-forward ALWAYS chains checkpoints (resume_overlap is deprecated and always True).
+    The resume_overlap=False parameter is ignored - checkpoint chaining is the unified strategy.
+    """
     call_log: List[Dict[str, Any]] = []
     fake_rl = _make_fake_rl(call_log)
     monkeypatch.setattr(walk_forward, "RLcontroller", fake_rl)
@@ -111,11 +122,15 @@ def test_walk_forward_overlap_without_resume(monkeypatch):
         end_date=None,
         seeds=[42],
         hparam_overrides=None,
-        resume_overlap=False,
+        resume_overlap=False,  # This is now ignored - always chains
         log_dir=str(Path(os.environ["MAFIA_RES_ROOT"]) / "logs_no_resume"),
     )
 
     assert len(call_log) == 2
-    assert call_log[1]["resume_from_checkpoint"] is None, "Should not reuse ckpt when resume_overlap=0 and windows overlap"
+    # resume_overlap is deprecated and always True - checkpoint chaining is always active
+    # Window 1 should resume from Window 0's checkpoint
+    assert call_log[1]["resume_from_checkpoint"] is not None, (
+        "Checkpoint chaining is always active (resume_overlap deprecated)"
+    )
     assert not df.empty
     assert not summary.empty

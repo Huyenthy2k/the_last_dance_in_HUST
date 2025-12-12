@@ -5,9 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 # Handle gym/gymnasium compatibility
 try:
     import gymnasium as gym
+
     GYMNASIUM_AVAILABLE = True
 except ImportError:
     import gym
+
     GYMNASIUM_AVAILABLE = False
 import numpy as np
 import torch as th
@@ -16,9 +18,25 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, TrainFreq, TrainFrequencyUnit, RolloutReturn 
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update, should_collect_more_steps
-from stable_baselines3.td3.policies import TD3Policy, CnnPolicy, MlpPolicy, MultiInputPolicy
+from stable_baselines3.common.type_aliases import (
+    GymEnv,
+    MaybeCallback,
+    Schedule,
+    TrainFreq,
+    TrainFrequencyUnit,
+    RolloutReturn,
+)
+from stable_baselines3.common.utils import (
+    get_parameters_by_name,
+    polyak_update,
+    should_collect_more_steps,
+)
+from stable_baselines3.td3.policies import (
+    TD3Policy,
+    CnnPolicy,
+    MlpPolicy,
+    MultiInputPolicy,
+)
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -27,7 +45,32 @@ from stable_baselines3.common.preprocessing import get_flattened_obs_dim
 from stable_baselines3.common.preprocessing import get_action_dim
 from .controllers import RL_withController
 
+# Import LiveDisplay check for stdout suppression
+try:
+    from utils.display_integration import get_display, smart_print, update_td3
+
+    LIVE_DISPLAY_AVAILABLE = True
+except ImportError:
+    LIVE_DISPLAY_AVAILABLE = False
+    
+    def update_td3(*args, **kwargs): pass
+
+    def get_display():
+        return None
+
+    smart_print = print  # Fallback to normal print
+
+
+def _is_live_display_active() -> bool:
+    """Check if LiveDisplay is currently active and rendering."""
+    if not LIVE_DISPLAY_AVAILABLE:
+        return False
+    display = get_display()
+    return display is not None and display.enabled
+
+
 SelfTD3 = TypeVar("SelfTD3", bound="TD3")
+
 
 def create_mlp_adj(
     input_dim: int,
@@ -110,7 +153,9 @@ class ActorAdj(BasePolicy):
         action_dim = get_action_dim(self.action_space)
         self.action_dim = action_dim
         # Adjust to consume full compact state as input (no assumption that last action_dim are market weights)
-        actor_net = create_mlp_adj(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        actor_net = create_mlp_adj(
+            features_dim, action_dim, net_arch, activation_fn, squash_output=True
+        )
 
         # Deterministic action
         self.mu = th.nn.Sequential(*actor_net)
@@ -133,12 +178,12 @@ class ActorAdj(BasePolicy):
         # assert deterministic, 'The TD3 actor only outputs deterministic actions'
         # Clean NaN/Inf from observation
         obs = th.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         features = self.extract_features(obs, self.features_extractor)
         # Clean NaN/Inf from features
         features = th.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        td3_decision = self.mu(features) # range [0, 1], sum=1
+
+        td3_decision = self.mu(features)  # range [0, 1], sum=1
         td3_decision = th.nan_to_num(td3_decision, nan=0.0, posinf=0.0, neginf=0.0)
         # Map to [-1, 1]
         final_output = (2.0 * td3_decision) - 1.0
@@ -146,7 +191,9 @@ class ActorAdj(BasePolicy):
         final_output = th.nan_to_num(final_output, nan=0.0, posinf=1.0, neginf=-1.0)
         return final_output
 
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+    def _predict(
+        self, observation: th.Tensor, deterministic: bool = False
+    ) -> th.Tensor:
         # Note: the deterministic deterministic parameter is ignored in the case of TD3.
         #   Predictions are always deterministic.
         return self(observation)
@@ -192,7 +239,9 @@ class ActorOriginal(BasePolicy):
         action_dim = get_action_dim(self.action_space)
         self.action_dim = action_dim
         # actor_net = create_mlp(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
-        actor_net = create_mlp_adj(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        actor_net = create_mlp_adj(
+            features_dim, action_dim, net_arch, activation_fn, squash_output=True
+        )
 
         # Deterministic action
         self.mu = th.nn.Sequential(*actor_net)
@@ -213,23 +262,36 @@ class ActorOriginal(BasePolicy):
     def forward(self, obs: th.Tensor) -> th.Tensor:
         # assert deterministic, 'The TD3 actor only outputs deterministic actions'
         features = self.extract_features(obs, self.features_extractor)
-        final_output = self.mu(features) # range [0, 1], sum=1
+        final_output = self.mu(features)  # range [0, 1], sum=1
         return final_output
 
-    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+    def _predict(
+        self, observation: th.Tensor, deterministic: bool = False
+    ) -> th.Tensor:
         # Note: the deterministic deterministic parameter is ignored in the case of TD3.
         #   Predictions are always deterministic.
         return self(observation)
 
+
 class TD3PolicyAdj(TD3Policy):
-    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ActorAdj:
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
+    def make_actor(
+        self, features_extractor: Optional[BaseFeaturesExtractor] = None
+    ) -> ActorAdj:
+        actor_kwargs = self._update_features_extractor(
+            self.actor_kwargs, features_extractor
+        )
         return ActorAdj(**actor_kwargs).to(self.device)
 
+
 class TD3PolicyOriginal(TD3Policy):
-    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ActorAdj:
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
+    def make_actor(
+        self, features_extractor: Optional[BaseFeaturesExtractor] = None
+    ) -> ActorAdj:
+        actor_kwargs = self._update_features_extractor(
+            self.actor_kwargs, features_extractor
+        )
         return ActorOriginal(**actor_kwargs).to(self.device)
+
 
 class TD3Controller(OffPolicyAlgorithm):
     """
@@ -279,8 +341,8 @@ class TD3Controller(OffPolicyAlgorithm):
         "MlpPolicy": MlpPolicy,
         "CnnPolicy": CnnPolicy,
         "MultiInputPolicy": MultiInputPolicy,
-        'TD3PolicyAdj': TD3PolicyAdj,
-        'TD3PolicyOriginal': TD3PolicyOriginal,
+        "TD3PolicyAdj": TD3PolicyAdj,
+        "TD3PolicyOriginal": TD3PolicyOriginal,
     }
 
     def __init__(
@@ -310,7 +372,6 @@ class TD3Controller(OffPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
-
         super().__init__(
             policy,
             env,
@@ -351,8 +412,12 @@ class TD3Controller(OffPolicyAlgorithm):
         # Running mean and running var
         self.actor_batch_norm_stats = get_parameters_by_name(self.actor, ["running_"])
         self.critic_batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
-        self.actor_batch_norm_stats_target = get_parameters_by_name(self.actor_target, ["running_"])
-        self.critic_batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
+        self.actor_batch_norm_stats_target = get_parameters_by_name(
+            self.actor_target, ["running_"]
+        )
+        self.critic_batch_norm_stats_target = get_parameters_by_name(
+            self.critic_target, ["running_"]
+        )
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
@@ -361,18 +426,42 @@ class TD3Controller(OffPolicyAlgorithm):
         self.critic_target = self.policy.critic_target
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+        # ===== Check if TD3 is frozen (Phase 1 - Observer Only) =====
+        mafia_config = getattr(self, "mafia_config", None)
+        training_mode = (
+            getattr(mafia_config, "training_mode", "RL_ONLY")
+            if mafia_config
+            else "RL_ONLY"
+        )
+        if training_mode == "OBSERVER_ONLY":
+            # Phase 1: TD3 frozen - skip all gradient updates
+            if not getattr(self, "_td3_frozen_logged", False):
+                smart_print(
+                    "[TRAIN] ❄️ TD3 FROZEN (Phase 1: Observer-Only mode) - Skipping gradient updates"
+                )
+                self._td3_frozen_logged = True
+            return
+
         # Log that train() was called (ALWAYS log, not just when verbose)
-        n_updates_before = getattr(self, '_n_updates', 0)
-        buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-        print(f"[TRAIN] ⚡ train() method CALLED | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+        n_updates_before = getattr(self, "_n_updates", 0)
+        buffer_size = (
+            self.replay_buffer.size()
+            if hasattr(self.replay_buffer, "size")
+            else len(self.replay_buffer)
+        )
+        smart_print(
+            f"[TRAIN] ⚡ train() method CALLED | _n_updates before: {n_updates_before} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}"
+        )
 
         # Guard against premature training (respect learning_starts even if collect_rollouts misfires)
-        learning_starts = getattr(self, 'learning_starts', 0)
+        learning_starts = getattr(self, "learning_starts", 0)
         if buffer_size < learning_starts:
             if self.verbose >= 1:
-                print(f"[TRAIN] ⏸ Buffer size {buffer_size} < learning_starts {learning_starts}. Skipping gradient update.", flush=True)
+                smart_print(
+                    f"[TRAIN] ⏸ Buffer size {buffer_size} < learning_starts {learning_starts}. Skipping gradient update."
+                )
             return
-        
+
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
 
@@ -381,15 +470,18 @@ class TD3Controller(OffPolicyAlgorithm):
 
         # Log training start (always log first few times, then every 100)
         if self.verbose >= 1 and (self._n_updates < 10 or self._n_updates % 100 == 0):
-            print(f"[TRAIN] Starting gradient updates | Total updates: {self._n_updates} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}", flush=True)
+            smart_print(
+                f"[TRAIN] Starting gradient updates | Total updates: {self._n_updates} | Gradient steps: {gradient_steps} | Buffer size: {buffer_size}"
+            )
 
         actor_losses, critic_losses = [], []
         sampled_rewards = []
         for _ in range(gradient_steps):
-
             self._n_updates += 1
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = self.replay_buffer.sample(
+                batch_size, env=self._vec_normalize_env
+            )
             try:
                 sampled_rewards.append(replay_data.rewards.mean().item())
             except Exception:
@@ -397,20 +489,34 @@ class TD3Controller(OffPolicyAlgorithm):
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
-                noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
+                noise = replay_data.actions.clone().data.normal_(
+                    0, self.target_policy_noise
+                )
                 noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
-                next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+                next_actions = (
+                    self.actor_target(replay_data.next_observations) + noise
+                ).clamp(-1, 1)
 
                 # Compute the next Q-values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values = th.cat(
+                    self.critic_target(replay_data.next_observations, next_actions),
+                    dim=1,
+                )
                 next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q_values = (
+                    replay_data.rewards
+                    + (1 - replay_data.dones) * self.gamma * next_q_values
+                )
 
             # Get current Q-values estimates for each critic network
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            current_q_values = self.critic(
+                replay_data.observations, replay_data.actions
+            )
 
             # Compute critic loss
-            critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            critic_loss = sum(
+                F.mse_loss(current_q, target_q_values) for current_q in current_q_values
+            )
             critic_losses.append(critic_loss.item())
 
             # Optimize the critics
@@ -422,7 +528,9 @@ class TD3Controller(OffPolicyAlgorithm):
             if self._n_updates % self.policy_delay == 0:
                 # Compute actor loss
                 actor_actions = self.actor(replay_data.observations)
-                base_actor_loss = -self.critic.q1_forward(replay_data.observations, actor_actions).mean()
+                base_actor_loss = -self.critic.q1_forward(
+                    replay_data.observations, actor_actions
+                ).mean()
                 entropy_term = 0.0
                 if getattr(self, "entropy_coef", 0.0) > 0:
                     probs = th.softmax(actor_actions, dim=1)
@@ -438,35 +546,101 @@ class TD3Controller(OffPolicyAlgorithm):
                 actor_loss.backward()
                 self.actor.optimizer.step()
 
-                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
-                polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                polyak_update(
+                    self.critic.parameters(), self.critic_target.parameters(), self.tau
+                )
+                polyak_update(
+                    self.actor.parameters(), self.actor_target.parameters(), self.tau
+                )
                 # Copy running stats, see GH issue #996
-                polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
-                polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
+                polyak_update(
+                    self.critic_batch_norm_stats,
+                    self.critic_batch_norm_stats_target,
+                    1.0,
+                )
+                polyak_update(
+                    self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0
+                )
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         if len(actor_losses) > 0:
             self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
-        
+
         # Log training completion with loss values (always log first few times, then every 100)
-        n_updates_after = getattr(self, '_n_updates', 0)
+        n_updates_after = getattr(self, "_n_updates", 0)
         mean_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
         mean_critic_loss = np.mean(critic_losses)
-        mean_sample_reward = np.mean(sampled_rewards) if len(sampled_rewards) > 0 else 0.0
-        config_ref = getattr(self, 'mafia_config', None)
+        mean_sample_reward = (
+            np.mean(sampled_rewards) if len(sampled_rewards) > 0 else 0.0
+        )
+        
+        # Update Dashboard
+        update_td3(
+            actor_loss=mean_actor_loss,
+            critic_loss=mean_critic_loss,
+            q_value=0.0, # Not easily available as aggregate, skip or pass critic_loss proxy
+            reward=mean_sample_reward,
+            buffer_size=(
+                self.replay_buffer.size()
+                if hasattr(self.replay_buffer, "size")
+                else len(self.replay_buffer)
+            )
+        )
+
+        config_ref = getattr(self, "mafia_config", None)
         if config_ref is not None:
             config_ref.last_td3_actor_loss = mean_actor_loss
             config_ref.last_td3_critic_loss = mean_critic_loss
             config_ref.last_td3_mean_reward = mean_sample_reward
             config_ref.last_td3_updates = n_updates_after
 
-        buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-        # Single-line completion summary (actor/critic losses, reward, buffer, updates)
-        print(
-            f"[TRAIN] ✅ Updates {n_updates_before}→{n_updates_after} (+{n_updates_after - n_updates_before}) | "
-            f"Actor: {mean_actor_loss:.6f} | Critic: {mean_critic_loss:.6f} | "
-            f"Sample reward: {mean_sample_reward:.6f} | Buffer: {buffer_size}",
+            # Accumulate TD3 reward for epoch summary
+            if not hasattr(config_ref, "td3_reward_sum"):
+                config_ref.td3_reward_sum = 0.0
+            config_ref.td3_reward_sum += mean_sample_reward * gradient_steps
+
+        buffer_size = (
+            self.replay_buffer.size()
+            if hasattr(self.replay_buffer, "size")
+            else len(self.replay_buffer)
+        )
+
+        # Get current Top-K info from environment if available
+        topk_display = "N/A"
+        try:
+            env = self.env.envs[0] if hasattr(self.env, "envs") else self.env
+            if hasattr(env, "env"):
+                env = env.env  # Unwrap Monitor
+            if hasattr(env, "unwrapped"):
+                env = env.unwrapped
+            topk_indices = getattr(env, "observer_topk_indices", None)
+            if (
+                topk_indices is not None
+                and hasattr(env, "stock_lst")
+                and env.stock_lst is not None
+            ):
+                topk_symbols = [
+                    env.stock_lst[i] if i < len(env.stock_lst) else f"idx_{i}"
+                    for i in topk_indices[:3]
+                ]
+                topk_display = (
+                    f"[{', '.join(topk_symbols)}...] ({len(topk_indices)} mã)"
+                )
+            elif topk_indices is not None:
+                topk_display = f"[{', '.join([str(i) for i in topk_indices[:3]])}...] ({len(topk_indices)} mã)"
+        except Exception:
+            pass
+
+        # Enhanced TD3 training log
+        smart_print(
+            f"\n[TD3 PORTFOLIO ALLOCATOR] ✅ Gradient Update Hoàn Thành\n"
+            f"  📊 Số lần updates: {n_updates_before} → {n_updates_after} (+{n_updates_after - n_updates_before})\n"
+            f"  📉 Actor Loss (Policy Network - tối ưu phân bổ): {mean_actor_loss:.6f}\n"
+            f"  📉 Critic Loss (Q-Network - đánh giá giá trị): {mean_critic_loss:.6f}\n"
+            f"  📈 Mean Reward (trung bình từ replay buffer): {mean_sample_reward:.6f}\n"
+            f"  💾 Replay Buffer Size: {buffer_size:,}\n"
+            f"  🎯 Đang tối ưu phân bổ cho Top-K: {topk_display}",
             flush=True,
         )
 
@@ -485,12 +659,32 @@ class TD3Controller(OffPolicyAlgorithm):
         This matches our expectation that once the replay buffer reaches the
         warm-up threshold, TD3 should begin updating immediately.
         """
+        # ===== Log if TD3 is frozen (Phase 1 - Observer Only) =====
+        mafia_config = getattr(self, "mafia_config", None)
+        training_mode = (
+            getattr(mafia_config, "training_mode", "RL_ONLY")
+            if mafia_config
+            else "RL_ONLY"
+        )
+        if training_mode == "OBSERVER_ONLY":
+            smart_print(
+                "[LEARN] ❄️ TD3 in FROZEN mode (Phase 1) - Will collect rollouts but skip gradient updates"
+            )
+
         # Log initial state
         if self.verbose >= 1:
-            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
-            learning_starts = getattr(self, 'learning_starts', 100)
-            print(f"[LEARN] Starting training | Buffer size: {buffer_size} | learning_starts: {learning_starts} | Total timesteps: {total_timesteps}", flush=True)
-            print(f"[LEARN] train_freq: {self.train_freq} | gradient_steps: {self.gradient_steps}", flush=True)
+            buffer_size = (
+                self.replay_buffer.size()
+                if hasattr(self.replay_buffer, "size")
+                else len(self.replay_buffer)
+            )
+            learning_starts = getattr(self, "learning_starts", 100)
+            smart_print(
+                f"[LEARN] Starting training | Buffer size: {buffer_size} | learning_starts: {learning_starts} | Total timesteps: {total_timesteps}"
+            )
+            smart_print(
+                f"[LEARN] train_freq: {self.train_freq} | gradient_steps: {self.gradient_steps}"
+            )
 
         total_timesteps, callback = self._setup_learn(
             total_timesteps,
@@ -502,7 +696,9 @@ class TD3Controller(OffPolicyAlgorithm):
 
         callback.on_training_start(locals(), globals())
 
-        assert self.env is not None, "You must set the environment before calling learn()"
+        assert self.env is not None, (
+            "You must set the environment before calling learn()"
+        )
         assert isinstance(self.train_freq, TrainFreq)
 
         while self.num_timesteps < total_timesteps:
@@ -520,26 +716,66 @@ class TD3Controller(OffPolicyAlgorithm):
                 break
 
             # Only train when replay buffer has reached learning_starts
-            buffer_size = self.replay_buffer.size() if hasattr(self.replay_buffer, 'size') else len(self.replay_buffer)
+            buffer_size = (
+                self.replay_buffer.size()
+                if hasattr(self.replay_buffer, "size")
+                else len(self.replay_buffer)
+            )
             if buffer_size < self.learning_starts:
                 continue
 
             if self.num_timesteps > 0:
-                gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+                gradient_steps = (
+                    self.gradient_steps
+                    if self.gradient_steps >= 0
+                    else rollout.episode_timesteps
+                )
                 if gradient_steps > 0:
-                    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
+                    self.train(
+                        batch_size=self.batch_size, gradient_steps=gradient_steps
+                    )
 
         callback.on_training_end()
+
+        # ===== Training Summary Log =====
+        training_mode = (
+            getattr(mafia_config, "training_mode", "RL_ONLY")
+            if mafia_config
+            else "RL_ONLY"
+        )
+        final_buffer_size = (
+            self.replay_buffer.size()
+            if hasattr(self.replay_buffer, "size")
+            else len(self.replay_buffer)
+        )
+        total_updates = getattr(self, "_n_updates", 0)
+
+        smart_print(f"\n{'=' * 70}")
+        smart_print(f"📊 TD3 TRAINING SUMMARY")
+        smart_print(f"{'=' * 70}")
+        smart_print(f"  Mode:              {training_mode}")
+        smart_print(f"  Total Timesteps:   {self.num_timesteps:,}")
+        smart_print(f"  Gradient Updates:  {total_updates:,}")
+        smart_print(f"  Final Buffer Size: {final_buffer_size:,}")
+        if training_mode == "RL_ONLY":
+            smart_print(f"  Observer Status:   ❄️ FROZEN (Static Expert)")
+        else:
+            smart_print(f"  Observer Status:   🔓 Training alongside TD3")
+        smart_print(f"{'=' * 70}\n")
 
         return self
 
     def _excluded_save_params(self) -> List[str]:
-        return super()._excluded_save_params() + ["actor", "critic", "actor_target", "critic_target"]
+        return super()._excluded_save_params() + [
+            "actor",
+            "critic",
+            "actor_target",
+            "critic_target",
+        ]
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
         return state_dicts, []
-
 
     def collect_rollouts(
         self,
@@ -583,15 +819,20 @@ class TD3Controller(OffPolicyAlgorithm):
         def _finalize_rollout_line() -> None:
             """Clear the live status line so future logs print normally."""
             if getattr(self, "_live_rollout_line_active", False):
-                sys.stdout.write("\r\033[2K")
-                sys.stdout.flush()
+                # Skip stdout write when LiveDisplay is active (it handles its own rendering)
+                if not _is_live_display_active():
+                    sys.stdout.write("\r\033[2K")
+                    sys.stdout.flush()
             self._live_rollout_line_active = False
 
         def _log_rollout(message: str) -> None:
             _finalize_rollout_line()
-            print(message, flush=True)
+            # Use smart_print to route to log file when display is active
+            smart_print(message)
 
-        def _log_rollout_status(timestep: int, episode: int, collected_steps: int) -> None:
+        def _log_rollout_status(
+            timestep: int, episode: int, collected_steps: int
+        ) -> None:
             nonlocal status_last_time, status_last_step
             # Throttle status updates to reduce spam
             status_interval = getattr(self, "_rollout_status_interval", 50)
@@ -604,14 +845,29 @@ class TD3Controller(OffPolicyAlgorithm):
             speed = delta_steps / elapsed
             status_last_time, status_last_step = now, timestep
 
-            buffer_size = replay_buffer.size() if hasattr(replay_buffer, "size") else len(replay_buffer)
+            buffer_size = (
+                replay_buffer.size()
+                if hasattr(replay_buffer, "size")
+                else len(replay_buffer)
+            )
             learning_starts = getattr(self, "learning_starts", 0)
             warmup_phase = learning_starts > 0 and buffer_size < learning_starts
-            buffer_target = learning_starts if learning_starts > 0 else getattr(replay_buffer, "max_size", None)
-            buffer_display = f"{buffer_size}/{buffer_target}" if buffer_target else str(buffer_size)
+            buffer_target = (
+                learning_starts
+                if learning_starts > 0
+                else getattr(replay_buffer, "max_size", None)
+            )
+            buffer_display = (
+                f"{buffer_size}/{buffer_target}" if buffer_target else str(buffer_size)
+            )
 
             label = "[WARM-UP]" if warmup_phase else "[ROLLOUT]"
             message = f"{label} Global step {timestep} | Buffer {buffer_display} | Speed: {speed:.2f} steps/s"
+
+            # Skip stdout write when LiveDisplay is active (it handles its own rendering)
+            if _is_live_display_active():
+                return
+
             width = getattr(self, "_rollout_status_width", 0)
             width = max(width, len(message))
             self._rollout_status_width = width
@@ -620,53 +876,75 @@ class TD3Controller(OffPolicyAlgorithm):
             sys.stdout.write(f"\r\033[2K{padded_message}")
             sys.stdout.flush()
             self._live_rollout_line_active = True
-        
+
         # Log rollout start
         if self.verbose >= 1 and self._episode_num % 10 == 0:
-            _log_rollout_status(self.num_timesteps, self._episode_num, num_collected_steps)
+            _log_rollout_status(
+                self.num_timesteps, self._episode_num, num_collected_steps
+            )
 
         if env.num_envs > 1:
-            assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
+            assert train_freq.unit == TrainFrequencyUnit.STEP, (
+                "You must use only one env when doing episodic training."
+            )
 
         # Vectorize action noise if needed
-        if action_noise is not None and env.num_envs > 1 and not isinstance(action_noise, VectorizedActionNoise):
+        if (
+            action_noise is not None
+            and env.num_envs > 1
+            and not isinstance(action_noise, VectorizedActionNoise)
+        ):
             action_noise = VectorizedActionNoise(action_noise, env.num_envs)
-        
+
         if self.use_sde:
             self.actor.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
         continue_training = True
 
-        while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
+        while should_collect_more_steps(
+            train_freq, num_collected_steps, num_collected_episodes
+        ):
             # Check if we've reached total timesteps - stop collecting to prevent extra steps
-            if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
+            if hasattr(self, "_total_timesteps") and self._total_timesteps is not None:
                 if self.num_timesteps >= self._total_timesteps:
                     if self.verbose >= 1:
-                        _log_rollout(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping collection")
+                        _log_rollout(
+                            f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping collection"
+                        )
                     continue_training = False
                     break
-            if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
+            if (
+                self.use_sde
+                and self.sde_sample_freq > 0
+                and num_collected_steps % self.sde_sample_freq == 0
+            ):
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
 
             # Select action randomly or according to policy
             # actions: Range-[low, high], shape: [1, num_of_stocks], buffer_actions: [-1, 1] for actor and critic agent training
-            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
-            a_rlonly = np.array(actions[0]) # [1, num_of_stocks] -> [num_of_stocks, ]
+            actions, buffer_actions = self._sample_action(
+                learning_starts, action_noise, env.num_envs
+            )
+            a_rlonly = np.array(actions[0])  # [1, num_of_stocks] -> [num_of_stocks, ]
             a_rl = a_rlonly
             # Unwrap environment to get the actual StockPortfolioEnv (not Monitor wrapper)
             unwrapped_env = env.envs[0]
-            if hasattr(unwrapped_env, 'env'):
+            if hasattr(unwrapped_env, "env"):
                 unwrapped_env = unwrapped_env.env  # Unwrap Monitor
-            if hasattr(unwrapped_env, 'unwrapped'):
+            if hasattr(unwrapped_env, "unwrapped"):
                 unwrapped_env = unwrapped_env.unwrapped
-            
+
             # Clean NaN/Inf from a_rl
             a_rl = np.nan_to_num(a_rl, nan=0.0, posinf=0.0, neginf=0.0)
-            
+
             # Check if a_rl is valid
-            if np.any(np.isnan(a_rl)) or np.any(np.isinf(a_rl)) or np.sum(np.abs(a_rl)) == 0:
+            if (
+                np.any(np.isnan(a_rl))
+                or np.any(np.isinf(a_rl))
+                or np.sum(np.abs(a_rl)) == 0
+            ):
                 # Fallback to uniform distribution
                 a_rl = np.ones(len(a_rl)) / len(a_rl) * unwrapped_env.bound_flag
             else:
@@ -688,51 +966,77 @@ class TD3Controller(OffPolicyAlgorithm):
             num_collected_steps += 1
 
             if self.verbose >= 1:
-                _log_rollout_status(self.num_timesteps, self._episode_num, num_collected_steps)
+                _log_rollout_status(
+                    self.num_timesteps, self._episode_num, num_collected_steps
+                )
 
             # Debug: Log dones to track episode end detection
-            dones_has_true = any(dones) if hasattr(dones, '__iter__') else bool(dones)
+            dones_has_true = any(dones) if hasattr(dones, "__iter__") else bool(dones)
             if self.verbose >= 1 and dones_has_true:
-                _log_rollout(f"[ROLLOUT] Episode end detected! dones={dones}, type={type(dones)}, shape={dones.shape if hasattr(dones, 'shape') else 'no shape'}, num_collected_episodes before={num_collected_episodes}, timesteps={self.num_timesteps}")
+                _log_rollout(
+                    f"[ROLLOUT] Episode end detected! dones={dones}, type={type(dones)}, shape={dones.shape if hasattr(dones, 'shape') else 'no shape'}, num_collected_episodes before={num_collected_episodes}, timesteps={self.num_timesteps}"
+                )
                 # Log individual done flags
-                if hasattr(dones, '__iter__') and not isinstance(dones, (str, bytes)):
+                if hasattr(dones, "__iter__") and not isinstance(dones, (str, bytes)):
                     for i, done_flag in enumerate(dones):
                         _log_rollout(f"[ROLLOUT]   dones[{i}] = {done_flag}")
                 else:
                     _log_rollout(f"[ROLLOUT]   dones value = {dones}")
 
             # Check if we've reached total timesteps - stop immediately to prevent extra steps
-            if hasattr(self, '_total_timesteps') and self._total_timesteps is not None:
+            if hasattr(self, "_total_timesteps") and self._total_timesteps is not None:
                 if self.num_timesteps >= self._total_timesteps:
                     if self.verbose >= 1:
-                        _log_rollout(f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping immediately")
+                        _log_rollout(
+                            f"[ROLLOUT] Reached total timesteps: {self.num_timesteps}/{self._total_timesteps}, stopping immediately"
+                        )
                     _finalize_rollout_line()
-                    return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
+                    return RolloutReturn(
+                        num_collected_steps * env.num_envs,
+                        num_collected_episodes,
+                        continue_training=False,
+                    )
 
             # Give access to local variables
             callback.update_locals(locals())
             # Only stop training if return value is False, not when it is None.
             if callback.on_step() is False:
                 _finalize_rollout_line()
-                return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
+                return RolloutReturn(
+                    num_collected_steps * env.num_envs,
+                    num_collected_episodes,
+                    continue_training=False,
+                )
 
             # Retrieve reward and episode length if using Monitor wrapper
             self._update_info_buffer(infos, dones)
 
             # Store data in replay buffer (normalized action and unnormalized observation)
-            self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos)
-            
+            self._store_transition(
+                replay_buffer, buffer_actions, new_obs, rewards, dones, infos
+            )
+
             # Log buffer size periodically
             if self.verbose >= 1 and num_collected_steps % 100 == 0:
-                buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
-                learning_starts = getattr(self, 'learning_starts', 100)
-                max_buffer_size = getattr(replay_buffer, 'max_size', None)
+                buffer_size = (
+                    replay_buffer.size()
+                    if hasattr(replay_buffer, "size")
+                    else len(replay_buffer)
+                )
+                learning_starts = getattr(self, "learning_starts", 100)
+                max_buffer_size = getattr(replay_buffer, "max_size", None)
                 if max_buffer_size is not None:
-                    _log_rollout(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{max_buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}")
+                    _log_rollout(
+                        f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size}/{max_buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}"
+                    )
                 else:
-                    _log_rollout(f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}")
+                    _log_rollout(
+                        f"[ROLLOUT] Step {num_collected_steps} | Buffer size: {buffer_size} (threshold: {learning_starts}) | Timesteps: {self.num_timesteps}"
+                    )
 
-            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+            self._update_current_progress_remaining(
+                self.num_timesteps, self._total_timesteps
+            )
 
             # For DQN, check if the target network should be updated
             # and update the exploration schedule
@@ -749,30 +1053,43 @@ class TD3Controller(OffPolicyAlgorithm):
                     episodes_ended += 1
 
                     if self.verbose >= 1:
-                        _log_rollout(f"[ROLLOUT] Episode {self._episode_num} completed! num_collected_episodes={num_collected_episodes}, train_freq={train_freq}, done_idx={idx}")
+                        _log_rollout(
+                            f"[ROLLOUT] Episode {self._episode_num} completed! num_collected_episodes={num_collected_episodes}, train_freq={train_freq}, done_idx={idx}"
+                        )
 
                     if action_noise is not None:
                         kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
                         action_noise.reset(**kwargs)
 
                     # Log training infos
-                    if log_interval is not None and self._episode_num % log_interval == 0:
+                    if (
+                        log_interval is not None
+                        and self._episode_num % log_interval == 0
+                    ):
                         # Mirror SB3 behaviour so TensorBoard/built-in logger still receives metrics
                         self.dump_logs()
 
             # Additional debug: Check if episodes were collected
             if self.verbose >= 1 and episodes_ended > 0:
-                _log_rollout(f"[ROLLOUT] Total episodes ended this step: {episodes_ended}, total collected: {num_collected_episodes}")
+                _log_rollout(
+                    f"[ROLLOUT] Total episodes ended this step: {episodes_ended}, total collected: {num_collected_episodes}"
+                )
         callback.on_rollout_end()
-        
+
         # Log rollout completion with buffer info
-        buffer_size = replay_buffer.size() if hasattr(replay_buffer, 'size') else len(replay_buffer)
-        learning_starts = getattr(self, 'learning_starts', 100)
+        buffer_size = (
+            replay_buffer.size()
+            if hasattr(replay_buffer, "size")
+            else len(replay_buffer)
+        )
+        learning_starts = getattr(self, "learning_starts", 100)
         warmup_phase = buffer_size < learning_starts
         if self.verbose >= 1:
             if warmup_phase:
                 if not getattr(self, "_warmup_notice_printed", False):
-                    _log_rollout(f"[ROLLOUT] Warm-up phase | Buffer size: {buffer_size}/{learning_starts} | Training disabled until buffer >= learning_starts")
+                    _log_rollout(
+                        f"[ROLLOUT] Warm-up phase | Buffer size: {buffer_size}/{learning_starts} | Training disabled until buffer >= learning_starts"
+                    )
                     self._warmup_notice_printed = True
             else:
                 self._warmup_notice_printed = False
@@ -790,8 +1107,13 @@ class TD3Controller(OffPolicyAlgorithm):
                 )
                 _log_rollout(rollout_summary)
                 if not should_train_flag:
-                    _log_rollout(f"[ROLLOUT] ❌ No training trigger (insufficient data for {train_freq.unit.name})")
+                    _log_rollout(
+                        f"[ROLLOUT] ❌ No training trigger (insufficient data for {train_freq.unit.name})"
+                    )
 
         _finalize_rollout_line()
-        return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
-        
+        return RolloutReturn(
+            num_collected_steps * env.num_envs,
+            num_collected_episodes,
+            continue_training,
+        )

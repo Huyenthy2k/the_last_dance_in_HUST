@@ -28,6 +28,11 @@ except ImportError:
         "Warning: TA-Lib not available. Using fallback implementations for technical indicators."
     )
 
+# Numba disabled to reduce memory usage during imports
+# DC features will be pre-computed during data preparation instead
+NUMBA_AVAILABLE = False
+_compute_dc_sequence_numba = None
+
 
 class MAFIAFeatureProcessor:
     """
@@ -50,6 +55,10 @@ class MAFIAFeatureProcessor:
         self.DC_thresholds = config.mafia_DC_thresholds  # [0.005, 0.01, 0.02]
         self.M_tech = config.mafia_M_tech  # 8 features for Technical agent
         self.M_dc = config.mafia_M_dc  # 5 features for DC agents
+        
+        # Cache for DC features to avoid redundant computation
+        # Key: (data_hash, threshold) -> Value: P_DC array
+        self._dc_cache = {}
 
     def process_technical_features(self, ochlv_data: np.ndarray) -> np.ndarray:
         """
@@ -193,6 +202,7 @@ class MAFIAFeatureProcessor:
             duration: (T_w,) - Days since last DC event
             event_flag: (T_w,) - 1.0 (DC event) or 0.5 (OS event)
         """
+        # Pure Python implementation (Numba disabled to save memory)
         T_w = len(close)
         state = np.zeros(T_w)
         magnitude = np.zeros(T_w)
@@ -200,42 +210,36 @@ class MAFIAFeatureProcessor:
         event_flag = np.zeros(T_w)
 
         # Initialize: start with upward trend
-        current_trend = 1  # +1 for up, -1 for down
-        current_extreme = close[0]  # Current extreme price (high for up, low for down)
-        event_price = close[0]  # Price at last DC event
-        event_time = 0  # Time of last DC event
+        current_trend = 1
+        current_extreme = close[0]
+        event_price = close[0]
+        event_time = 0
 
         state[0] = current_trend
         magnitude[0] = 0.0
         duration[0] = 0
-        event_flag[0] = 1.0  # First point is considered an event
+        event_flag[0] = 1.0
 
         for t in range(1, T_w):
-            if current_trend == 1:  # Upward trend
-                # Check for Downward DC
+            if current_trend == 1:
                 if close[t] <= current_extreme * (1 - threshold):
-                    # Downward DC event
                     current_trend = -1
                     current_extreme = close[t]
                     event_price = close[t]
                     event_time = t
                     event_flag[t] = 1.0
                 else:
-                    # Continue upward (OS - Overshoot)
                     if high[t] > current_extreme:
                         current_extreme = high[t]
                     event_flag[t] = 0.5
-            else:  # Downward trend
-                # Check for Upward DC
+            else:
                 if close[t] >= current_extreme * (1 + threshold):
-                    # Upward DC event
                     current_trend = 1
                     current_extreme = close[t]
                     event_price = close[t]
                     event_time = t
                     event_flag[t] = 1.0
                 else:
-                    # Continue downward (OS - Overshoot)
                     if low[t] < current_extreme:
                         current_extreme = low[t]
                     event_flag[t] = 0.5
@@ -327,22 +331,17 @@ class MAFIAFeatureProcessor:
 
         return result
 
-    def process_market_index_features(self, ochlv_data: np.ndarray, regime_feats: np.ndarray | None = None) -> np.ndarray:
+    def process_market_index_features(self, ochlv_data: np.ndarray) -> np.ndarray:
         """
         Process features for Market-index Agent (VNINDEX).
 
         Input: Raw OCHLV data for single asset (VNINDEX)
         - ochlv_data: (1, 5, T_w) where 5 = [open, close, high, low, volume]
-        - regime_feats: Optional (T_w, R) or (1, T_w, R) array of precomputed regime features
-          (percentiles/trend/tail) already aligned to this window. If provided as (R,), it will
-          be broadcast across T_w.
 
         Output: P_Mkt ∈ ℝ^(1 × T_w × M_mkt)
         - 5 features: Change of OHLCV (ΔO, ΔC, ΔH, ΔL, ΔV)
         - 3 features: SMA(20), RSI(14), ATR(14)
         - 11 extended features: MACD_hist, BB_width, Stoch_K, Stoch_D, ADX14, OBV, MFI14, CCI20, Vol_std20, Drawdown60, Regime_sma20_60
-        - Regime features (optional, appended): vol/drawdown percentiles, trend, ADX percentile,
-          autocorr, skew/kurtosis
 
         Args:
             ochlv_data: (1, 5, T_w) numpy array
@@ -362,42 +361,7 @@ class MAFIAFeatureProcessor:
         low_prices = ochlv_data[0, 3, :]  # (T_w,)
         volumes = ochlv_data[0, 4, :]  # (T_w,)
 
-        base_features = 19  # change(5) + basic(3) + extended(11)
-        extra_regime_dim = 0
-        regime_array = None
-        if regime_feats is not None:
-            regime_arr = np.array(regime_feats, dtype=np.float32)
-            # Accept shapes: (R,), (T_w, R), (1, T_w, R)
-            if regime_arr.ndim == 1:
-                regime_arr = np.tile(regime_arr.reshape(1, -1), (T_w, 1))
-            elif regime_arr.ndim == 2:
-                if regime_arr.shape[0] != T_w:
-                    # If provided with different time length, repeat last row/pad
-                    if regime_arr.shape[0] < T_w:
-                        last_row = regime_arr[-1:].copy()
-                        padding = np.tile(last_row, (T_w - regime_arr.shape[0], 1))
-                        regime_arr = np.vstack([regime_arr, padding])
-                    else:
-                        regime_arr = regime_arr[-T_w:]
-            elif regime_arr.ndim == 3:
-                # Expect (1, T_w, R)
-                regime_arr = regime_arr.reshape(-1, regime_arr.shape[-1])
-                if regime_arr.shape[0] < T_w:
-                    last_row = regime_arr[-1:].copy()
-                    padding = np.tile(last_row, (T_w - regime_arr.shape[0], 1))
-                    regime_arr = np.vstack([regime_arr, padding])
-                elif regime_arr.shape[0] > T_w:
-                    regime_arr = regime_arr[-T_w:]
-            else:
-                regime_arr = None
-            if regime_arr is not None:
-                regime_array = regime_arr.astype(np.float32)
-                extra_regime_dim = regime_array.shape[1]
-
-        M_mkt = base_features + extra_regime_dim
-        # Align config if needed to avoid shape mismatch downstream
-        if hasattr(self.config, "mafia_M_mkt"):
-            self.config.mafia_M_mkt = max(self.config.mafia_M_mkt, M_mkt)
+        M_mkt = getattr(self.config, "mafia_M_mkt", 19)  # change(5) + basic(3) + extended(11)
         P_Mkt = np.zeros((1, T_w, M_mkt), dtype=np.float32)
 
         # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV) - same as Technical Agent
@@ -547,9 +511,5 @@ class MAFIAFeatureProcessor:
         sma60 = pd.Series(close_prices).rolling(window=60, min_periods=1).mean().values
         regime = sma_20 - sma60
         P_Mkt[0, :, 18] = regime
-
-        # Append optional regime-aware features (percentiles/trend/tail)
-        if regime_array is not None and extra_regime_dim > 0:
-            P_Mkt[0, :, 19:19 + extra_regime_dim] = regime_array
 
         return P_Mkt.astype(np.float32)

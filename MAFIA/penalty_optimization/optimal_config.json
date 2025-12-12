@@ -1,0 +1,17 @@
+{
+  "total_samples": 512.0,
+  "rebalance_days": 42.0,
+  "rebalance_ratio": 0.08203125,
+  "avg_turnover_rate": 0.9404761739756362,
+  "avg_penalty_ratio": 0.2657808017754875,
+  "positive_advantage_ratio": 0.4375,
+  "avg_advantage": -0.0011532567673384554,
+  "total_raw_return": 4.380444500900916,
+  "total_net_reward": 3.1954445258743323,
+  "total_penalty": 1.1849999910593016,
+  "alpha_turnover": 0.01,
+  "alpha_change": 0.01,
+  "config_name": "alpha_t0.010_c0.010",
+  "composite_score": 0.453294814380999,
+  "error": NaN
+}

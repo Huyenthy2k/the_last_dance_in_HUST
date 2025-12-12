@@ -15,7 +15,9 @@ from RL_controller.compressed_replay_buffer import (
     CompressedReplayBuffer,
 )
 from RL_controller.TD3_controller import TD3PolicyOriginal
-from RL_controller.feature_extractors import MAFIAMultiModalExtractor
+from RL_controller.feature_extractors import (
+    MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
+)
 from stable_baselines3.common.utils import LinearSchedule
 
 
@@ -25,7 +27,7 @@ class Config:
         "cnn": "temporal_convolution",
         "lstm": "bidirectional_lstm",
     }
-    DEFAULT_GATING_MODE_ALIAS = "cnn"
+    DEFAULT_GATING_MODE_ALIAS = "lstm"
     DEFAULT_GATING_ENCODER = GATING_MODE_MAP[DEFAULT_GATING_MODE_ALIAS]
     GATING_MODE_DESCRIPTIONS = {
         "attentive": "Self-attention gating that weighs temporal embeddings via multi-head attention.",
@@ -33,13 +35,22 @@ class Config:
         "lstm": "Bidirectional LSTM gating that captures sequential dependencies.",
     }
 
-    def __init__(self, seed_num=2022, current_date=None):
+    def __init__(self, seed_num=2022, current_date=None, create_dirs=True):
+        """
+        Initialize Config.
+
+        Args:
+            seed_num: Random seed (default: 2022)
+            current_date: Override current date string (default: None, uses now())
+            create_dirs: If True, auto-create result directories (default: True)
+                        Set to False when using custom output paths (e.g., observer offline training)
+        """
         self.notes = "MAFIA Implementation - MAFIA-only (Legacy models removed)"
 
         # MAFIA-only configuration (Legacy TD3-only and old MASA variants removed)
         self.benchmark_algo = "TD3-PR"  # TD3 Profit-Risk optimization
         self.market_name = "VNINDEX"  # Financial Index: 'DJIA', 'SP500', 'CSI300'
-        self.topK = 15  # Number of assets in a portfolio (10, 20, 30)
+        self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
         self.num_epochs = 50  # episodes for convergence
 
         # MAFIA configuration (fixed)
@@ -57,16 +68,53 @@ class Config:
         self.mafia_use_gumbel_topk = (
             False  # Disable Gumbel-TopK, pass raw market vector to RL
         )
-        self.mafia_top_k = 15
-        self.mafia_gumbel_temperature = 1.0
+        self.mafia_top_k = 10
+        self.mafia_gumbel_temperature = 1.0  # Training init temperature
+        self.mafia_gumbel_temp_inference = (
+            0.1  # Inference temperature (sharper decisions)
+        )
+        self.mafia_gumbel_temp_min = 0.1  # Minimum temperature after decay
+        self.mafia_gumbel_temp_decay = (
+            0.99  # Decay rate per episode: temp = max(min, init * decay^episode)
+        )
         self.mafia_hard_topk_inference = True  # use hard Top-K at eval
         self.mafia_include_risk_boundary_in_state = True
-        # MAFIA state mode: 'compact' (Top-K market_vector) or 'full-score' (full market_scores_full)
-        # 'compact': Observer chọn Top-K → State có Top-K → RL tự động nhận Top-K từ Observer (state)
-        # 'full-score': Observer đưa ra Full N stocks → State có market_scores_full → RL tự động tự quyết Top-K từ market_scores_full
-        self.mafia_state_mode = (
-            "full-score"  # Pass full market scores directly to RL agent
+        # Live display (can be re-enabled with env: MAFIA_USE_LIVE_DISPLAY=1)
+        env_live_display = os.environ.get("MAFIA_USE_LIVE_DISPLAY")
+        if env_live_display is None:
+            self.use_live_display = False
+        else:
+            self.use_live_display = env_live_display.strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+        # Observer Pretrain Configuration
+        # Pretrain uses mini-epochs (each = observer_mini_epoch_steps = 126 steps)
+        # After pretrain, Observer is ALWAYS frozen (Static Expert mode)
+        # Note: 3 mini-epochs = 378 steps > observer_warmup_samples (300)
+        # This ensures at least one training happens during pretrain
+        self.mafia_pretrain_mini_epochs = (
+            3  # Number of observer-only mini-epochs before TD3 (window 0 only)
         )
+        # Observer training flag
+        # - True: Only during pretrain phase (set automatically by entrance.py)
+        # - False: After pretrain, Observer frozen as "Static Expert"
+        self.mafia_allow_observer_training = False
+        # Warmup: Minimum samples to collect before first Observer training update
+        # Observer will skip training until buffer has >= this many samples
+        self.observer_warmup_samples = 300
+        # Observer sequence sampling: train on contiguous mini-batch with random start
+        # Set >0 to sample a window of this length from observer buffers at each train()
+        self.observer_seq_len = 128  # window length T_m (days); 0 = use full buffer
+        self.observer_seq_sampling = "random"  # options: "random", "recent"
+        # Trajectory configuration (Spec §6)
+        self.mafia_trajectory_length = 128  # T_m for on-policy batch segments
+        self.mafia_sampling_strategy = "random_trajectory"  # or "recent_trajectory"
+        # MAFIA state mode: 'compact' (Top-K market_vector) or 'full-score' (full market_scores_full)
+        # Top-K only: Observer chọn Top-K → State có Top-K → RL tối ưu trên Top-K (full-universe mode bị vô hiệu hóa)
+        self.mafia_state_mode = "compact"
 
         # RL Top-K selection method (only used in 'full-score' mode)
         # In 'compact' mode: RL automatically uses Top-K from Observer (no selection needed)
@@ -81,8 +129,7 @@ class Config:
             False  # If True, CBF uses market_scores_full as prior
         )
         self.mafia_cbf_prior_weight = 0.3  # Weight for prior distribution (0.0-1.0)
-        # Allow RL to output full-universe weights (skip Top-K masking); controller will consume full vector
-        # Default False to keep RL selecting Top-K and avoid covariance mismatch vs K
+        # Legacy flag (disabled): RL full-universe weights không còn được hỗ trợ, luôn dùng Top-K từ Observer
         self.mafia_action_full_universe = False
         # Solver: in 'full-score' mode, restrict optimization to RL-selected Top-K only (zero others)
         # Default True to keep optimization aligned to RL Top-K
@@ -91,8 +138,6 @@ class Config:
         self.risk_bound_warmup_steps = 30
         self.risk_bound_is_annualized = False  # Set True if observer outputs annualized sigma; will be scaled to daily
         self.risk_bound_minvar_eps = 0.0  # Safety margin when kẹp bound to min_var_K (risk_bound = max(bound, min_var_K*(1+eps)))
-        # Risk-bound handling: number of steps to ignore direction logits and use continuous risk/safe defaults
-        self.risk_bound_warmup_steps = 30
 
         # Solver boost behavior (only active in 'full-score' mode when RL has selected Top-K)
         # In 'full-score' mode: Solver can boost stocks already selected by RL, or keep original logic
@@ -118,8 +163,59 @@ class Config:
         # Reward weights (tuned via quick Optuna on mini window)
         self.lambda_1 = 500  # return reward weight
         self.lambda_2 = 30  # Tăng λ₂ nghĩa là phạt nặng hơn khi RL khác xa controller → khuyến khích RL bám sát/quy phục hành động của controller (ít lệch, ít “liều” theo hướng riêng), thường dẫn đến phân bổ ổn định hơn và ít turnover thay đổi mạnh.
+        # Nếu True: bỏ phạt turnover/change khỏi reward (chỉ dùng khi muốn RL thuần lợi nhuận + JS)
+        self.rl_reward_disable_turnover_change = True
         # Encourage diversified actions (entropy regularizer on policy output)
         self.entropy_coef = 0.2  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
+        # Policy Gradient horizon for observer PG loss (Top-K compounding window)
+        self.mafia_pg_reward_horizon = (
+            14  # Increased from 1 to learn longer-term patterns
+        )
+        # PG reward shaping penalties (Top-K turnover & membership change)
+        # Penalty coefficients (stronger to stand against reward scaling=100)
+        self.mafia_pg_alpha_turnover = 0.2  # Turnover penalty coefficient
+        self.mafia_pg_alpha_change = 0.1  # Membership change penalty coefficient
+        # Direction label generation (future-based)
+        self.direction_label_lookahead = 14  # k days ahead for R_fut
+        self.direction_label_delta = (
+            0.025  # symmetric threshold δ (default 2.5%) - used in online mode
+        )
+
+        # Dynamic Threshold for Direction Labeling (Spec §5.1.3)
+        # Used in offline batch training for adaptive thresholding based on market volatility
+        # δ_t = max(δ_min, k_atr * ATR_14 / P_t)
+        # Optimized based on VNINDEX analysis: ATR/Price mean=1.4%, IntraDD P10=-8.5%
+        self.direction_label_atr_period = 14  # ATR window (days)
+        self.direction_label_atr_multiplier = 2.0  # k_atr: ATR multiplier (2σ margin)
+        self.direction_label_delta_min = 0.020  # δ_min: minimum threshold (2.0%)
+        self.direction_label_stop_loss = -0.07  # IntraDD threshold (-7%, P10)
+
+        # ============================================================
+        # Regime Shift Detection Thresholds (Spec Section 8)
+        # Calibrated from VNINDEX statistics (2015-2025, 2709 trading days)
+        # ============================================================
+        # Enable regime shift detection in training & inference
+        self.enable_regime_shift_detection = (
+            True  # Master switch for regime shift logic
+        )
+
+        # Trigger 1: Direction Reversal (Bull <-> Bear confirmed over N days)
+        self.regime_confirmation_window = 3  # N-day confirmation for direction reversal
+        self.regime_trend_z_threshold = 1.0  # minimum |Z_trend| to confirm reversal
+
+        # Trigger 2: Volatility Shock (V_curr > mu + k*sigma)
+        self.regime_vol_window = 20  # window for realized volatility
+        self.regime_vol_k = (
+            3.0  # k * std for volatility shock (captures ~1% extreme events)
+        )
+
+        # Trigger 3: Structural Break (Downward DC at major threshold)
+        self.regime_dc_threshold_pct = (
+            0.02  # DC trigger threshold on index (2%) - Spec 8.2 Major Reversal
+        )
+
+        # Legacy threshold (for backward compatibility)
+        self.regime_shift_threshold = 0.2  # General regime shift detection threshold
         self.controller_reg_lambda = 1.5  # λ_reg: controller regularization weight ||x - a_RL||^2,  λ_reg lớn → bám sát RL, nhỏ → cho solver chỉnh mạnh hơn
         self.controller_observer_bias_weight = (
             0.3  # α: scales observer signal when forming linear bias q
@@ -139,12 +235,208 @@ class Config:
         # Debug: log reward components for first N train steps (0 = disable)
         self.reward_debug_steps = 30
         self.train_freq = [1, "step"]  # Update every trading step
-        self.risk_default = 0.015
-        self.risk_hold_bound = 0.0225  # sideways
-        self.risk_up_bound = 0.0290  # bull
-        self.risk_down_bound = 0.0205  # bear
+        # Risk tolerance factors (eta): relative multipliers on baseline sigma (Top-K)
+        self.risk_eta_default = 1.0
+        self.risk_eta_hold = 1.0  # sideways
+        self.risk_eta_up = 1.3  # bull
+        self.risk_eta_down = 0.7  # bear
+        # Supervised eta label generation (lookback/lookahead)
+        self.risk_eta_label_lookback = 60
+        self.risk_eta_lookahead = 14  # Default 14 days lookahead for eta target
+        self.risk_eta_label_epsilon = 1e-6
+        # S_risk: Scaling factor for MSE (amplify gradient)
+        # L_risk (MSE) ≈ 0.01, need to scale up to match L_selection (~1.0) and L_direction (~1.0)
+        # With scale=10.0: L_risk contribution ≈ 0.01 × 10 = 0.1 (balanced)
+        self.scale_factor_risk = 10.0
+        # S_reward: Scaling factor for PG Reward (amplify Advantage gradient)
+        # Raw compounding returns ~0.01, scale to ~1.0 for stable gradients
+        self.scale_factor_reward = 100.0
+        # Continuous eta mapping (tanh over market index z-score)
+        self.risk_eta_window = 30
+        self.risk_eta_lambda = 0.3  # eta in [1-λ, 1+λ] => [0.7, 1.3]
+        self.risk_eta_sensitivity = 1.0
+        # MaxDD Penalty for Hybrid eta_target (spec 5.1.2)
+        self.risk_eta_lambda_dd = 0.5  # Drawdown penalty weight
+        self.risk_eta_dd_ref = 0.10  # Reference drawdown (10%)
+        # Observer eta scaling (tanh-based, clipped)
+        # FIX: Expanded range to match target eta range [0.1, 2.0]
+        # Target eta formula: eta = 1.0 + lambda_val*tanh(z) - lambda_dd*clip(dd/ref,0,1)
+        # With lambda_val=0.3, lambda_dd=0.5 => raw range [0.2, 1.3], clipped to [0.1, 2.0]
+        # Predicted must cover same range for proper correlation
+        self.mafia_eta_base = 1.05  # Center of [0.1, 2.0]
+        self.mafia_eta_amplitude = 0.95  # (2.0 - 0.1) / 2 = 0.95
+        self.mafia_eta_min = 0.1
+        self.mafia_eta_max = 2.0
+        # Legacy aliases maintained for backward compatibility
+        self.risk_default = self.risk_eta_default
+        self.risk_hold_bound = self.risk_eta_hold
+        self.risk_up_bound = self.risk_eta_up
+        self.risk_down_bound = self.risk_eta_down
         # Smooth risk_bound over time to avoid abrupt jumps that cause large controller moves (0 = no smoothing)
-        self.risk_bound_smoothing_alpha = 0.5
+        self.risk_bound_smoothing_alpha = 0.0
+
+        # ============================================================
+        # Portfolio Allocator (TD3) Configuration
+        # Per spec: Porfolio_allocator_spec.md Section 11
+        # ============================================================
+
+        # Enable new 2-component reward function (log return + JS divergence)
+        self.use_portfolio_allocator_reward = True
+
+        # Reward weights
+        self.allocator_return_weight = 1.0  # w_return: weight for log return component
+        self.allocator_lambda_js = (
+            0.1  # λ_js: Jensen-Shannon divergence penalty [0.05, 0.2]
+        )
+        # Reward scaling: amplifies reward signal for stronger gradients
+        # Daily log returns are tiny (~0.001), scaling helps TD3 learn faster
+        # Recommended range: [10, 100], default 100 to bring rewards to ~0.1 scale
+        self.allocator_reward_scale = 100.0
+        self.allocator_reward_norm_alpha = (
+            0.01  # EMA coefficient for reward normalization
+        )
+
+        # Learning rates (spec defaults)
+        self.allocator_learning_rate_actor = 1e-4
+        self.allocator_learning_rate_critic = 1e-3
+
+        # TD3 hyperparameters (aligned with SB3 defaults per spec)
+        self.allocator_discount_gamma = 0.99  # γ: discount factor
+        self.allocator_polyak_tau = 0.005  # τ: target network update rate
+        self.allocator_policy_delay = 2  # d: update actor every d critic updates
+
+        # Training parameters
+        self.allocator_batch_size = 128  # Mini-batch size (spec: 64-256)
+        self.allocator_replay_buffer_size = 100000  # Replay buffer capacity
+        self.allocator_warmup_steps = (
+            5000  # Steps before training begins (spec: 1000-5000)
+        )
+        self.allocator_exploration_noise_std = 0.1  # Exploration noise std
+
+        # Architecture dimensions
+        self.allocator_feature_hidden_dim = 128  # Feature extractor hidden dim
+        self.allocator_actor_hidden_dim = 256  # Actor network hidden dim
+        self.allocator_critic_hidden_dim = 256  # Critic network hidden dim
+        self.allocator_gradient_clip = 1.0  # Gradient clipping threshold
+
+        # Feature extractor output dimension (D_hidden per spec Section 3.4)
+        self.rl_features_dim = 256
+
+        # State configuration (per spec Section 3)
+        # History buffer features: portfolio_return, rl_last_action, rl_last_turnover, cbf_adjustment
+        self.rl_obs_history_features = [
+            "portfolio_return",
+            "rl_last_action",
+            "rl_last_turnover",
+            "cbf_adjustment",
+        ]
+        self.rl_obs_history_len = 5  # Number of historical steps in state
+
+        # Global context scalar features (per spec Section 3.4)
+        # Includes Contextual Awareness Features: time_decay, relative_alpha, risk_violation
+        # Plus Rebalance Signals for TD3 to learn distinct policies
+        self.rl_obs_global_scalars = [
+            "log_capital",
+            "last_turnover",
+            "drawdown",
+            "time_decay",  # τ_decay: days_since_rebalance / rebalance_interval ∈ [0, 1]
+            "relative_alpha",  # α_rel: R_portfolio - R_topk_avg (Credit Assignment)
+            "risk_violation",  # δ_risk: max(0, σ(a^RL) - σ_target) (Risk Violation Diagnostic)
+            # Rebalance Signals: TD3 can learn different policies for each type
+            "is_rebalance_scheduled",  # 1.0 = scheduled rebalance (every N days), 0.0 = hold
+            "is_rebalance_regime",  # 1.0 = regime shift triggered rebalance, 0.0 = no regime shift
+        ]
+
+        # ============================================================
+        # Walk-Forward Training Configuration
+        # Separates Observer pre-training from RL training
+        # Phase 1: Train Observer → Save observer_best.pth
+        # Phase 2: RL Training with frozen Observer ("Static Expert")
+        # NOTE: NO COMBINED MODE! Observer and TD3 NEVER train together!
+        # ============================================================
+
+        # Training phase indicator (1 = Observer, 2 = TD3)
+        # Phase 1: Observer training, TD3 frozen (uniform weights)
+        # Phase 2: TD3 training, Observer frozen (Static Expert)
+        self.training_phase = 2  # Default: Phase 2 (TD3 training)
+
+        # Training mode for display (derived from training_phase)
+        # "OBSERVER_ONLY" for Phase 1, "RL_ONLY" for Phase 2
+        self.training_mode = "RL_ONLY"  # Default: Phase 2
+
+        # Observer-only training mode (Phase 1)
+        # Set to True only when running Phase 1 (train_separated.py --phase 1)
+        self.observer_only_training = False  # Default: Phase 2 (TD3 training)
+
+        # Pre-trained observer checkpoint path (Phase 2)
+        # REQUIRED for Phase 2 - loads this checkpoint and freezes observer
+        self.observer_pretrained_path = None  # Set path to observer_best.pth
+
+        # Freeze observer during RL training (Phase 2) - DEFAULT ENABLED
+        # Observer acts as "Static Expert" - only provides Top-K, risk_eta, direction
+        self.freeze_observer_during_rl = True  # Separated training by default
+
+        # Walk-forward iteration settings
+        self.walkforward_iteration = (
+            0  # 0 = base training (from scratch), 1+ = finetune
+        )
+        self.walkforward_train_start_year = 2015  # Expanding window start
+        self.walkforward_train_end_year = None  # Set dynamically per iteration
+        self.walkforward_valid_year = None  # Validation year (same as train_end)
+        self.walkforward_infer_year = None  # Inference year (train_end + 1)
+
+        # Epoch schedule (varies by iteration)
+        self.walkforward_base_epochs = 50  # Iteration 0: train from scratch
+        self.walkforward_finetune_epochs = 20  # Iteration 1+: finetune
+        self.walkforward_base_lr = 1e-4  # Base learning rate
+        self.walkforward_finetune_lr = 1e-5  # Finetune learning rate
+        self.walkforward_base_patience = 15  # Early stopping patience (base)
+        self.walkforward_finetune_patience = 5  # Early stopping patience (finetune)
+
+        # Composite score weights for checkpoint selection
+        # Score = w_sharpe × SR + w_ic × IC + w_f1 × F1
+        self.walkforward_score_w_sharpe = 0.5  # Top-K Sharpe Ratio weight
+        self.walkforward_score_w_ic = 0.3  # Information Coefficient weight
+        self.walkforward_score_w_f1 = 0.2  # Direction F1-Macro weight
+
+        # ============================================================
+        # Expanding Window Mode Configuration (New Training Paradigm)
+        # ============================================================
+        # Timeline per iteration:
+        #   Iter 1: Train[01/2015 → 06/2017] → Valid[07/2017 → 12/2017] → Infer[2018]
+        #   Iter 2: Train[01/2015 → 06/2018] → Valid[07/2018 → 12/2018] → Infer[2019]
+        #   ...
+        # Key differences from Sliding Window:
+        #   - Train start is FIXED (expanding_train_start)
+        #   - Train end EXPANDS each iteration
+        #   - Each iteration loads checkpoint from previous iteration (finetune)
+        # ============================================================
+
+        # Enable Expanding Window mode (False = use traditional Sliding Window)
+        self.expanding_window_mode = True
+
+        # Fixed training start date (Expanding Window only)
+        self.expanding_train_start = "2015-01-01"
+
+        # Validation period: 6 months at end of train year (07-12)
+        self.expanding_valid_months = 6
+
+        # Save inference states for downstream RL training
+        self.save_inference_states = True
+
+        # Finetune settings (applied when loading checkpoint from previous iteration)
+        # Iter 1 trains from scratch, Iter 2+ finetunes from Ckpt_Best_{Year-1}
+        self.finetune_epoch_factor = (
+            0.4  # epochs = base_epochs * factor (e.g., 50 * 0.4 = 20)
+        )
+        self.finetune_lr_factor = 0.1  # lr = base_lr * factor (e.g., 1e-4 * 0.1 = 1e-5)
+
+        # Rebalance interval for selection head training (days)
+        self.topk_rebalance_interval = 14  # Selection Head update every 14 days
+
+        # Output directories for walk-forward artifacts
+        self.walkforward_checkpoint_dir = None  # Directory for observer checkpoints
+        self.walkforward_states_dir = None  # Directory for pre-computed RL states
 
         self.period_mode = 1
         self.tmp_name = "Cls3_{}_{}_K{}_M{}_{}_{}".format(
@@ -161,10 +453,22 @@ class Config:
         # Data file configuration - can specify custom file names or use None for auto-detection
         # If None, will use pattern: {market_name}_{topK}_{freq}.csv
         # Set to a specific filename to use that file from the data directory
-        # Example: self.stock_data_file = 'stock_prices_all_20251108_234851.csv'
+        # Available filtered datasets:
+        #   - stock_data_top23.csv (23 blue-chip stocks, ADV > 300B, recommended for 16GB RAM)
+        #   - stock_data_top143.csv or stock_data_dynamic143.csv (143 stocks, ADV > 5B, needs 32GB+ RAM)
+        #   - stock_prices_all_20251108_234851.csv (235 stocks, full dataset, needs 64GB+ RAM)
         self.stock_data_file = (
-            "stock_prices_all_20251108_234851.csv"  # Set to None for auto-detection
+            "stock_data_dynamic143.csv"  # Use top 23 stocks for Mac 16GB
         )
+        # Data quality guards
+        self.mafia_price_floor = 1e-6  # Replace zero/negative prices with ffill/bfill
+        self.mafia_extreme_return_threshold = (
+            10.0  # |return| > threshold is treated as anomaly before clipping
+        )
+        self.mafia_return_clip_min = (
+            -0.5
+        )  # Post-clean clip bounds (matches PG reward safety)
+        self.mafia_return_clip_max = 1.0
         self.index_data_file = "VNINDEX_1d_index.csv"  # Optional: 'DJIA_1d_index.csv' or None. If None, market features will be generated from stock data
         self.pricePredModel = "MA"
         self.cov_lookback = 30
@@ -173,6 +477,30 @@ class Config:
             100  # Drop stocks with > this number of zero-volume days
         )
         self.rebalance_interval = 1  # Days between portfolio rebalances
+        # Scheduler: decouple Top-K refresh cadence from daily eta updates
+        # Top-K/market-direction refreshed on rebalance window or regime-shift trigger
+        self.mafia_topk_rebalance_interval = int(
+            os.environ.get(
+                "MAFIA_TOPK_REBALANCE_INTERVAL", 10
+            )  # Changed from 15 to 10 days
+        )
+        # Eta/risk calibration tick (env step granularity); keep daily by default
+        self.mafia_eta_update_interval = 1
+        # Allow regime detector to force early rebalance outside fixed cadence
+        self.mafia_enable_regime_force_rebalance = True
+        # Verbose scheduler/regime logs on terminal during training
+        # Set to True for debugging, False for clean output
+        self.mafia_log_scheduler = (
+            False  # [SCHEDULER] hold status logs (separate lines)
+        )
+        self.mafia_log_eta = False  # [RISK-ETA] risk boundary logs (separate lines)
+        self.mafia_log_reward = (
+            False  # [PA-REWARD] reward component logs (separate lines)
+        )
+        # Single-line realtime status (recommended for monitoring)
+        self.mafia_log_realtime = (
+            True  # [ENV-STATUS] all-in-one realtime status on 1 line
+        )
 
         if self.mode == "Benchmark":
             self.trained_best_model_type = "max_capital"
@@ -184,13 +512,14 @@ class Config:
                     )
                 )
 
-        self.default_risk_market = (
-            0.001  # Default fallback for market risk (\Sigma_beta)
-        )
+        # Default fallback for market risk (\Sigma_beta): 18% annual vol -> daily sigma
+        self.default_risk_market = 0.18 / np.sqrt(252)
         self.cbf_gamma = 0.7
+        # Blend factor for observer risk bound vs min-variance bound in CBF solver
+        self.risk_bound_alpha = 0.7
         # Observer mini-epochs: train observer more frequently and reset its buffers to save memory
         self.observer_mini_epoch_steps = (
-            252  # Set to 0 to disable mid-epoch observer training
+            126  # 0.5 epoch mini-epochs (126 steps for 252 trading days/year)
         )
         # TD3 config
         self.reward_scaling = 1
@@ -216,6 +545,12 @@ class Config:
         self.last_td3_updates = 0
         self.last_mafia_loss = None
         self.last_mafia_direction_loss = None
+        self.last_mafia_eta_loss = None
+        self.last_mafia_eta_mae = None
+        self.last_mafia_pg_loss = None
+        self.last_mafia_eta_pred = 1.0
+        self.last_mafia_dir_pred = "FLAT"
+        self.last_mafia_dir_conf = 0.0
 
         if current_date is None:
             self.cur_datetime = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
@@ -230,17 +565,20 @@ class Config:
             "{}-{}".format(self.market_name, self.topK),
             self.cur_datetime,
         )
-        os.makedirs(self.res_dir, exist_ok=True)
         self.res_model_dir = os.path.join(self.res_dir, "model")
-        os.makedirs(self.res_model_dir, exist_ok=True)
         self.res_img_dir = os.path.join(self.res_dir, "graph")
-        os.makedirs(self.res_img_dir, exist_ok=True)
         self.metrics_history_path = os.path.join(self.res_dir, "metrics_history.csv")
         self.run_manifest_path = os.path.join(self.res_dir, "run_manifest.json")
 
         # Checkpoint configuration
         self.checkpoint_dir = os.path.join(self.res_dir, "checkpoints")
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # Only create directories if requested (avoid creating unwanted TD3 dirs during observer training)
+        if create_dirs:
+            os.makedirs(self.res_dir, exist_ok=True)
+            os.makedirs(self.res_model_dir, exist_ok=True)
+            os.makedirs(self.res_img_dir, exist_ok=True)
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.checkpoint_freq = 1  # Save checkpoint every N epochs (0 to disable)
         self.validation_freq = (
             1  # Run validation every N epochs (test runs only at final epoch)
@@ -253,8 +591,6 @@ class Config:
         self.partial_checkpoint_steps = (
             0  # Disable step-based checkpoints; only save per epoch/best_valid
         )
-        # Early stopping based on validation Sharpe (patience in epochs)
-        self.early_stop_patience = None
         self.resume_from_checkpoint = None  # Path to checkpoint to resume from (None to start fresh or use auto_resume)
         self.auto_resume_from_latest = True  # Auto-resume from latest checkpoint if exists (when resume_from_checkpoint is None)
         self.enable_checkpoint_cleanup = (
@@ -264,30 +600,72 @@ class Config:
             1  # Applies to both epoch and step checkpoints when cleanup enabled
         )
         # On resume: only load model weights/observer; skip replay buffer to avoid stale/overlapping samples
-        self.reset_replay_buffer_on_resume = True
+        self.reset_replay_buffer_on_resume = False
+
+        # Walk-forward buffer filtering: filter buffer to keep only experiences
+        # within the new window's train period instead of full reset.
+        # This retains overlapping experiences (e.g., with step_years=1, 2/3 of experiences
+        # from previous window may still be valid for new window's train period).
+        # Set to True to enable smart filtering; False to use reset_replay_buffer_on_resume behavior.
+        self.filter_replay_buffer_on_resume = True
+
+        # Priority sampling for regime shift experiences in replay buffer.
+        # Fraction of each batch to sample from regime shift experiences (if available).
+        # Default 0.20 = 20% of batch. Set to 0 to disable priority sampling.
+        # This prevents "catastrophic forgetting" of rare crisis patterns.
+        self.regime_shift_sample_ratio = 0.20
+
+        # Skip observer pretrain when resuming from checkpoint (walk-forward chaining).
+        # When True: Observer already has learned weights from previous window, skip warmup.
+        # When False: Always run pretrain epochs even when resuming.
+        self.skip_pretrain_on_resume = True
+
+        # Reset LR scheduler when resuming from checkpoint for new window.
+        # When True: LR starts fresh from initial learning rate (recommended for walk-forward).
+        # When False: LR continues from where it left off in previous window.
+        self.reset_lr_scheduler_on_resume = True
+
         self.save_replay_buffer_on_step_checkpoints = (
             False  # Skip 3GB+ replay buffer for frequent step checkpoints
         )
         self.save_replay_buffer_on_epoch_checkpoints = (
             True  # Save replay buffer on epoch checkpoints (uses float16 compression)
         )
-        # Early stopping (validation-based)
-        self.early_stop_patience = 3
-        self.early_stop_min_delta = 0.02
-        self.early_stop_warmup = 3
-        self.early_stop_metric = "sharpeRatio"  # fallback to reward_sum if missing
+        # Early stopping (validation-based): stop if no improvement for N epochs
+        self.early_stop_patience = 10  # Stop after 10 epochs without improvement
+        self.early_stop_min_delta = 0.01  # Minimum improvement threshold
+        self.early_stop_warmup = 2  # Start checking after 2 epochs
+        self.early_stop_metric = (
+            "sharpeRatio"  # Metric to monitor (fallback to reward_sum if missing)
+        )
         self.tradeDays_per_year = 252
         self.tradeDays_per_month = 21
         self.seed_num = seed_num
         self._market_risk_warned_insufficient = False
+
+        # LiveDisplay configuration (real-time terminal updates)
+        # Set to False to disable LiveDisplay and use legacy print-based logging
+        self.use_live_display = True  # Default disabled until fully tested
+
+        # Web Dashboard configuration (replaces terminal display for stable layout)
+        # Set to True to enable web-based dashboard at http://localhost:5050
+        # This provides a stable layout without terminal ANSI code issues
+        self.use_web_dashboard = True  # Default disabled, set True to enable
+        self.dashboard_port = 5050  # Web dashboard port
+        self.dashboard_open_browser = True  # Auto-open browser when dashboard starts
+
+        # TD3 Training Window Configuration (Phase 2)
+        # Train: 2018-2022 (5 years single window)
+        # Valid: 2023-2024 (2 years)
+        # Test: 2025 (1 year - final evaluation)
         date_split_dict = {
             1: {
-                "train_date_start": "2017-01-03 00:00:00",
-                "train_date_end": "2021-12-31 23:59:59",
-                "valid_date_start": "2022-01-01 00:00:00",
-                "valid_date_end": "2023-12-31 23:59:59",
-                "test_date_start": "2024-01-01 00:00:00",
-                "test_date_end": "2025-11-06 23:59:59",
+                "train_date_start": "2018-01-02 00:00:00",
+                "train_date_end": "2022-12-30 23:59:59",
+                "valid_date_start": "2023-01-02 00:00:00",
+                "valid_date_end": "2024-12-31 23:59:59",
+                "test_date_start": "2025-01-02 00:00:00",
+                "test_date_end": "2025-12-31 23:59:59",
             },
         }
 
@@ -322,8 +700,8 @@ class Config:
             self.test_date_start = None
             self.test_date_end = None
 
-        # Compute market risk using data available up to the end of the training period to avoid look-ahead bias
-        self.risk_market = self._compute_market_risk(cutoff_date=self.train_date_end)
+        # Use a fixed fallback for market risk (observer will emit dynamic bounds)
+        self.risk_market = self.default_risk_market
         self._calibrate_risk_bounds()
 
         self.tech_indicator_talib_lst = ["SMA", "RSI", "ATR"]
@@ -395,23 +773,11 @@ class Config:
         self.mafia_encoder_heads = 4  # Number of attention heads
         self.mafia_M_tech = 8  # Features for Technical agent (5 OCHLV + 3 indicators)
         self.mafia_M_dc = 5  # Features for DC agents
-        # Market-index agent features:
-        # 5 change + 3 basic + 11 extended + 10 regime features (percentiles/trend/tail)
-        self.mafia_M_mkt = 29
-        # Regime feature list for market index (used by observer and RL global context)
-        self.mafia_regime_feature_names = [
-            "vol_pct_252",
-            "vol_pct_756",
-            "dd_pct_252",
-            "dd_pct_756",
-            "ma20_ma200_diff",
-            "adx_pct_252",
-            "autocorr_ret_60",
-            "autocorr_ret_120",
-            "skew20",
-            "kurt20",
-        ]
-        self.mafia_regime_dim = len(self.mafia_regime_feature_names)
+        # Market-index agent features: only 19 base kênh (ΔOHLCV + indicator set), không dùng regime append
+        self.mafia_M_mkt = 19
+        # Regime features removed from market-index agent
+        self.mafia_regime_feature_names = []
+        self.mafia_regime_dim = 0
         self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
         # Match TD3-style LR schedule for observer (linear decay)
         self.mafia_lr_schedule = (
@@ -429,12 +795,117 @@ class Config:
             1.0  # Weight for market direction classification loss
         )
 
+        # ===== Offline Batch Training Configuration (Spec §6) =====
+        # Training Duration per Iteration
+        self.mafia_observer_base_epochs = 50  # Base training (iter 0) epochs
+        self.mafia_observer_finetune_epochs = 20  # Finetune (iter > 0) epochs
+        # Steps per epoch: auto-computed as ceil((Len(Data) - T_m - h) / Batch_Size)
+        # No manual override needed; calculated dynamically per dataset
+
+        # Trajectory Configuration (Spec §6)
+        self.mafia_trajectory_length = 128  # T_m: trajectory length
+        self.mafia_batch_size = 32  # B: batch size for random trajectory sampling
+        self.mafia_sampling_strategy = (
+            "random_trajectory"  # "random_trajectory" or "recent_trajectory"
+        )
+        self.mafia_use_class_balanced_sampling = True  # Enable stratified sampling by direction class (helps Bear recall)
+
+        # ===== Memory Optimization Configuration =====
+        # Mixed Precision Training (FP16)
+        # Reduces VRAM usage by ~50% with minimal accuracy impact
+        self.use_mixed_precision = True  # Enable automatic mixed precision (AMP)
+
+        # Gradient Accumulation
+        # Accumulate gradients over N microbatches before optimizer step
+        # Allows using smaller batch sizes while maintaining effective large batch training
+        # Reduces RAM usage by ~70% (can use batch_size=8 instead of 32)
+        # NOTE: Set to 1 for faster iteration. Increase to 4 if training is unstable.
+        self.gradient_accumulation_steps = (
+            1  # Effective batch = batch_size * accumulation_steps = 32
+        )
+
+        # Gradient Checkpointing
+        # Trade compute for memory by recomputing activations during backward pass
+        # Reduces VRAM for activations by ~30-40%
+        self.use_gradient_checkpointing = (
+            True  # Enable for Router Bi-LSTM and Expert Transformers
+        )
+
+        # ===== TensorBoard Configuration =====
+        # Real-time visualization of training metrics via web dashboard
+        self.use_tensorboard = True  # Enable/disable TensorBoard logging
+        self.tensorboard_log_dir = "tensorboard"  # Subdirectory for TensorBoard logs
+        self.tensorboard_log_images = True  # Log training charts as images
+        self.tensorboard_log_histograms = True  # Log weight/gradient histograms
+        self.tensorboard_histogram_freq = 10  # Log histograms every N batches
+
+        # Loss Weights (Spec §6)
+        self.mafia_lambda_pg = 1.0  # Weight for L_PG (policy gradient loss)
+        self.mafia_lambda_risk = 0.3  # Weight for L_Risk (risk calibration loss)
+        self.mafia_lambda_dir = 0.5  # Weight for L_Dir (direction classification loss)
+
+        # Entropy Bonus for L_PG (spec 5.1.1)
+        self.mafia_beta_entropy = 0.01  # β_ent: entropy bonus coefficient
+
+        # Policy Gradient Reward Shaping
+        self.mafia_pg_reward_horizon = (
+            14  # h: lookahead horizon for reward accumulation (spec §5.1.1)
+        )
+        # At time t, when Observer selects a portfolio, h determines how many days forward
+        # to accumulate returns for evaluating that decision
+        # Stronger portfolio churn penalties (penalty ~25–30% reward at λ=1 with typical turnover/symdiff)
+        self.mafia_pg_alpha_turnover = 0.30  # α_turnover: turnover penalty coefficient
+        self.mafia_pg_alpha_change = (
+            0.40  # α_change: membership change penalty coefficient
+        )
+
+        # Curriculum Learning (spec §7.1) - Penalty Warm-up
+        self.curriculum_warmup_epochs = 1  # Pure Alpha phase: λ_epoch = 0 (Epoch 0)
+        self.curriculum_penalty_rampup = 5  # Ramp-up phase: λ_epoch 0→1 across Epoch 1→5
+
+        # Direction Labeling
+        self.mafia_direction_threshold = (
+            0.02  # δ: threshold for bull/bear classification
+        )
+
+        # Direction Loss (Focal Loss) Class Weights
+        # Optimized based on VNINDEX ground truth distribution: Bear=20.3%, Side=46.4%, Bull=33.3%
+        # α = [α_bear, α_side, α_bull] - balances gradient contribution across classes
+        # Bear↑ (1.65): Most important for crash detection, minority class needs higher weight
+        # Side↓ (0.70): Majority class needs lower weight to prevent model bias
+        # Bull (1.0): Baseline reference
+        # Calculated from inverse frequency: [1/0.203, 1/0.464, 1/0.333] normalized to Bull=1.0
+        self.mafia_focal_alpha = [1.65, 0.70, 1.0]
+        self.mafia_focal_gamma = 1.5  # Focusing parameter for hard examples (sharper than 2.0)
+        # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
+        # Helps model converge stably, avoids overconfidence on noisy labels
+        self.mafia_direction_label_smoothing = 0.05  # ε: smoothing factor (reduced)
+        # Temperature scaling for direction logits (T<1 sharpens, T>1 flattens)
+        self.mafia_direction_temperature = 0.85
+
+        # Gradient Clipping
+        self.mafia_max_grad_norm = 1.0  # Max gradient norm for clipping
+
+        # Top-K Selection
+        self.mafia_top_k = 10  # K: number of assets to select
+        self.mafia_topk_rebalance_interval = 14  # Rebalance interval (days)
+
         # Dense MoE Gating Configuration
         self.mafia_gating_encoder_type = self.DEFAULT_GATING_ENCODER  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
         self.mafia_gating_dropout = 0.2  # Dropout for gating networks
         self.mafia_gating_lstm_layers = 2  # For bidirectional_lstm encoder
         self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
+
+        # Temporal Context Augmentation for Gating Router (Spec 3.6)
+        # Solves distribution shift: Router updated per rebalance, but market_context updated daily
+        # Augmented input: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt] ∈ R^{3D}
+        self.router_context_window = int(
+            os.environ.get("ROUTER_CONTEXT_WINDOW", 14)
+        )  # Lookback window W for rolling mean/drift (align with topk_rebalance_interval)
+        self.router_use_temporal_augmentation = (
+            True  # Enable C_aug = [C, C_bar, Delta_C]
+        )
 
         self.finestock_feat_cols_lst = []
         self.finemkt_feat_cols_lst = []
@@ -536,6 +1007,7 @@ class Config:
             "handle_timeout_termination": False,
             "compress_obs": self.compress_obs,
             "storage_dtype": self.replay_buffer_dtype,
+            "regime_shift_sample_ratio": self.regime_shift_sample_ratio,
         }
 
         if self.enable_market_observer:
@@ -619,7 +1091,9 @@ class Config:
             "replay_buffer_kwargs": replay_buffer_kwargs,
             "optimize_memory_usage": optimize_memory_usage,
             "entropy_coef": self.entropy_coef,
-            "tensorboard_log": "./tb_logs",
+            "tensorboard_log": os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "tb_logs"
+            ),
             "policy_kwargs": None,
             "seed": self.seed_num,
             "device": "auto",
@@ -666,7 +1140,7 @@ class Config:
         if use_multibranch and self.rl_model_name == "TD3":
             extractor_kwargs = {"config": self}
             mi_policy_kwargs = {
-                "features_extractor_class": MAFIAMultiModalExtractor,
+                "features_extractor_class": MAFIASingleStageMLP,
                 "features_extractor_kwargs": extractor_kwargs,
             }
             if (
@@ -773,7 +1247,7 @@ class Config:
             closes = pd.to_numeric(index_df["close"], errors="coerce").dropna()
             if len(closes) < 2:
                 raise ValueError("Not enough close prices for returns")
-            returns = closes.pct_change().dropna()
+            returns = closes.pct_change(fill_method=None).dropna()
             if len(returns) == 0:
                 raise ValueError("Empty returns series")
             window = int(max(2, self.cov_lookback))
@@ -798,42 +1272,66 @@ class Config:
 
     def _calibrate_risk_bounds(self):
         """
-        Ensure risk boundaries remain ordered relative to dynamic market risk.
-        Automatically nudges values instead of raising hard errors.
+        Ensure risk tolerance factors remain ordered and positive.
         """
-        margin = max(0.001, self.risk_market * 0.15)
+        eps = 1e-6
+        self.risk_default = max(self.risk_default, eps)
+        self.risk_hold_bound = max(self.risk_hold_bound, eps)
+        self.risk_up_bound = max(self.risk_up_bound, eps)
+        self.risk_down_bound = max(self.risk_down_bound, eps)
 
-        if self.risk_default <= self.risk_market:
-            new_value = self.risk_market + margin
-            print(
-                f"[Config] Adjusting risk_default from {self.risk_default} to {new_value} (market risk={self.risk_market})",
-                flush=True,
-            )
-            self.risk_default = new_value
+        # Enforce ordering: down <= hold <= up, and default within [down, up]
+        if self.risk_down_bound > self.risk_hold_bound:
+            self.risk_down_bound = self.risk_hold_bound
+        if self.risk_up_bound < self.risk_hold_bound:
+            self.risk_up_bound = self.risk_hold_bound
+        self.risk_default = min(
+            max(self.risk_default, self.risk_down_bound), self.risk_up_bound
+        )
 
-        if self.risk_hold_bound >= self.risk_default:
-            new_value = max(self.risk_market, self.risk_default - margin * 0.5)
-            print(
-                f"[Config] Adjusting risk_hold_bound from {self.risk_hold_bound} to {new_value} to keep below risk_default",
-                flush=True,
-            )
-            self.risk_hold_bound = new_value
+        # Keep eta aliases in sync
+        self.risk_eta_default = self.risk_default
+        self.risk_eta_hold = self.risk_hold_bound
+        self.risk_eta_up = self.risk_up_bound
+        self.risk_eta_down = self.risk_down_bound
 
-        if self.risk_down_bound >= self.risk_hold_bound:
-            new_value = max(self.risk_market * 0.8, self.risk_hold_bound - margin * 0.5)
-            print(
-                f"[Config] Adjusting risk_down_bound from {self.risk_down_bound} to {new_value} to keep ordering",
-                flush=True,
-            )
-            self.risk_down_bound = new_value
+    def rebuild_result_paths(self, new_res_dir: str, create_dirs: bool = True):
+        """
+        Rebuild all result-related paths when res_dir changes.
 
-        if self.risk_up_bound <= self.risk_default:
-            new_value = self.risk_default + margin * 0.5
-            print(
-                f"[Config] Adjusting risk_up_bound from {self.risk_up_bound} to {new_value} (above risk_default)",
-                flush=True,
-            )
-            self.risk_up_bound = new_value
+        This is necessary when redirecting outputs to a different directory
+        (e.g., for Observer walk-forward training vs TD3 training).
+
+        Args:
+            new_res_dir: New base directory for results
+            create_dirs: Whether to create directories (default: True)
+
+        Example:
+            config.rebuild_result_paths("./observer_walkforward/iter_0_valid_2017")
+            # This updates:
+            # - res_dir, res_root
+            # - res_model_dir, res_img_dir, checkpoint_dir
+            # - metrics_history_path, run_manifest_path
+        """
+        self.res_dir = os.path.abspath(new_res_dir)
+        self.res_root = self.res_dir
+
+        # Rebuild subdirectories
+        self.res_model_dir = os.path.join(self.res_dir, "model")
+        self.res_img_dir = os.path.join(self.res_dir, "graph")
+        self.checkpoint_dir = os.path.join(self.res_dir, "checkpoints")
+
+        # Rebuild file paths
+        self.metrics_history_path = os.path.join(self.res_dir, "metrics_history.csv")
+        self.run_manifest_path = os.path.join(self.res_dir, "run_manifest.json")
+
+        if create_dirs:
+            os.makedirs(self.res_dir, exist_ok=True)
+            os.makedirs(self.res_model_dir, exist_ok=True)
+            os.makedirs(self.res_img_dir, exist_ok=True)
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        return self
 
     def print_config(self):
         log_str = "=" * 30 + "\n"

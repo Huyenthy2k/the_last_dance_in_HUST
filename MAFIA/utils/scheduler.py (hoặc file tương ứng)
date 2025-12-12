@@ -1,0 +1,8 @@
+# Thay vì:
+# print(f"[SCHED] hold day={day} date={date} keep_topk={keep_topk}")
+
+# Sử dụng:
+print(f"\r[🔮 PRETRAIN] Mini-epoch {epoch}/{total_epochs} │ Bước {step}/{total_steps} ({pct:.1f}%) │ [SCHED] hold day={day}", end="", flush=True)
+
+# Khi kết thúc epoch, in newline:
+print()  # hoặc print(f"\n✓ Epoch {epoch} completed")
