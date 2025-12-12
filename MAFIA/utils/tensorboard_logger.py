@@ -29,11 +29,11 @@ except ImportError:
 class TensorBoardLogger:
     """
     Centralized TensorBoard logger for MAFIA Observer training.
-    
+
     Handles all TensorBoard logging operations with automatic directory management,
     graceful fallback, and memory-efficient image encoding.
     """
-    
+
     def __init__(
         self,
         log_dir: str,
@@ -45,7 +45,7 @@ class TensorBoardLogger:
     ):
         """
         Initialize TensorBoard logger.
-        
+
         Args:
             log_dir: Base directory for TensorBoard logs
             enabled: Enable/disable logging (master switch)
@@ -59,28 +59,52 @@ class TensorBoardLogger:
         self.log_histograms = log_histograms
         self.histogram_freq = histogram_freq
         self.comment = comment
-        
+
         self.writer: Optional[SummaryWriter] = None
-        self.log_dir = log_dir
+        # Store absolute path to avoid issues with working directory changes
+        self.log_dir = str(Path(log_dir).resolve())
         self.global_step = 0
-        
+        self._writer_invalid = False  # Track if writer needs recreation
+
         if self.enabled:
-            try:
-                # Create log directory
-                Path(log_dir).mkdir(parents=True, exist_ok=True)
-                
-                # Initialize SummaryWriter
-                self.writer = SummaryWriter(log_dir=log_dir, comment=comment)
-                print(f"[TensorBoard] Logging to: {log_dir}")
-                print(f"[TensorBoard] Start server: tensorboard --logdir {Path(log_dir).parent}")
-            except Exception as e:
-                print(f"[WARN] Failed to initialize TensorBoard: {e}")
-                self.enabled = False
+            self._init_writer()
         else:
             if not TENSORBOARD_AVAILABLE:
                 print("[WARN] TensorBoard not available. Install with: pip install tensorboard")
             else:
                 print("[INFO] TensorBoard logging disabled")
+
+    def _init_writer(self):
+        """Initialize or reinitialize the SummaryWriter."""
+        try:
+            # Close existing writer if any
+            if self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
+
+            # Create log directory (use absolute path)
+            Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
+            # Initialize SummaryWriter with absolute path
+            self.writer = SummaryWriter(log_dir=self.log_dir, comment=self.comment)
+            self._writer_invalid = False
+            print(f"[TensorBoard] Logging to: {self.log_dir}")
+            print(f"[TensorBoard] Start server: tensorboard --logdir {Path(self.log_dir).parent}")
+        except Exception as e:
+            print(f"[WARN] Failed to initialize TensorBoard: {e}")
+            self.enabled = False
+            self._writer_invalid = True
+
+    def _ensure_writer_valid(self) -> bool:
+        """Ensure writer is valid, recreate if needed. Returns True if valid."""
+        if not self.enabled or self._writer_invalid:
+            if self._writer_invalid and self.enabled:
+                # Try to recreate the writer once
+                self._init_writer()
+            return self.enabled and self.writer is not None and not self._writer_invalid
+        return self.writer is not None
     
     def log_scalar(
         self,
@@ -91,29 +115,33 @@ class TensorBoardLogger:
     ):
         """
         Log a scalar value.
-        
+
         Args:
             tag: Metric name (e.g., "loss/pg", "metrics/sharpe")
             value: Scalar value to log
             step: Global step (uses internal counter if None)
             phase: Training phase (train/valid/test) - prepended to tag
         """
-        if not self.enabled or self.writer is None:
+        if not self._ensure_writer_valid():
             return
-        
+
         try:
             # Convert tensor to scalar
             if isinstance(value, th.Tensor):
                 value = value.detach().cpu().item()
-            
+
             # Prepend phase to tag
             full_tag = f"{phase}/{tag}"
-            
+
             # Use internal step counter if not provided
             if step is None:
                 step = self.global_step
-            
+
             self.writer.add_scalar(full_tag, value, step)
+        except OSError as e:
+            print(f"[WARN] Failed to log scalar {tag}: {e}")
+            self._writer_invalid = True
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log scalar {tag}: {e}")
     
@@ -126,29 +154,33 @@ class TensorBoardLogger:
     ):
         """
         Log multiple scalars under a common tag.
-        
+
         Args:
             main_tag: Main category (e.g., "losses", "metrics")
             tag_scalar_dict: Dictionary of {sub_tag: value}
             step: Global step
             phase: Training phase
         """
-        if not self.enabled or self.writer is None:
+        if not self._ensure_writer_valid():
             return
-        
+
         try:
             if step is None:
                 step = self.global_step
-            
+
             # Convert tensors to scalars
             scalar_dict = {}
             for k, v in tag_scalar_dict.items():
                 if isinstance(v, th.Tensor):
                     v = v.detach().cpu().item()
                 scalar_dict[k] = v
-            
+
             full_tag = f"{phase}/{main_tag}"
             self.writer.add_scalars(full_tag, scalar_dict, step)
+        except OSError as e:
+            print(f"[WARN] Failed to log scalars {main_tag}: {e}")
+            self._writer_invalid = True
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log scalars {main_tag}: {e}")
     
@@ -161,34 +193,38 @@ class TensorBoardLogger:
     ):
         """
         Log an image from file path.
-        
+
         Args:
             tag: Image name (e.g., "charts/dashboard")
             image_path: Path to image file
             step: Global step
             phase: Training phase
         """
-        if not self.enabled or not self.log_images or self.writer is None:
+        if not self.log_images or not self._ensure_writer_valid():
             return
-        
+
         try:
             if not os.path.exists(image_path):
                 print(f"[WARN] Image not found: {image_path}")
                 return
-            
+
             # Read image using PIL
             from PIL import Image
             import torchvision.transforms as transforms
-            
+
             img = Image.open(image_path)
             # Convert to tensor (C, H, W) format
             img_tensor = transforms.ToTensor()(img)
-            
+
             if step is None:
                 step = self.global_step
-            
+
             full_tag = f"{phase}/{tag}"
             self.writer.add_image(full_tag, img_tensor, step)
+        except OSError as e:
+            print(f"[WARN] Failed to log image {tag}: {e}")
+            self._writer_invalid = True
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log image {tag}: {e}")
     
@@ -201,26 +237,32 @@ class TensorBoardLogger:
     ):
         """
         Log a histogram of values.
-        
+
         Args:
             tag: Histogram name (e.g., "weights/layer1", "gradients/encoder")
             values: Tensor or array of values
             step: Global step
             phase: Training phase
         """
-        if not self.enabled or not self.log_histograms or self.writer is None:
+        if not self.log_histograms or not self._ensure_writer_valid():
             return
-        
+
         try:
             # Convert to numpy if tensor
             if isinstance(values, th.Tensor):
                 values = values.detach().cpu().numpy()
-            
+
             if step is None:
                 step = self.global_step
-            
+
             full_tag = f"{phase}/{tag}"
             self.writer.add_histogram(full_tag, values, step)
+        except OSError as e:
+            # Handle file not found errors (e.g., event file deleted)
+            print(f"[WARN] Failed to log histogram {tag}: {e}")
+            self._writer_invalid = True
+            # Try to recreate writer for next call
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log histogram {tag}: {e}")
     
@@ -286,20 +328,24 @@ class TensorBoardLogger:
     ):
         """
         Log text data.
-        
+
         Args:
             tag: Text identifier
             text: Text content
             step: Global step
         """
-        if not self.enabled or self.writer is None:
+        if not self._ensure_writer_valid():
             return
-        
+
         try:
             if step is None:
                 step = self.global_step
-            
+
             self.writer.add_text(tag, text, step)
+        except OSError as e:
+            print(f"[WARN] Failed to log text {tag}: {e}")
+            self._writer_invalid = True
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log text {tag}: {e}")
     
@@ -310,14 +356,14 @@ class TensorBoardLogger:
     ):
         """
         Log hyperparameters and final metrics.
-        
+
         Args:
             hparam_dict: Dictionary of hyperparameters
             metric_dict: Dictionary of final metrics
         """
-        if not self.enabled or self.writer is None:
+        if not self._ensure_writer_valid():
             return
-        
+
         try:
             # Filter out non-serializable values
             clean_hparams = {}
@@ -326,8 +372,12 @@ class TensorBoardLogger:
                     clean_hparams[k] = v
                 elif isinstance(v, (list, tuple)) and len(v) > 0:
                     clean_hparams[k] = str(v)
-            
+
             self.writer.add_hparams(clean_hparams, metric_dict)
+        except OSError as e:
+            print(f"[WARN] Failed to log hparams: {e}")
+            self._writer_invalid = True
+            self._init_writer()
         except Exception as e:
             print(f"[WARN] Failed to log hparams: {e}")
     

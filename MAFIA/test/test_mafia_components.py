@@ -228,8 +228,9 @@ def test_signal_generator():
     O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
     
     # Forward pass
-    market_vector, risk_eta, market_scores_full, market_context, sigma_logits, topk_indices, topk_embeddings, topk_scores = signal_gen(
-        expert_outputs, expert_ta_outputs, x_mkt_seq=O_mkt_TA, O_mkt_TA=None, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)]
+    explicit_signals = th.randn(batch_size, 4).to(device) # Assuming 4 experts for now
+    market_vector, risk_eta, market_scores_full, sigma_logits, market_context, topk_indices, topk_embeddings, topk_scores = signal_gen(
+        expert_outputs, expert_ta_outputs, x_mkt_seq=O_mkt_TA, O_mkt_TA=None, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)], explicit_signals=explicit_signals
     )
     
     # Assertions
@@ -279,8 +280,8 @@ def test_mafia_model():
     market_index_ochlv_data = th.randn(batch_size, 1, M, T_w).to(device) * 50 + 1000  # VNINDEX prices
     
     with th.no_grad():
-        market_vector, risk_eta, market_scores_full, market_context, sigma_logits, topk_indices, topk_embeddings, topk_scores = mafia_model(
-            ochlv_data, market_index_ochlv_data=market_index_ochlv_data
+        market_vector, risk_eta, market_scores_full, sigma_logits, market_context, topk_indices, topk_embeddings, topk_scores = mafia_model(
+            ochlv_data, market_index_ochlv_data=market_index_ochlv_data, explicit_signals=th.randn(batch_size, 4).to(device)
         )
     
     # Original assertions
@@ -327,7 +328,7 @@ def test_temporal_encoders():
     encoder_types = [
         ('attention_based_aggregation', AttentionBasedTemporalEncoder),
         ('temporal_convolution', TemporalConvolutionEncoder),
-        ('bidirectional_lstm', UnidirectionalLSTMEncoder)
+        ('lstm', UnidirectionalLSTMEncoder)
     ]
     
     for encoder_name, EncoderClass in encoder_types:
@@ -350,8 +351,8 @@ def test_temporal_encoders():
     print("✓ All Temporal Encoders: PASSED\n")
 
 
-def test_stateful_bilstm_encoder_continuity():
-    """Spec 3.6.2: BiLSTM encoder should carry and reset hidden state cleanly."""
+def test_stateful_lstm_encoder_continuity():
+    """Spec 3.6.2: LSTM encoder should carry and reset hidden state cleanly."""
     config = MockConfig()
     encoder = UnidirectionalLSTMEncoder(config)
 
@@ -388,7 +389,7 @@ def test_stateful_bilstm_encoder_continuity():
     assert th.count_nonzero(h0).item() == 0 and th.count_nonzero(c0).item() == 0
     encoder.reset_state()  # defer zero-init to next forward
     assert encoder._cached_state is None
-    print("✓ Stateful BiLSTM encoder propagates/clears state per Spec 3.6.2\n")
+    print("✓ Stateful LSTM encoder propagates/clears state per Spec 3.6.2\n")
 
 
 def run_all_tests():
@@ -404,7 +405,7 @@ def run_all_tests():
         test_ta_module()
         test_st_fusion()
         test_temporal_encoders()
-        test_stateful_bilstm_encoder_continuity()
+        test_stateful_lstm_encoder_continuity()
         test_signal_generator()
         test_mafia_model()
         

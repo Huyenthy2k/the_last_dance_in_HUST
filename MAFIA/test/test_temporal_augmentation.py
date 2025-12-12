@@ -32,7 +32,7 @@ class MockConfig:
         self.mafia_weight_decay = 0.0
         self.num_epochs = 10
         self.risk_market = 0.0
-        self.mafia_gating_encoder_type = "bidirectional_lstm"
+        self.mafia_gating_encoder_type = "lstm"
         self.mafia_gating_lstm_layers = 1
 
 class MockEncoder(nn.Module):
@@ -197,8 +197,8 @@ class TestStatePropagation(unittest.TestCase):
         self.router.detach_temporal_state()
         self.assertTrue(self.router.temporal_encoder.detach_called)
         
-    def test_bilstm_state_cache(self):
-        """Test BiLSTM actual state caching."""
+    def test_lstm_state_cache(self):
+        """Test LSTM actual state caching."""
         encoder = UnidirectionalLSTMEncoder(self.config)
         
         # Reset

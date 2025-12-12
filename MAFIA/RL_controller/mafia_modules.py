@@ -631,12 +631,8 @@ class UnidirectionalLSTMEncoder(nn.Module):
                     if self._cached_state is not None
                     else th.device("cpu")
                 )
-            h0 = th.zeros(
-                self.num_layers, batch_size, self.D, device=device
-            )
-            c0 = th.zeros(
-                self.num_layers, batch_size, self.D, device=device
-            )
+            h0 = th.zeros(self.num_layers, batch_size, self.D, device=device)
+            c0 = th.zeros(self.num_layers, batch_size, self.D, device=device)
             self._cached_state = (h0, c0)
         else:
             self._cached_state = None
@@ -659,12 +655,8 @@ class UnidirectionalLSTMEncoder(nn.Module):
         if self._reset_to_zero:
             # Explicit zero-init request from reset_state()
             self._reset_to_zero = False
-            h0 = th.zeros(
-                self.num_layers, batch_size, self.D, device=device
-            )
-            c0 = th.zeros(
-                self.num_layers, batch_size, self.D, device=device
-            )
+            h0 = th.zeros(self.num_layers, batch_size, self.D, device=device)
+            c0 = th.zeros(self.num_layers, batch_size, self.D, device=device)
             self._cached_state = (h0, c0)
             return self._cached_state
         if self._cached_state is None:
@@ -758,12 +750,12 @@ class DenseMoEGatingRouter(nn.Module):
             self.temporal_encoder = AttentionBasedTemporalEncoder(config)
         elif encoder_type == "temporal_convolution":
             self.temporal_encoder = TemporalConvolutionEncoder(config)
-        elif encoder_type == "bidirectional_lstm":
+        elif encoder_type in ("lstm", "unidirectional_lstm"):
             self.temporal_encoder = UnidirectionalLSTMEncoder(config)
         else:
             raise ValueError(
                 f"Unknown gating encoder type: {encoder_type}. "
-                f"Must be one of: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'"
+                f"Must be one of: 'attention_based_aggregation', 'temporal_convolution', 'lstm'"
             )
         self._stateful_encoder = isinstance(
             self.temporal_encoder, UnidirectionalLSTMEncoder
@@ -786,6 +778,10 @@ class DenseMoEGatingRouter(nn.Module):
             nn.Linear(self.D * 2, num_experts),
             nn.Softmax(dim=-1),  # Normalize weights to sum to 1
         )
+
+        # Signal Decoupling Adapters (Task-Specific Views)
+        # Selection Adapter: Projects raw context for Gating (Selection Task)
+        self.selection_adapter = nn.Linear(self.D, self.D)
 
     def reset_temporal_state(self):
         """Reset temporal encoder state (Spec 3.6.2) when encoder is stateful."""
@@ -815,7 +811,9 @@ class DenseMoEGatingRouter(nn.Module):
         self,
         x_mkt_seq: Optional[th.Tensor] = None,  # (batch, T, D_m)
         O_mkt_TA: Optional[th.Tensor] = None,  # (batch, T, D)
-        context_buffer: Optional[th.Tensor] = None,  # (W, D) or (batch, W, D) - historical context
+        context_buffer: Optional[
+            th.Tensor
+        ] = None,  # (W, D) or (batch, W, D) - historical context
     ) -> Tuple[th.Tensor, th.Tensor]:
         """
         Args:
@@ -825,8 +823,9 @@ class DenseMoEGatingRouter(nn.Module):
                            Used for temporal augmentation (Spec 3.6)
 
         Returns:
+        Returns:
             gate_weights: (batch, num_experts) - Weights for each expert (sum to 1)
-            market_context: (batch, D) - Market condition embedding
+            raw_context: (batch, D) - Raw market latent state (shared source)
         """
         device = next(self.parameters()).device
         if x_mkt_seq is None and O_mkt_TA is None:
@@ -835,8 +834,8 @@ class DenseMoEGatingRouter(nn.Module):
             gate_weights = (
                 th.ones(batch_size, self.num_experts, device=device) / self.num_experts
             )
-            market_context = th.zeros(batch_size, self.D, device=device)
-            return gate_weights, market_context
+            raw_context = th.zeros(batch_size, self.D, device=device)
+            return gate_weights, raw_context
 
         market_tokens = None
         if x_mkt_seq is not None:
@@ -844,11 +843,15 @@ class DenseMoEGatingRouter(nn.Module):
         elif O_mkt_TA is not None:
             market_tokens = O_mkt_TA
 
-        # Extract market condition from temporal sequence
-        market_context, _ = self.temporal_encoder(market_tokens)  # (batch, D)
+        # Extract RAW market condition from temporal encoder
+        # This is the shared latent state before task-specific projection
+        raw_context, _ = self.temporal_encoder(market_tokens)  # (batch, D)
+
+        # Apply Selection Adapter to create "Selection View" of the context
+        context_selection = self.selection_adapter(raw_context)  # (batch, D)
 
         # ===== Temporal Context Augmentation (Spec 3.6) =====
-        # Augment gate input: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt]
+        # Augment gate input: C_aug = [C_sel^(t), C_bar_sel, Delta_C_sel]
         if self.use_temporal_augmentation:
             if context_buffer is not None:
                 # Ensure buffer has batch dimension
@@ -856,60 +859,59 @@ class DenseMoEGatingRouter(nn.Module):
                     context_buffer = context_buffer.unsqueeze(0)  # (1, W, D)
 
                 # Expand buffer to match batch size if needed
-                batch_size = market_context.size(0)
+                batch_size = raw_context.size(0)
                 if context_buffer.size(0) == 1 and batch_size > 1:
                     context_buffer = context_buffer.expand(batch_size, -1, -1)
 
-                # Construct rolling window inclusive of current step: [t-W+1, ..., t]
-                # context_buffer is [t-W, ..., t-1] (history)
-                # Take last W-1 from buffer and append current C_mkt
+                # context_buffer stores RAW contexts (history)
+                # We need to project history to Selection View for consistency
                 # buffer shape: (batch, W, D)
-                history_part = context_buffer[:, 1:, :]  # (batch, W-1, D)
-                current_part = market_context.unsqueeze(1)  # (batch, 1, D)
-                rolling_window = th.cat([history_part, current_part], dim=1)  # (batch, W, D)
+                history_raw = context_buffer[:, 1:, :]  # (batch, W-1, D)
+                current_raw = raw_context.unsqueeze(1)  # (batch, 1, D)
+                rolling_raw = th.cat([history_raw, current_raw], dim=1) # (batch, W, D)
 
-                # C_bar: Rolling mean over window W ending at t
-                C_bar_mkt = rolling_window.mean(dim=1)  # (batch, D)
+                # Compute statistics on RAW data first
+                C_bar_raw = rolling_raw.mean(dim=1)  # (batch, D)
+                C_oldest_raw = rolling_raw[:, 0, :]  # (batch, D)
+                Delta_C_raw = raw_context - C_oldest_raw  # (batch, D)
 
-                # Delta_C: Drift = C_mkt^(t) - C_mkt^(t-W+1) (start of window)
-                C_oldest = rolling_window[:, 0, :]  # (batch, D)
-                Delta_C_mkt = market_context - C_oldest  # (batch, D)
+                # Project statistics to Selection View
+                C_bar_sel = self.selection_adapter(C_bar_raw)
+                Delta_C_sel = self.selection_adapter(Delta_C_raw)
 
-                # Concatenate: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt]
+                # Concatenate: C_aug = [C_sel, C_bar_sel, Delta_C_sel]
                 gate_input = th.cat(
-                    [market_context, C_bar_mkt, Delta_C_mkt], dim=-1
+                    [context_selection, C_bar_sel, Delta_C_sel], dim=-1
                 )  # (batch, 3D)
             else:
-                # No buffer available (cold start): zero-pad C_bar and Delta_C
-                zeros = th.zeros_like(market_context)
-                gate_input = th.cat([market_context, zeros, zeros], dim=-1)  # (batch, 3D)
+                # No buffer available (cold start)
+                zeros = th.zeros_like(context_selection)
+                gate_input = th.cat(
+                    [context_selection, zeros, zeros], dim=-1
+                )  # (batch, 3D)
         else:
-            # Augmentation disabled: use raw market_context
-            gate_input = market_context
+            # Augmentation disabled
+            gate_input = context_selection
 
-        # Generate gate weights from (augmented) context
+        # Generate gate weights from (augmented) selection context
         gate_weights = self.gate_network(gate_input)  # (batch, num_experts)
 
-        return gate_weights, market_context
+        return gate_weights, raw_context
 
 
 class DirectionHead(nn.Module):
     """
-    Context-Augmented Residual Direction Head (Spec 3.5)
+    Wide & Deep Late Fusion Direction Head (Spec 3.5 v2.1)
 
-    Solves two core challenges in market regime classification:
-    1. Information Asymmetry: Uses momentum (Δ_C_mkt) + explicit signals
-       to provide velocity information for future prediction
-    2. Representation Conflict: Decouples from Gating via Residual architecture
-       with direct gradient paths
-
-    Input: X_dir = [C_mkt^(t), Δ_C_mkt, Explicit_Signals]
-    Output: logits for 3 classes (Bear/Side/Bull)
+    Uses Late Fusion architecture to solve Information Bottleneck problem.
+    Explicit signals bypass ResBlock and fuse directly at classification layer.
 
     Architecture (Spec 3.5.2):
-    - Input Projection: Linear(2D+k → D)
-    - Residual Block: LayerNorm → Linear → GELU → Dropout → Linear + Skip
-    - Classification: Linear(D → 3)
+    - Deep Path: X_latent = [C_mkt, ΔC_mkt] → InputProj(2D→D) → ResBlock → h_deep
+    - Wide Path: X_explicit (4 signals) → bypass (direct anchoring)
+    - Late Fusion: H_final = Concat(h_deep, X_explicit) → Classifier(D+4 → 3)
+
+    Output: logits for 3 classes (Bear/Side/Bull)
     """
 
     def __init__(self, config):
@@ -918,34 +920,44 @@ class DirectionHead(nn.Module):
         self.num_classes = 3
         self.dropout_rate = getattr(config, "direction_head_dropout", 0.2)
 
-        # Explicit signals: vol_shock(1) + dc_event(1) = 2 dims
-        self.explicit_dim = 2
+        # Explicit signals (Spec §3.5.1 v2.1): 4 dims (Wide Path)
+        # 1. DC_Event_Flag: Structural break signal from Market-DC Agent
+        # 2. Breadth_Gap: avg(RSI_stocks) - RSI_index ("Xanh vỏ đỏ lòng" detection)
+        # 3. Div_Signal: RSI slope vs Price slope divergence (reversal signal)
+        # 4. Signed_VPI_Zscore: Volume-price efficiency (money flow)
+        self.explicit_dim = 4
 
-        # Total input: C_mkt(D) + Delta_C(D) + Explicit(2) = 2D + 2
-        self.input_dim = self.D * 2 + self.explicit_dim
+        # Deep Path: Input Projection for LATENT only (2D → D)
+        self.latent_dim = self.D * 2  # C_mkt(D) + Delta_C(D)
+        self.input_proj = nn.Linear(self.latent_dim, self.D)
 
-        # 1. Input Projection (Spec 3.5.2)
-        self.input_proj = nn.Linear(self.input_dim, self.D)
-
-        # 2. Residual Block (Spec 3.5.2)
+        # Residual Block (Spec 3.5.2)
         self.res_ln = nn.LayerNorm(self.D)
         self.res_fc1 = nn.Linear(self.D, self.D)
         self.res_fc2 = nn.Linear(self.D, self.D)
         self.res_dropout = nn.Dropout(self.dropout_rate)
 
-        # 3. Classification Head
-        self.classifier = nn.Linear(self.D, self.num_classes)
+        # Wide Path: No transformation (explicit signals bypass to fusion)
+
+        # Classification Head: Late Fusion (D + 4 → 3)
+        self.classifier = nn.Linear(self.D + self.explicit_dim, self.num_classes)
 
         # Initialize bias to log-priors matching data distribution
         self._init_classifier_bias()
 
     def _init_classifier_bias(self):
         """
-        Initialize classifier bias to log-priors (Spec 3.5).
-        Distribution: Bear ~15%, Side ~50%, Bull ~35%
+        Initialize classifier bias to log-priors matching data distribution.
+
+        VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
+        log(0.22)=-1.514, log(0.44)=-0.821, log(0.34)=-1.079
+
+        This gives model prior knowledge about class frequencies,
+        helping faster convergence without biasing toward majority class.
         """
         with th.no_grad():
-            self.classifier.bias.copy_(th.tensor([-1.9, -0.69, -1.05]))
+            # Log-prior initialization (matches data distribution)
+            self.classifier.bias.copy_(th.tensor([-1.514, -0.821, -1.079]))
 
     def forward(
         self,
@@ -954,33 +966,36 @@ class DirectionHead(nn.Module):
         explicit_signals: th.Tensor,
     ) -> th.Tensor:
         """
-        Forward pass with augmented input.
+        Wide & Deep Late Fusion forward pass (Spec 3.5.2 v2.1).
 
         Args:
             c_mkt: (B, D) - Current market context from Temporal Encoder
             delta_c_mkt: (B, D) - Momentum/Velocity from Shared Buffer (Spec 3.6)
-            explicit_signals: (B, 2) - [vol_shock_flag, dc_event_flag]
+            explicit_signals: (B, 4) - Wide path signals:
+                [DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore]
 
         Returns:
             logits: (B, 3) - Bear/Side/Bull classification logits
         """
-        # Build X_dir (Spec 3.5.1)
-        x_dir = th.cat([c_mkt, delta_c_mkt, explicit_signals], dim=-1)  # (B, 2D+2)
+        # === 1. Deep Path: Process latent context ===
+        x_latent = th.cat([c_mkt, delta_c_mkt], dim=-1)  # (B, 2D)
+        h = self.input_proj(x_latent)  # (B, D)
 
-        # Input Projection
-        h = self.input_proj(x_dir)  # (B, D)
-
-        # Residual Block with Skip Connection (Spec 3.5.2)
-        # H_out = H_in + F(H_in)
+        # Residual Block with Skip Connection
         h_res = self.res_ln(h)
         h_res = F.gelu(self.res_fc1(h_res))
         h_res = self.res_dropout(h_res)
         h_res = self.res_fc2(h_res)
+        h_deep = h + h_res  # (B, D)
 
-        h = h + h_res  # Skip Connection
+        # === 2. Wide Path: Direct bypass (no transformation) ===
+        x_wide = explicit_signals  # (B, 4)
 
-        # Classification
-        logits = self.classifier(h)  # (B, 3)
+        # === 3. Late Fusion ===
+        h_final = th.cat([h_deep, x_wide], dim=-1)  # (B, D+4)
+
+        # === 4. Classification ===
+        logits = self.classifier(h_final)  # (B, 3)
 
         return logits
 
@@ -1026,10 +1041,15 @@ class DenseMoESignalGenerator(nn.Module):
 
         # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
         # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
+        # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
+        # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
         self.direction_head = DirectionHead(config)
 
+        # Macro Adapter: Projects raw context for Direction/Risk (Macro Task)
+        self.macro_adapter = nn.Linear(self.D, self.D)
+
     def reset_router_state(self):
-        """Reset stateful components inside the gating router (BiLSTM hidden/cache)."""
+        """Reset stateful components inside the gating router (LSTM hidden/cache)."""
         self.gating_router.reset_temporal_state()
 
     def detach_router_state(self):
@@ -1102,7 +1122,8 @@ class DenseMoESignalGenerator(nn.Module):
 
         # Step 1: Compute gate weights from market condition
         # Pass context_buffer for temporal augmentation (Spec 3.6)
-        gate_weights, market_context = self.gating_router(
+        # NOTE: returns raw_context (latent), not projected context
+        gate_weights, raw_context = self.gating_router(
             x_mkt_seq=x_mkt_seq,
             O_mkt_TA=O_mkt_TA,
             context_buffer=router_context_buffer,
@@ -1111,7 +1132,7 @@ class DenseMoESignalGenerator(nn.Module):
         # Expand gate_weights for batch if needed (when O_mkt_TA was None)
         if gate_weights.size(0) == 1 and batch_size > 1:
             gate_weights = gate_weights.expand(batch_size, -1)
-            market_context = market_context.expand(batch_size, -1)
+            raw_context = raw_context.expand(batch_size, -1)
 
         # Step 2: Stack expert outputs and apply gating
         expert_logits_stacked = th.stack(
@@ -1224,12 +1245,15 @@ class DenseMoESignalGenerator(nn.Module):
             topk_embeddings = th.gather(fused_stock_embedding, 1, topk_indices_exp)
         topk_scores = th.gather(market_vector, 1, topk_indices)  # (batch, K)
 
+        # Apply Macro Adapter to create "Macro View" of the context
+        context_macro = self.macro_adapter(raw_context)  # (batch, D)
+
         # Compute risk from market + portfolio context
         # GRADIENT FIREWALL: Detach portfolio_context to prevent L_Risk from
-        # backpropagating to Stock Experts (Selection Stream). This ensures:
-        # - Allowed: L_Risk → market_context → Macro Backbone (UPDATE)
-        # - Blocked: L_Risk → portfolio_context -X→ Stock Experts (FROZEN)
-        risk_input = th.cat([market_context, portfolio_context.detach()], dim=-1)  # (batch, 2D)
+        # backpropagating to Stock Experts (Selection Stream).
+        risk_input = th.cat(
+            [context_macro, portfolio_context.detach()], dim=-1
+        )  # (batch, 2D)
         eta_raw = self.risk_network(risk_input).squeeze(-1)  # (batch,)
         eta_base = getattr(self.config, "mafia_eta_base", 1.0)
         eta_amp = getattr(self.config, "mafia_eta_amplitude", 0.3)
@@ -1240,29 +1264,40 @@ class DenseMoESignalGenerator(nn.Module):
 
         # === Direction Head with Augmented Input (Spec 3.5) ===
         # Compute Delta_C_mkt (Momentum/Velocity) from context buffer
-        delta_c_mkt = th.zeros_like(market_context)  # Default: zeros (cold start)
+        delta_c_mkt = th.zeros_like(context_macro)  # Default: zeros (cold start)
 
         if router_context_buffer is not None:
-            # router_context_buffer: (W, D) or (batch, W, D)
+            # router_context_buffer contains RAW contexts
+            # (W, D) or (batch, W, D)
             if router_context_buffer.dim() == 2:  # (W, D)
-                c_oldest = router_context_buffer[0:1].expand(batch_size, -1)  # (B, D)
+                c_oldest_raw = router_context_buffer[0:1].expand(batch_size, -1)  # (B, D)
             else:  # (batch, W, D)
-                c_oldest = router_context_buffer[:, 0, :]  # (B, D)
-            delta_c_mkt = market_context - c_oldest  # Velocity = Current - Oldest
+                c_oldest_raw = router_context_buffer[:, 0, :]  # (B, D)
+            
+            # Compute Raw Delta and Project via Macro Adapter
+            delta_raw = raw_context - c_oldest_raw
+            delta_c_mkt = self.macro_adapter(delta_raw)
 
-        # Prepare explicit signals (vol_shock, dc_event)
+        # Require explicit signals - Spec §3.5.1 Updated (5 signals)
+        # These signals provide critical market regime information to Direction Head
         if explicit_signals is None:
-            explicit_signals = th.zeros(batch_size, 2, device=device)
+            raise ValueError(
+                "explicit_signals is required for Direction Head (Spec §3.5.1). "
+                "Must provide [Vol_Std20, DC_Event, KER_10, RSI_Grad, Breadth_Mom] "
+                "as (batch, 5) tensor. Caller must compute and normalize these values."
+            )
 
         # Market direction logits (Spec 3.5: Context-Augmented Residual)
-        sigma_logits = self.direction_head(market_context, delta_c_mkt, explicit_signals)  # (batch, 3)
+        sigma_logits = self.direction_head(
+            context_macro, delta_c_mkt, explicit_signals
+        )  # (batch, 3)
 
         return (
             market_vector,  # (batch, N)
             eta,  # (batch,)
             market_scores_full,  # (batch, N)
             sigma_logits,  # (batch, 3) - Direction classification
-            market_context,  # (batch, D)
+            raw_context,  # (batch, D) - Raw Latent State (for buffer continuity)
             topk_indices,  # (batch, K)
             topk_embeddings,  # (batch, K, D) or None
             topk_scores,  # (batch, K)
@@ -1332,7 +1367,7 @@ class MAFIAModel(nn.Module):
     def reset_temporal_state(self):
         """
         Reset temporal states for components that maintain running context
-        (e.g., BiLSTM inside the gating router).
+        (e.g., LSTM inside the gating router).
         """
         if hasattr(self.signal_generator, "reset_router_state"):
             self.signal_generator.reset_router_state()
@@ -1349,8 +1384,12 @@ class MAFIAModel(nn.Module):
         ochlv_data: th.Tensor,
         market_index_ochlv_data: Optional[th.Tensor] = None,
         force_topk_indices: Optional[th.Tensor] = None,
-        router_context_buffer: Optional[th.Tensor] = None,  # (W, D) buffer for temporal augmentation
-        explicit_signals: Optional[th.Tensor] = None,  # (batch, 2) [vol_shock, dc_flag] for Direction Head (Spec 3.5)
+        router_context_buffer: Optional[
+            th.Tensor
+        ] = None,  # (W, D) buffer for temporal augmentation
+        explicit_signals: Optional[
+            th.Tensor
+        ] = None,  # (batch, 2) [vol_shock, dc_flag] for Direction Head (Spec 3.5)
     ) -> Tuple[
         th.Tensor,
         th.Tensor,
@@ -1372,7 +1411,9 @@ class MAFIAModel(nn.Module):
             market_vector: (batch, N) - Market trend vector (Top-K weights, zero elsewhere)
             eta: (batch,) - Risk tolerance factor
             market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
-            market_context: (batch, D) - Market condition embedding from the gating encoder
+            market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
+            market_context: (batch, D) - Raw market latent state (shared source)
+            sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
             sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
             topk_indices: (batch, K) - Indices of selected assets
             topk_embeddings: (batch, K, D) or None - Embeddings of selected assets

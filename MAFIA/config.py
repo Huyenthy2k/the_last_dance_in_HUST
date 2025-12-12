@@ -25,14 +25,14 @@ class Config:
     GATING_MODE_MAP = {
         "attentive": "attention_based_aggregation",
         "cnn": "temporal_convolution",
-        "lstm": "bidirectional_lstm",
+        "lstm": "lstm",
     }
     DEFAULT_GATING_MODE_ALIAS = "lstm"
     DEFAULT_GATING_ENCODER = GATING_MODE_MAP[DEFAULT_GATING_MODE_ALIAS]
     GATING_MODE_DESCRIPTIONS = {
         "attentive": "Self-attention gating that weighs temporal embeddings via multi-head attention.",
         "cnn": "Temporal convolution (CNN) gating that extracts short-term patterns before routing.",
-        "lstm": "Bidirectional LSTM gating that captures sequential dependencies.",
+        "lstm": "Unidirectional LSTM gating (causal, forward-only) that captures sequential dependencies.",
     }
 
     def __init__(self, seed_num=2022, current_date=None, create_dirs=True):
@@ -808,7 +808,9 @@ class Config:
         self.mafia_sampling_strategy = (
             "random_trajectory"  # "random_trajectory" or "recent_trajectory"
         )
-        self.mafia_use_class_balanced_sampling = True  # Enable stratified sampling by direction class (helps Bear recall)
+        self.mafia_use_class_balanced_sampling = (
+            False  # Disabled: Focal Loss α handles class imbalance per Spec
+        )
 
         # ===== Memory Optimization Configuration =====
         # Mixed Precision Training (FP16)
@@ -828,7 +830,7 @@ class Config:
         # Trade compute for memory by recomputing activations during backward pass
         # Reduces VRAM for activations by ~30-40%
         self.use_gradient_checkpointing = (
-            True  # Enable for Router Bi-LSTM and Expert Transformers
+            True  # Enable for Router LSTM and Expert Transformers
         )
 
         # ===== TensorBoard Configuration =====
@@ -854,14 +856,15 @@ class Config:
         # At time t, when Observer selects a portfolio, h determines how many days forward
         # to accumulate returns for evaluating that decision
         # Stronger portfolio churn penalties (penalty ~25–30% reward at λ=1 with typical turnover/symdiff)
-        self.mafia_pg_alpha_turnover = 0.30  # α_turnover: turnover penalty coefficient
+        self.mafia_pg_alpha_turnover = 0.40  # α_turnover: turnover penalty coefficient
         self.mafia_pg_alpha_change = (
-            0.40  # α_change: membership change penalty coefficient
+            0.50  # α_change: membership change penalty coefficient
         )
 
         # Curriculum Learning (spec §7.1) - Penalty Warm-up
-        self.curriculum_warmup_epochs = 1  # Pure Alpha phase: λ_epoch = 0 (Epoch 0)
-        self.curriculum_penalty_rampup = 5  # Ramp-up phase: λ_epoch 0→1 across Epoch 1→5
+        # DISABLED: Full penalties from epoch 0 (λ_epoch = 1.0 always)
+        self.curriculum_warmup_epochs = 0  # No warmup phase
+        self.curriculum_penalty_rampup = 0  # No rampup → λ_epoch = 1.0 from start
 
         # Direction Labeling
         self.mafia_direction_threshold = (
@@ -869,19 +872,22 @@ class Config:
         )
 
         # Direction Loss (Focal Loss) Class Weights
-        # Optimized based on VNINDEX ground truth distribution: Bear=20.3%, Side=46.4%, Bull=33.3%
+        # Optimized based on VNINDEX ground truth distribution: Bear=22.1%, Side=43.8%, Bull=34.1%
         # α = [α_bear, α_side, α_bull] - balances gradient contribution across classes
-        # Bear↑ (1.65): Most important for crash detection, minority class needs higher weight
-        # Side↓ (0.70): Majority class needs lower weight to prevent model bias
-        # Bull (1.0): Baseline reference
-        # Calculated from inverse frequency: [1/0.203, 1/0.464, 1/0.333] normalized to Bull=1.0
-        self.mafia_focal_alpha = [1.65, 0.70, 1.0]
-        self.mafia_focal_gamma = 1.5  # Focusing parameter for hard examples (sharper than 2.0)
+        #
+        # IMPORTANT: These weights compensate for class imbalance AND focal modulation
+        # With γ=2.0, easy (majority) samples get ~0.1x gradient vs hard samples
+        # Direction Loss (Focal Loss) Class Weights: [Bear, Side, Bull]
+        # Based on VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
+        self.mafia_focal_alpha = [1.7, 0.70, 1.0]
+        self.mafia_focal_gamma = (
+            2.0  # Focusing parameter γ: reduces loss for confident (easy) predictions
+        )
         # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
         # Helps model converge stably, avoids overconfidence on noisy labels
         self.mafia_direction_label_smoothing = 0.05  # ε: smoothing factor (reduced)
         # Temperature scaling for direction logits (T<1 sharpens, T>1 flattens)
-        self.mafia_direction_temperature = 0.85
+        self.mafia_direction_temperature = 1
 
         # Gradient Clipping
         self.mafia_max_grad_norm = 1.0  # Max gradient norm for clipping
@@ -891,10 +897,12 @@ class Config:
         self.mafia_topk_rebalance_interval = 14  # Rebalance interval (days)
 
         # Dense MoE Gating Configuration
-        self.mafia_gating_encoder_type = self.DEFAULT_GATING_ENCODER  # Options: 'attention_based_aggregation', 'temporal_convolution', 'bidirectional_lstm'
+        self.mafia_gating_encoder_type = (
+            self.DEFAULT_GATING_ENCODER
+        )  # Options: 'attention_based_aggregation', 'temporal_convolution', 'lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
         self.mafia_gating_dropout = 0.2  # Dropout for gating networks
-        self.mafia_gating_lstm_layers = 2  # For bidirectional_lstm encoder
+        self.mafia_gating_lstm_layers = 2  # For lstm encoder
         self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
 
         # Temporal Context Augmentation for Gating Router (Spec 3.6)

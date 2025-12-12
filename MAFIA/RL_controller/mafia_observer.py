@@ -89,6 +89,13 @@ class MAFIAObserver:
         self.context_buffer = None  # Lazily initialized as (W, D) tensor
         self._context_buffer_initialized = False
 
+        # Price history buffer for explicit signals computation (Spec §3.5)
+        # Store recent close prices for Vol_Std20 and DC event detection
+        self.price_history_window = 50  # Need ~30+ days for Vol_Std20 + history
+        self.price_history_buffer = None  # (history_len,) - market close prices
+        self.dc_state = {"mode": "up", "p_ext": None}  # DC algorithm state
+        self.dc_threshold = float(getattr(config, "mafia_DC_threshold", 0.02))
+
         # Validate MAFIA hyperparameters exist
         self._validate_config()
 
@@ -248,6 +255,164 @@ class MAFIAObserver:
         for param in required_params:
             if not hasattr(self.config, param):
                 raise ValueError(f"Config missing required MAFIA parameter: {param}")
+
+    def _compute_explicit_signals(
+        self,
+        market_close_price: Optional[float] = None,
+        stock_closes: Optional[np.ndarray] = None,
+        stock_volumes: Optional[np.ndarray] = None,
+        market_volume: Optional[float] = None,
+    ) -> th.Tensor:
+        """
+        Compute explicit signals for Direction Head Wide Path (Spec §3.5.1 v2.1).
+        Returns (1, 4) tensor: [DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore]
+
+        Args:
+            market_close_price: Current market close price (for online inference)
+            stock_closes: Current stock close prices (N,) for breadth calculation
+            stock_volumes: Current stock volumes (N,) - optional
+            market_volume: Current market volume - for VPI calculation
+
+        Returns:
+            explicit_signals: (1, 4) tensor with normalized values
+        """
+        # Initialize buffers on first call
+        if self.price_history_buffer is None:
+            self.price_history_buffer = []
+        if not hasattr(self, "stock_price_history") or self.stock_price_history is None:
+            self.stock_price_history = []
+        if not hasattr(self, "rsi_history") or self.rsi_history is None:
+            self.rsi_history = []
+        if not hasattr(self, "volume_history") or self.volume_history is None:
+            self.volume_history = []
+        if not hasattr(self, "vpi_history") or self.vpi_history is None:
+            self.vpi_history = []
+
+        # Update price history
+        if market_close_price is not None:
+            self.price_history_buffer.append(market_close_price)
+            if len(self.price_history_buffer) > self.price_history_window:
+                self.price_history_buffer.pop(0)
+
+        # Update stock history
+        if stock_closes is not None:
+            self.stock_price_history.append(stock_closes.copy())
+            if len(self.stock_price_history) > self.price_history_window:
+                self.stock_price_history.pop(0)
+
+        # Update volume history
+        if market_volume is not None:
+            self.volume_history.append(market_volume)
+            if len(self.volume_history) > 25:
+                self.volume_history.pop(0)
+
+        # Helper: Compute RSI
+        def compute_rsi(prices, period=14):
+            if len(prices) < period + 1:
+                return 50.0  # Neutral
+            deltas = np.diff(prices[-period - 1 :])
+            gains = np.maximum(deltas, 0)
+            losses = np.abs(np.minimum(deltas, 0))
+            avg_gain = np.mean(gains)
+            avg_loss = np.mean(losses) + 1e-8
+            rs = avg_gain / avg_loss
+            return 100 - (100 / (1 + rs))
+
+        # === 1. DC_Event_Flag: Structural break detection (binary) ===
+        dc_event_flag = 0.0
+        if market_close_price is not None and len(self.price_history_buffer) >= 2:
+            if self.dc_state["p_ext"] is None:
+                self.dc_state["p_ext"] = self.price_history_buffer[0]
+                self.dc_state["mode"] = "up"
+
+            p_ext = self.dc_state["p_ext"]
+            var = (market_close_price - p_ext) / (p_ext + 1e-8)
+
+            if self.dc_state["mode"] == "up":
+                if var < -self.dc_threshold:
+                    dc_event_flag = 1.0  # Downward DC (Crash)
+                    self.dc_state["mode"] = "down"
+                    self.dc_state["p_ext"] = market_close_price
+                elif market_close_price > p_ext:
+                    self.dc_state["p_ext"] = market_close_price
+            else:
+                if var > self.dc_threshold:
+                    dc_event_flag = 1.0  # Upward DC (Rally)
+                    self.dc_state["mode"] = "up"
+                    self.dc_state["p_ext"] = market_close_price
+                elif market_close_price < p_ext:
+                    self.dc_state["p_ext"] = market_close_price
+
+        # === 2. Breadth_Gap: avg(RSI_stocks) - RSI_index ===
+        # Detects "Xanh vỏ đỏ lòng" (Index up but stocks weak)
+        breadth_gap = 0.0
+        rsi_index = 50.0
+        if len(self.price_history_buffer) >= 15:
+            rsi_index = compute_rsi(self.price_history_buffer)
+            self.rsi_history.append(rsi_index)
+            if len(self.rsi_history) > 20:
+                self.rsi_history.pop(0)
+
+            if len(self.stock_price_history) >= 15 and stock_closes is not None:
+                N = len(stock_closes)
+                rsi_stocks_sum = 0.0
+                for n in range(N):
+                    stock_hist = [h[n] for h in self.stock_price_history[-15:]]
+                    rsi_stocks_sum += compute_rsi(stock_hist)
+                rsi_stocks_avg = rsi_stocks_sum / N
+                # Normalize to [-1, 1]
+                breadth_gap = (rsi_stocks_avg - rsi_index) / 100.0
+
+        # === 3. Div_Signal: RSI slope vs Price slope divergence ===
+        # Signal = -Sign(Price_slope) if divergence detected, else 0
+        div_signal = 0.0
+        lookback = 5
+        if len(self.price_history_buffer) >= lookback + 1 and len(self.rsi_history) >= lookback + 1:
+            # Price slope (percentage change over lookback)
+            price_slope = (self.price_history_buffer[-1] - self.price_history_buffer[-lookback - 1]) / (
+                self.price_history_buffer[-lookback - 1] + 1e-8
+            )
+            # RSI slope
+            rsi_slope = self.rsi_history[-1] - self.rsi_history[-lookback - 1]
+
+            # Divergence: RSI and Price moving in opposite directions
+            if np.sign(price_slope) != np.sign(rsi_slope) and abs(rsi_slope) > 5:
+                div_signal = -np.sign(price_slope)
+
+        # === 4. Signed_VPI_Zscore: Volume-Price Efficiency Index ===
+        # VPI = Sign(ΔP) × |ΔP| / (Vol / Vol_20_avg)
+        vpi_zscore = 0.0
+        if len(self.price_history_buffer) >= 2 and len(self.volume_history) >= 20 and market_volume is not None:
+            # Price change
+            delta_p = (self.price_history_buffer[-1] - self.price_history_buffer[-2]) / (
+                self.price_history_buffer[-2] + 1e-8
+            )
+
+            # Volume ratio
+            vol_20_avg = np.mean(self.volume_history[-20:]) + 1e-8
+            vol_ratio = market_volume / vol_20_avg
+
+            # VPI = Sign(ΔP) × |ΔP| / Vol_ratio
+            vpi = np.sign(delta_p) * abs(delta_p) / (vol_ratio + 1e-8)
+            self.vpi_history.append(vpi)
+            if len(self.vpi_history) > 25:
+                self.vpi_history.pop(0)
+
+            # Z-score normalize
+            if len(self.vpi_history) >= 10:
+                vpi_mean = np.mean(self.vpi_history)
+                vpi_std = np.std(self.vpi_history) + 1e-8
+                vpi_zscore = (vpi - vpi_mean) / vpi_std
+                vpi_zscore = float(np.clip(vpi_zscore, -3, 3))
+
+        # Create tensor (1, 4)
+        explicit_signals = th.tensor(
+            [[dc_event_flag, breadth_gap, div_signal, vpi_zscore]],
+            dtype=th.float32,
+            device=self.device,
+        )
+
+        return explicit_signals
 
     def _ensure_temp_embeddings_from_state(self, state_dict: dict):
         """
@@ -492,9 +657,43 @@ class MAFIAObserver:
         # Get context buffer for temporal augmentation (Spec 3.6)
         router_context_buffer = self._get_context_buffer()
 
-        # Get explicit signals for Direction Head (Spec 3.5)
-        # Optional: can be passed via kwargs as tensor (B, 2) [vol_shock_flag, dc_event_flag]
+        # Get explicit signals for Direction Head (Spec 3.5 Extended)
+        # If not provided, compute from market/stock price history
         explicit_signals = kwargs.get("explicit_signals", None)
+
+        if explicit_signals is None:
+            # Extract market close price from market_index_ochlv_tensor
+            market_close_price = None
+            if market_index_ochlv_tensor is not None:
+                # market_index_ochlv_tensor: (batch=1, 1, 5, T_w)
+                # Extract the most recent close price (index 1 in OCHLV)
+                try:
+                    market_close_price = float(
+                        market_index_ochlv_tensor[0, 0, 1, -1].cpu().item()
+                    )
+                except Exception:
+                    pass
+
+            # Extract stock closes and volumes from ochlv_tensor
+            # ochlv_tensor: (batch, N, 5, T_w) - batch, stocks, features, time
+            stock_closes = None
+            stock_volumes = None
+            try:
+                # Get most recent close prices (feature index 1) and volumes (feature index 4)
+                stock_closes = ochlv_tensor[0, :, 1, -1].cpu().numpy()  # (N,)
+                stock_volumes = ochlv_tensor[0, :, 4, -1].cpu().numpy()  # (N,)
+            except Exception:
+                pass
+
+            # Compute explicit signals (5 signals)
+            explicit_signals = self._compute_explicit_signals(
+                market_close_price, stock_closes, stock_volumes
+            )
+
+            # If batch size > 1, expand to match
+            batch_size = ochlv_tensor.shape[0]
+            if batch_size > 1:
+                explicit_signals = explicit_signals.expand(batch_size, -1)
 
         if mode == "train":
             self.mafia_model.train()
