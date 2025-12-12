@@ -262,8 +262,8 @@ class ObserverOfflineBatchTrainer:
         )  # λ_dir = 0.5 per Spec §5
 
         # Penalty coefficients for PG
-        self.alpha_turnover = float(getattr(config, "mafia_pg_alpha_turnover", 0.08))
-        self.alpha_change = float(getattr(config, "mafia_pg_alpha_change", 0.08))
+        self.alpha_turnover = float(getattr(config, "mafia_pg_alpha_turnover", 0.50))
+        self.alpha_change = float(getattr(config, "mafia_pg_alpha_change", 0.50))
 
         # Risk loss scaling factor (Spec §5.1.2: S_risk)
         # L_risk (MSE) ≈ 0.01, scale up to match L_PG (~1.0) and L_dir (~1.0)
@@ -275,7 +275,7 @@ class ObserverOfflineBatchTrainer:
 
         # Curriculum Learning parameters (Spec §7.1)
         self.curriculum_warmup_epochs = int(
-            getattr(config, "curriculum_warmup_epochs", 5)
+            getattr(config, "curriculum_warmup_epochs", 0)
         )
         self.curriculum_penalty_rampup = int(
             getattr(config, "curriculum_penalty_rampup", 5)

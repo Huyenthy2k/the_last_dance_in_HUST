@@ -173,8 +173,8 @@ class Config:
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
         # Penalty coefficients (stronger to stand against reward scaling=100)
-        self.mafia_pg_alpha_turnover = 0.2  # Turnover penalty coefficient
-        self.mafia_pg_alpha_change = 0.1  # Membership change penalty coefficient
+        self.mafia_pg_alpha_turnover = 0.5  # Turnover penalty coefficient
+        self.mafia_pg_alpha_change = 0.5  # Membership change penalty coefficient
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
         self.direction_label_delta = (
@@ -864,7 +864,7 @@ class Config:
         # Curriculum Learning (spec §7.1) - Penalty Warm-up
         # DISABLED: Full penalties from epoch 0 (λ_epoch = 1.0 always)
         self.curriculum_warmup_epochs = 0  # No warmup phase
-        self.curriculum_penalty_rampup = 0  # No rampup → λ_epoch = 1.0 from start
+        self.curriculum_penalty_rampup = 5 # Rampup over 3 epochs (Planned: 3)
 
         # Direction Labeling
         self.mafia_direction_threshold = (
