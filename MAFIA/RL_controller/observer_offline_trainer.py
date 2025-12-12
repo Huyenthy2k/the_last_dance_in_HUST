@@ -2817,19 +2817,19 @@ class ObserverOfflineBatchTrainer:
         price_returns: th.Tensor,  # (B, T_m, N)
     ) -> Dict[str, float]:
         """
-        Compute Top-K portfolio selection performance metrics.
+        Compute Top-K portfolio selection performance metrics (TD3-Aligned).
 
         Args:
             topk_indices: Selected Top-K stock indices for each timestep
-            topk_scores: Softmax scores for Top-K stocks (for weighted portfolio, currently unused)
+            topk_scores: Softmax scores for Top-K stocks (unused)
             price_returns: Returns for all N stocks
 
         Returns:
             Dict with:
-                - sharpe_ratio: Sharpe Ratio of equal-weighted Top-K portfolio
-                - mean_return: Daily mean return
-                - volatility: Daily return volatility (std dev)
-                - turnover: Average turnover rate (% of portfolio changed per timestep)
+                - sharpe_ratio: Sharpe Ratio (Annualized, Excess Return)
+                - mean_return: Annualized Return (CAGR)
+                - volatility: Annualized Volatility
+                - turnover: Average turnover rate
         """
         B, T_m, K = topk_indices.shape
         N = price_returns.shape[2]
@@ -2838,60 +2838,91 @@ class ObserverOfflineBatchTrainer:
         topk_indices_np = topk_indices.cpu().numpy()  # (B, T_m, K)
         returns_np = price_returns[:, :T_m, :].cpu().numpy()  # (B, T_m, N)
 
-        # Compute portfolio returns (equal-weighted Top-K)
-        portfolio_returns = []
-        turnover_rates = []
+        # Config parameters
+        tradeDays_per_year = getattr(self.config, "tradeDays_per_year", 252)
+        market_name = getattr(self.config, "market_name", "vnindex")
+        mkt_rf_map = getattr(self.config, "mkt_rf", {})
+        # Rf is usually stored as percentage (e.g. 6.0 for 6%) in config
+        rf_rate_percent = mkt_rf_map.get(market_name, 0.0)
+        rf_rate_decimal = rf_rate_percent / 100.0
+
+        # Store metrics per trajectory
+        traj_sharpes = []
+        traj_annual_returns = []
+        traj_volatilities = []
+        traj_turnovers = []
 
         for b in range(B):
-            # For each timestep, compute portfolio return as mean of Top-K returns
-            traj_returns = []
-            traj_turnover = []
-
+            # 1. Collect Daily Returns & Turnover
+            daily_returns = []
+            turnover_sum = 0.0
             prev_set = None
+
             for t in range(T_m):
                 selected_idx = topk_indices_np[b, t]  # (K,)
-                selected_returns = returns_np[b, t, selected_idx]  # (K,)
+                selected_ret = returns_np[b, t, selected_idx]  # (K,)
 
-                # Equal-weighted portfolio return
-                port_ret = selected_returns.mean()
-                traj_returns.append(port_ret)
+                # Portfolio return (Equal Weighted)
+                port_ret = selected_ret.mean()
+                daily_returns.append(port_ret)
 
-                # Turnover: % of stocks changed from previous timestep
+                # Turnover
+                current_set = set(selected_idx)
                 if prev_set is not None:
-                    current_set = set(selected_idx)
+                    # Turnover = 1 - (Intersection / K)
                     unchanged = len(current_set.intersection(prev_set))
                     turnover = 1.0 - (unchanged / K)
-                    traj_turnover.append(turnover)
+                    turnover_sum += turnover
+                prev_set = current_set
 
-                prev_set = set(selected_idx)
+            # 2. Compute Metrics for this Trajectory (Episode of length T_m)
+            daily_returns = np.array(daily_returns)
+            days = len(daily_returns)
+            if days < 2:
+                continue
 
-            portfolio_returns.extend(traj_returns)
-            if traj_turnover:
-                turnover_rates.extend(traj_turnover)
+            # A. Net Profit (Cumulative)
+            # prod(1+r) - 1
+            net_profit_pct = np.prod(1 + daily_returns) - 1
 
-        # Convert to array
-        portfolio_returns = np.array(portfolio_returns)
+            # B. Annualized Return (CAGR)
+            # (1 + netProfit)^(252/D) - 1
+            annual_return_pct = (
+                np.power((1 + net_profit_pct), (tradeDays_per_year / days)) - 1
+            )
 
-        # Compute metrics
-        mean_return = portfolio_returns.mean()
-        volatility = portfolio_returns.std()
+            # C. Annualized Volatility
+            # std(daily) * sqrt(252)
+            # Use ddof=1 for sample standard deviation
+            std_daily = np.std(daily_returns, ddof=1)
+            volatility_annual = std_daily * np.sqrt(tradeDays_per_year)
 
-        # Sharpe Ratio (annualized, assuming daily returns)
-        # Sharpe = (mean * 252) / (std * sqrt(252)) = mean * sqrt(252) / std
-        if volatility > 1e-8:
-            sharpe_ratio = mean_return * np.sqrt(252) / volatility
-        else:
-            sharpe_ratio = 0.0
+            # Avoid div/0
+            if volatility_annual < 1e-6:
+                volatility_annual = 1e-6
 
-        # Average turnover
-        avg_turnover = np.mean(turnover_rates) if turnover_rates else 0.0
+            # D. Sharpe Ratio
+            # (AnnualReturn - Rf) / Volatility
+            # All in decimals. (TD3 converts to percent for num/denom, result is same)
+            sharpe_ratio = (annual_return_pct - rf_rate_decimal) / volatility_annual
 
-        return {
-            "sharpe_ratio": float(sharpe_ratio),
-            "mean_return": float(mean_return),
-            "volatility": float(volatility),
-            "turnover": float(avg_turnover),
+            # Turnover Avg
+            avg_turnover = turnover_sum / (days - 1) if days > 1 else 0.0
+
+            traj_sharpes.append(sharpe_ratio)
+            traj_annual_returns.append(annual_return_pct)
+            traj_volatilities.append(volatility_annual)
+            traj_turnovers.append(avg_turnover)
+
+        # Average across batch
+        metrics = {
+            "sharpe_ratio": np.mean(traj_sharpes) if traj_sharpes else 0.0,
+            "mean_return": np.mean(traj_annual_returns) if traj_annual_returns else 0.0,
+            "volatility": np.mean(traj_volatilities) if traj_volatilities else 0.0,
+            "turnover": np.mean(traj_turnovers) if traj_turnovers else 0.0,
         }
+
+        return metrics
 
     @th.no_grad()
     def compute_direction_metrics(

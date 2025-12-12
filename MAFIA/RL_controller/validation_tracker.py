@@ -7,7 +7,7 @@ This module implements rank-based normalization for CES (Composite Efficiency Sc
 computation per Spec §7.1164-1178.
 
 CES Formula:
-    CES = 0.6 × S_sharpe + 0.2 × S_dir_f1 + 0.2 × (1 - S_risk_mse)
+    CES = 1.0 × S_sharpe + 0.5 × S_dir_f1 + 0.5 × (1 - S_risk_mse)
     
 Where S_* are rank-normalized scores:
     1. Rank all checkpoints from worst (1) to best (N)
@@ -81,7 +81,7 @@ class ValidationMetricsTracker:
         1. For each metric M (Sharpe, Dir_F1, Risk_MSE):
             - Rank all checkpoints 1..N_actual (worst to best)
             - Normalize: S_hat = (Rank(M) - 1) / (N_fixed - 1)
-        2. Compute CES = 0.6 × S_sharpe + 0.2 × S_dir_f1 + 0.2 × (1 - S_risk_mse)
+        2. Compute CES = 1.0 × S_sharpe + 0.5 × S_dir_f1 + 0.5 × (1 - S_risk_mse)
 
         Note:
         - Risk_MSE is inverted (lower is better)
@@ -134,12 +134,12 @@ class ValidationMetricsTracker:
             hist.ces_rank_risk_mse = (r_r - 1) / max(1, N_norm - 1)
 
             # CES formula from Spec §7.1200
-            # CES = 0.6 × Ŝ_Sharpe + 0.2 × Ŝ_Dir_F1 + 0.2 × (1 - Ŝ_Risk_MSE)
+            # CES = 1.0 × Ŝ_Sharpe + 0.5 × Ŝ_Dir_F1 + 0.5 × (1 - Ŝ_Risk_MSE)
             # Note: (1 - Ŝ_Risk_MSE) inverts the score since lower MSE is better
             hist.ces_score = (
-                0.6 * hist.ces_rank_sharpe +
-                0.2 * hist.ces_rank_dir_f1 +
-                0.2 * (1 - hist.ces_rank_risk_mse)
+                1.0 * hist.ces_rank_sharpe +
+                0.5 * hist.ces_rank_dir_f1 +
+                0.5 * (1 - hist.ces_rank_risk_mse)
             )
     
     def _update_best(self) -> bool:
