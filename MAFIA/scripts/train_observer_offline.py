@@ -605,6 +605,7 @@ def run_offline_observer_training(
         device = th.device("mps")
     else:
         device = th.device("cpu")
+    smart_print(f"[DEVICE] Training on device: {device}")
     
     # Determine action_dim (N) from loaded data
     action_dim = len(stock_list)
