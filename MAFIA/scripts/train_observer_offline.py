@@ -322,9 +322,11 @@ def train_observer_offline_iteration(
         smart_print(f"[OFFLINE] Iteration already completed ({start_epoch} >= {num_epochs}). Skipping training loop.")
 
     # IMPORTANT: ALWAYS sync trainer._epoch with start_epoch for correct epoch numbering
-    # train_epoch() increments _epoch at the start, so we set to (start_epoch - 1) or 0 for fresh start
+    # train_epoch() increments _epoch at the start, so we set to start_epoch
     # This ensures epoch numbering in validation results matches the actual epoch
-    trainer._epoch = max(0, start_epoch - 1) if start_epoch > 0 else 0
+    # Note: Loop epoch N corresponds to display "EPOCH N+1", so when resuming from
+    # checkpoint with loop epoch E, we want to display "EPOCH E+2" (the next one)
+    trainer._epoch = start_epoch
     if start_epoch > 0:
         # Also update current_global_step based on previously completed epochs
         current_global_step = global_step_start + (start_epoch * (batches_per_epoch or 10))
