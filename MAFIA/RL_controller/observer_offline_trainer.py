@@ -2815,6 +2815,7 @@ class ObserverOfflineBatchTrainer:
         topk_indices: th.Tensor,  # (B, T_m, K)
         topk_scores: th.Tensor,  # (B, T_m, K) - kept for possible weighted portfolio
         price_returns: th.Tensor,  # (B, T_m, N)
+        market_returns: Optional[th.Tensor] = None,  # (B, T_m)
     ) -> Dict[str, float]:
         """
         Compute Top-K portfolio selection performance metrics (TD3-Aligned).
@@ -2823,6 +2824,7 @@ class ObserverOfflineBatchTrainer:
             topk_indices: Selected Top-K stock indices for each timestep
             topk_scores: Softmax scores for Top-K stocks (unused)
             price_returns: Returns for all N stocks
+            market_returns: (Optional) Market index returns for advantage calculation
 
         Returns:
             Dict with:
@@ -2830,6 +2832,7 @@ class ObserverOfflineBatchTrainer:
                 - mean_return: Annualized Return (CAGR)
                 - volatility: Annualized Volatility
                 - turnover: Average turnover rate
+                - topk_advantage: Annualized Advantage (Top-K Return - Market Return)
         """
         B, T_m, K = topk_indices.shape
         N = price_returns.shape[2]
@@ -2837,6 +2840,11 @@ class ObserverOfflineBatchTrainer:
         # Convert to numpy for easier computation
         topk_indices_np = topk_indices.cpu().numpy()  # (B, T_m, K)
         returns_np = price_returns[:, :T_m, :].cpu().numpy()  # (B, T_m, N)
+        
+        if market_returns is not None:
+            market_returns_np = market_returns[:, :T_m].cpu().numpy() # (B, T_m)
+        else:
+            market_returns_np = None
 
         # Config parameters
         tradeDays_per_year = getattr(self.config, "tradeDays_per_year", 252)
@@ -2851,10 +2859,12 @@ class ObserverOfflineBatchTrainer:
         traj_annual_returns = []
         traj_volatilities = []
         traj_turnovers = []
+        traj_advantages = []
 
         for b in range(B):
             # 1. Collect Daily Returns & Turnover
             daily_returns = []
+            daily_market_returns = []
             turnover_sum = 0.0
             prev_set = None
 
@@ -2865,6 +2875,9 @@ class ObserverOfflineBatchTrainer:
                 # Portfolio return (Equal Weighted)
                 port_ret = selected_ret.mean()
                 daily_returns.append(port_ret)
+                
+                if market_returns_np is not None:
+                    daily_market_returns.append(market_returns_np[b, t])
 
                 # Turnover
                 current_set = set(selected_idx)
@@ -2905,6 +2918,17 @@ class ObserverOfflineBatchTrainer:
             # (AnnualReturn - Rf) / Volatility
             # All in decimals. (TD3 converts to percent for num/denom, result is same)
             sharpe_ratio = (annual_return_pct - rf_rate_decimal) / volatility_annual
+            
+            # E. Advantage (Annualized) 
+            # Approx: AnnualReturns - AnnualMarketReturns
+            advantage = 0.0
+            if market_returns_np is not None and len(daily_market_returns) > 0:
+                mkt_returns_arr = np.array(daily_market_returns)
+                mkt_net_profit = np.prod(1 + mkt_returns_arr) - 1
+                mkt_annual_return = (
+                    np.power((1 + mkt_net_profit), (tradeDays_per_year / days)) - 1
+                )
+                advantage = annual_return_pct - mkt_annual_return
 
             # Turnover Avg
             avg_turnover = turnover_sum / (days - 1) if days > 1 else 0.0
@@ -2913,6 +2937,7 @@ class ObserverOfflineBatchTrainer:
             traj_annual_returns.append(annual_return_pct)
             traj_volatilities.append(volatility_annual)
             traj_turnovers.append(avg_turnover)
+            traj_advantages.append(advantage)
 
         # Average across batch
         metrics = {
@@ -2920,6 +2945,7 @@ class ObserverOfflineBatchTrainer:
             "mean_return": np.mean(traj_annual_returns) if traj_annual_returns else 0.0,
             "volatility": np.mean(traj_volatilities) if traj_volatilities else 0.0,
             "turnover": np.mean(traj_turnovers) if traj_turnovers else 0.0,
+            "topk_advantage": np.mean(traj_advantages) if traj_advantages else 0.0,
         }
 
         return metrics
@@ -3058,16 +3084,23 @@ class ObserverOfflineBatchTrainer:
             available_starts = T_total - self.T_m - self.horizon - self.T_w
             steps = max(1, min(10, available_starts // self.batch_size))
 
-        # Accumulators for losses
+                # Accumulators for losses
         total_loss_total = 0.0
         total_loss_pg = 0.0
         total_loss_risk = 0.0
         total_loss_dir = 0.0
+        
+        # Accumulators for rewards & penalties
+        total_reward = 0.0
+        total_net_reward = 0.0
+        total_turnover_penalty = 0.0
+        total_symdiff_penalty = 0.0
 
         # Accumulators for metric computation
         all_topk_indices = []
         all_topk_scores = []
         all_price_returns = []
+        all_market_returns = [] # NEW
         all_risk_pred = []
         all_risk_target = []
         all_direction_logits = []
@@ -3094,7 +3127,7 @@ class ObserverOfflineBatchTrainer:
 
                 full_ochlv = data_tensors["ochlv"]
                 full_market_ochlv = data_tensors.get("market_ochlv")
-
+                
                 # Direction reversal tracking
                 N_confirm = int(getattr(self.config, "regime_confirmation_window", 3))
                 direction_history = th.ones(
@@ -3127,6 +3160,12 @@ class ObserverOfflineBatchTrainer:
                 pg_losses = []
                 risk_losses = []
                 dir_losses = []
+                
+                # Reward collections
+                curr_batch_rewards = []
+                curr_batch_net = []
+                curr_batch_turnover = []
+                curr_batch_symdiff = []
 
                 prev_indices_tensor = None
 
@@ -3294,9 +3333,11 @@ class ObserverOfflineBatchTrainer:
 
                     # VALIDATION MODE: Always use full penalty (no curriculum learning)
                     lambda_epoch = 1.0
-                    penalty = lambda_epoch * (
+                    penalty_sum = (
                         self.alpha_turnover * turnover + self.alpha_change * symdiff
                     )
+                    penalty = lambda_epoch * penalty_sum
+                    
                     R_net = R_raw - penalty
                     A_t_raw = R_net - baseline
                     A_mean = A_t_raw.mean()
@@ -3324,6 +3365,31 @@ class ObserverOfflineBatchTrainer:
                     pg_losses.append(step_pg_loss.item())
                     risk_losses.append(risk_loss.item())
                     dir_losses.append(dir_loss.item())
+                    
+                    # Store rewards ONLY for rebalance events (matching effective_mask)
+                    # Or do we want average per step? Spec usually implies rebalance events?
+                    # But for overall validation metrics, we can just sum up everything or mask it.
+                    # Since losses are sparse, let's follow the mask logic for accurate counts.
+                    # R_raw/penalty are defined at every step but only meaningful at rebalance.
+                    # But if we hold, turnover=0, R_raw is still computed (future return).
+                    # Actually spec says PG considers rewards from action a_t.
+                    # If we held, action was 'hold'.
+                    # Let's collect ALL for simple averaging, or masked?
+                    # Usually metrics like "Turnover" should be avg per step or avg per rebalance?
+                    # Standard practice: Average over all steps to see load, or average per event.
+                    # Let's collect raw values and normalized later if needed.
+                    # Actually, let's use the effective mask to only count "decisions".
+                    # But "Reward" exists even if we hold.
+                    # Let's average over the whole trajectory for now, consistent with losses.
+                    # NOTE: R_net is used for Advantage.
+                    
+                    curr_batch_rewards.append(R_raw.mean().item()) # Mean across batch
+                    curr_batch_net.append(R_net.mean().item())
+                    
+                    # For penalties, meaningful only if rebalance occurred? 
+                    # If we hold, turnover=0. So summing 0s works fine for average.
+                    curr_batch_turnover.append((turnover * lambda_epoch * self.alpha_turnover).mean().item())
+                    curr_batch_symdiff.append((symdiff * lambda_epoch * self.alpha_change).mean().item())
 
                     # Collect outputs
                     collected_topk_scores.append(final_scores)
@@ -3360,11 +3426,23 @@ class ObserverOfflineBatchTrainer:
             total_loss_pg += avg_pg
             total_loss_risk += avg_risk
             total_loss_dir += avg_dir
+            
+            # Aggregate Rewards
+            avg_rew = sum(curr_batch_rewards) / len(curr_batch_rewards) if curr_batch_rewards else 0.0
+            avg_net = sum(curr_batch_net) / len(curr_batch_net) if curr_batch_net else 0.0
+            avg_turn = sum(curr_batch_turnover) / len(curr_batch_turnover) if curr_batch_turnover else 0.0
+            avg_sym = sum(curr_batch_symdiff) / len(curr_batch_symdiff) if curr_batch_symdiff else 0.0
+            
+            total_reward += avg_rew
+            total_net_reward += avg_net
+            total_turnover_penalty += avg_turn
+            total_symdiff_penalty += avg_sym
 
             # Store for metric computation
             all_topk_indices.append(topk_indices_stack)
             all_topk_scores.append(topk_scores_stack)
             all_price_returns.append(batch.price_returns[:, :T_m, :])
+            all_market_returns.append(batch.market_returns[:, :T_m]) # NEW
             all_risk_pred.append(risk_eta_stack)
             all_risk_target.append(batch.risk_targets)
             all_direction_logits.append(direction_logits_stack)
@@ -3375,11 +3453,18 @@ class ObserverOfflineBatchTrainer:
         avg_loss_pg = total_loss_pg / steps
         avg_loss_risk = total_loss_risk / steps
         avg_loss_dir = total_loss_dir / steps
+        
+        # Average rewards
+        avg_reward = total_reward / steps
+        avg_net_reward = total_net_reward / steps
+        avg_turnover_penalty = total_turnover_penalty / steps
+        avg_symdiff_penalty = total_symdiff_penalty / steps
 
         # Concatenate all batches for metric computation
         all_topk_indices_cat = th.cat(all_topk_indices, dim=0)
         all_topk_scores_cat = th.cat(all_topk_scores, dim=0)
         all_price_returns_cat = th.cat(all_price_returns, dim=0)
+        all_market_returns_cat = th.cat(all_market_returns, dim=0) # NEW
         all_risk_pred_cat = th.cat(all_risk_pred, dim=0)
         all_risk_target_cat = th.cat(all_risk_target, dim=0)
         all_direction_logits_cat = th.cat(all_direction_logits, dim=0)
@@ -3390,6 +3475,7 @@ class ObserverOfflineBatchTrainer:
             all_topk_indices_cat,
             all_topk_scores_cat,
             all_price_returns_cat,
+            all_market_returns_cat, # Pass market returns
         )
 
         direction_metrics = self.compute_direction_metrics(
@@ -3420,6 +3506,12 @@ class ObserverOfflineBatchTrainer:
             risk_mse=risk_metrics["mse"],
             risk_mae=risk_metrics["mae"],
             risk_correlation=risk_metrics["correlation"],
+            # NEW fields
+            topk_advantage=selection_metrics.get("topk_advantage", 0.0),
+            reward=avg_reward,
+            net_reward=avg_net_reward,
+            turnover_penalty=avg_turnover_penalty,
+            symdiff_penalty=avg_symdiff_penalty,
         )
 
         self.observer.mafia_model.train()

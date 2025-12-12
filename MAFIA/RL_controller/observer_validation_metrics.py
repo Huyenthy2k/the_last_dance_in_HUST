@@ -59,6 +59,13 @@ class ObserverValidationResult:
         ces_rank_sharpe: Rank-normalized Sharpe (0 to 1)
         ces_rank_dir_f1: Rank-normalized Direction F1 (0 to 1)
         ces_rank_risk_mse: Rank-normalized Risk MSE (0 to 1)
+        
+        # Additional Metrics (Requested)
+        topk_advantage: Advantage of Top-K over baseline (Top-K Return - Baseline Return)
+        reward: Raw reward sum
+        net_reward: Net reward (Reward - Penalties)
+        turnover_penalty: Turnover penalty value
+        symdiff_penalty: Symdiff penalty value
     """
     
     epoch: int
@@ -92,6 +99,13 @@ class ObserverValidationResult:
     ces_rank_sharpe: float = 0.0
     ces_rank_dir_f1: float = 0.0
     ces_rank_risk_mse: float = 0.0
+    
+    # Additional metrics
+    topk_advantage: float = 0.0
+    reward: float = 0.0
+    net_reward: float = 0.0
+    turnover_penalty: float = 0.0
+    symdiff_penalty: float = 0.0
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for CSV export."""
