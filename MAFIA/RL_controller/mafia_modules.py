@@ -944,6 +944,8 @@ class DirectionHead(nn.Module):
 
         # Initialize bias to log-priors matching data distribution
         self._init_classifier_bias()
+        # Smart-initialize explicit signal weights (hot-start for Wide Path)
+        self._init_explicit_signal_weights()
 
     def _init_classifier_bias(self):
         """
@@ -958,6 +960,42 @@ class DirectionHead(nn.Module):
         with th.no_grad():
             # Log-prior initialization (matches data distribution)
             self.classifier.bias.copy_(th.tensor([-1.514, -0.821, -1.079]))
+
+    def _init_explicit_signal_weights(self):
+        """
+        Smart-initialize Wide Path weights to respect signal logic.
+        Signals: 0:DC, 1:Breadth, 2:Div, 3:VPI
+        Convention: -1 (Bearish), +1 (Bullish)
+
+        Weight logic:
+        - Bear Class (0): Negative weight (so -1 input -> + logit)
+        - Bull Class (2): Positive weight (so +1 input -> + logit)
+        """
+        with th.no_grad():
+            # Indices in the concatenated input (Deep=0..D-1, Wide=D..D+3)
+            # Weights shape: (3, D+4)
+
+            # 1. DC Event Flag (Index D+0) - Strongest Signal
+            # Val: -1 (Bear), 1 (Bull)
+            self.classifier.weight[0, self.D + 0] = -1.0  # Bear class favors negative input
+            self.classifier.weight[2, self.D + 0] = 1.0  # Bull class favors positive input
+
+            # 2. Divergence Signal (Index D+2) - Reversal
+            # Val: -1 (Bear reversal), 1 (Bull reversal)
+            self.classifier.weight[0, self.D + 2] = -0.5
+            self.classifier.weight[2, self.D + 2] = 0.5
+
+            # 3. Breadth & VPI (Indices D+1, D+3) - Weaker correlation
+            # Breadth: High/Pos -> Bull, Low/Neg -> Bear
+            self.classifier.weight[0, self.D + 1] = -0.3
+            self.classifier.weight[2, self.D + 1] = 0.3
+            # VPI: Pos -> Bull efficient, Neg -> Bear efficient
+            self.classifier.weight[0, self.D + 3] = -0.3
+            self.classifier.weight[2, self.D + 3] = 0.3
+
+            # Ensure Side Class (1) remains neutral to these signals initially
+            # It relies more on the Deep Path (latent context)
+            self.classifier.weight[1, self.D : self.D + 4] = 0.0
 
     def forward(
         self,
