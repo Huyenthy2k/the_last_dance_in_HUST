@@ -14,10 +14,10 @@ from RL_controller.compressed_replay_buffer import (
     CompressedDictReplayBuffer,
     CompressedReplayBuffer,
 )
-from RL_controller.TD3_controller import TD3PolicyOriginal
-from RL_controller.feature_extractors import (
-    MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
-)
+# from RL_controller.TD3_controller import TD3PolicyOriginal
+# from RL_controller.feature_extractors import (
+#     MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
+# )
 from stable_baselines3.common.utils import LinearSchedule
 
 
@@ -1029,6 +1029,7 @@ class Config:
                 )
         else:
             if self.rl_model_name == "TD3":
+                from RL_controller.TD3_controller import TD3PolicyOriginal
                 policy_name = TD3PolicyOriginal
             else:
                 if self.mode in ["RLonly", "RLcontroller"]:
@@ -1147,6 +1148,9 @@ class Config:
         # Inject multi-input policy kwargs when using observer+dict obs
         if use_multibranch and self.rl_model_name == "TD3":
             extractor_kwargs = {"config": self}
+            from RL_controller.feature_extractors import (
+                MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
+            )
             mi_policy_kwargs = {
                 "features_extractor_class": MAFIASingleStageMLP,
                 "features_extractor_kwargs": extractor_kwargs,

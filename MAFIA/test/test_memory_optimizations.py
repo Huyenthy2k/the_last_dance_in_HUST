@@ -41,7 +41,10 @@ def test_mixed_precision():
     print(f"Device: {device}")
     
     # Create observer and trainer
-    observer = MAFIAObserver(config, stock_list=["TEST1", "TEST2", "TEST3"], device=device)
+    # Create observer and trainer
+    observer = MAFIAObserver(config, action_dim=3)
+    # Observer sets its own device from config/availability, verify it matches
+    print(f"Observer Device: {observer.device}")
     trainer = ObserverOfflineBatchTrainer(config, observer, device)
     
     # Check if scaler is initialized correctly
@@ -70,7 +73,7 @@ def test_gradient_accumulation():
     
     device = th.device("cpu")  # Use CPU for simplicity
     
-    observer = MAFIAObserver(config, stock_list=["TEST1", "TEST2"], device=device)
+    observer = MAFIAObserver(config, action_dim=2)
     trainer = ObserverOfflineBatchTrainer(config, observer, device)
     
     assert trainer.gradient_accumulation_steps == 4
