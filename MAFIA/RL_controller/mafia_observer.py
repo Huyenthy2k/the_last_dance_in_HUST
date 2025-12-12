@@ -100,10 +100,10 @@ class MAFIAObserver:
         self._validate_config()
 
         # Setup device first: MPS (Apple Silicon) > CUDA (NVIDIA) > CPU
-        if th.backends.mps.is_available():
-            self.device = th.device("mps")
-        elif th.cuda.is_available():
+        if th.cuda.is_available():
             self.device = th.device("cuda:0")
+        elif th.backends.mps.is_available():
+            self.device = th.device("mps")
         else:
             self.device = th.device("cpu")
 

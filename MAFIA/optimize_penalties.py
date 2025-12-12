@@ -81,7 +81,12 @@ def run_single_config(
         return {"error": str(e), "alpha_turnover": alpha_turnover, "alpha_change": alpha_change}
 
     # Initialize model and trainer
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    if th.cuda.is_available():
+        device = th.device("cuda")
+    elif th.backends.mps.is_available():
+        device = th.device("mps")
+    else:
+        device = th.device("cpu")
     action_dim = len(stock_list)
     observer = MAFIAObserver(config=config, action_dim=action_dim)
     trainer = ObserverOfflineBatchTrainer(config=config, observer=observer, device=device)

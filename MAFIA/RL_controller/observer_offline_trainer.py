@@ -211,10 +211,10 @@ class ObserverOfflineBatchTrainer:
         # Device selection: MPS (Apple Silicon) > CUDA (NVIDIA) > CPU
         if device is not None:
             self.device = device
-        elif th.backends.mps.is_available():
-            self.device = th.device("mps")
         elif th.cuda.is_available():
             self.device = th.device("cuda")
+        elif th.backends.mps.is_available():
+            self.device = th.device("mps")
         else:
             self.device = th.device("cpu")
         self.optimizer = observer.optimizer  # Use observer's optimizer

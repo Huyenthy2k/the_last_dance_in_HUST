@@ -597,10 +597,10 @@ def run_offline_observer_training(
 
     # Create observer and trainer
     # Device selection: MPS (Apple Silicon) > CUDA (NVIDIA) > CPU
-    if th.backends.mps.is_available():
-        device = th.device("mps")
-    elif th.cuda.is_available():
+    if th.cuda.is_available():
         device = th.device("cuda")
+    elif th.backends.mps.is_available():
+        device = th.device("mps")
     else:
         device = th.device("cpu")
     

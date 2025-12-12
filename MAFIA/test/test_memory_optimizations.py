@@ -32,7 +32,12 @@ def test_mixed_precision():
     config.use_mixed_precision = True
     config.gradient_accumulation_steps = 1
     
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    if th.cuda.is_available():
+        device = th.device("cuda")
+    elif th.backends.mps.is_available():
+        device = th.device("mps")
+    else:
+        device = th.device("cpu")
     print(f"Device: {device}")
     
     # Create observer and trainer
