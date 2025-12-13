@@ -61,14 +61,26 @@ class ValidationMetricsTracker:
     def add_epoch(self, result: ObserverValidationResult) -> bool:
         """
         Add validation result for an epoch and update CES scores.
-        
+        If epoch already exists (from resume), replace it instead of duplicating.
+
         Args:
             result: Validation result to add
-            
+
         Returns:
             True if this is a new best checkpoint
         """
-        self.history.append(result)
+        # Check if epoch already exists (resume scenario) - replace instead of duplicate
+        existing_idx = None
+        for idx, h in enumerate(self.history):
+            if h.epoch == result.epoch:
+                existing_idx = idx
+                break
+
+        if existing_idx is not None:
+            self.history[existing_idx] = result
+        else:
+            self.history.append(result)
+
         self._recompute_ces_scores()
         is_best = self._update_best()
         return is_best
@@ -189,7 +201,12 @@ class ValidationMetricsTracker:
     
     def save_validation_history(self) -> str:
         """
-        Save validation metrics to CSV file.
+        Save validation metrics to CSV file using atomic write.
+        
+        Writing strategy:
+        1. Write to temp file
+        2. Flush and sync
+        3. Rename temp file to target file (atomic on POSIX)
         
         Returns:
             Path to saved CSV file
@@ -201,10 +218,25 @@ class ValidationMetricsTracker:
         records = [h.to_dict() for h in self.history]
         df = pd.DataFrame(records)
         
-        # Save to CSV
-        csv_path = os.path.join(self.output_dir, "valid_metrics.csv")
         os.makedirs(self.output_dir, exist_ok=True)
-        df.to_csv(csv_path, index=False)
+        csv_path = os.path.join(self.output_dir, "valid_metrics.csv")
+        temp_path = csv_path + ".tmp"
+        
+        try:
+            # Write to temp file first
+            df.to_csv(temp_path, index=False)
+            
+            # Atomic rename
+            os.replace(temp_path, csv_path)
+        except Exception as e:
+            print(f"[TRACKER] Failed to save validation history: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            # Don't crash training on save fail, but warn loudly
+            pass
         
         return csv_path
     
@@ -218,6 +250,10 @@ class ValidationMetricsTracker:
         
         Args:
             csv_path: Path to valid_metrics.csv
+            
+        Raises:
+            ValueError: If file content is invalid/corrupt (to prevent functional data loss)
+            IOError: If file cannot be read
         """
         if not os.path.exists(csv_path):
             return
@@ -225,10 +261,16 @@ class ValidationMetricsTracker:
         try:
             df = pd.read_csv(csv_path)
             if df.empty:
-                print(f"[TRACKER] CSV file exists but is empty: {csv_path}")
+                print(f"[TRACKER] CSV file exists but is empty, starting fresh: {csv_path}")
                 return
 
-            self.history = []
+            # Check if required columns exist before parsing (at least epoch matches)
+            if "epoch" not in df.columns:
+                print(f"[TRACKER] CRITICAL: 'epoch' column missing in {csv_path}. Treating as corrupt.")
+                # We decide to abort loading to force user intervention or explicit restart
+                raise ValueError(f"Corrupt CSV: Missing 'epoch' column in {csv_path}")
+
+            loaded_history = []
 
             for _, row in df.iterrows():
                 # Convert row keys to match ObserverValidationResult fields
@@ -236,14 +278,26 @@ class ValidationMetricsTracker:
                 data = row.to_dict()
                 
                 # Ensure types
-                data["epoch"] = int(data["epoch"])
-                for k, v in data.items():
-                    if k != "epoch":
-                        data[k] = float(v)
+                try:
+                    data["epoch"] = int(data["epoch"])
+                    for k, v in data.items():
+                        if k != "epoch":
+                            data[k] = float(v)
+                except ValueError as ve:
+                     raise ValueError(f"Invalid data type in CSV row: {row}") from ve
+                
+                # Robustly create object, ignoring unknown fields if schema evolved
+                # Filter data to only valid fields of ObserverValidationResult
+                valid_fields = ObserverValidationResult.__dataclass_fields__.keys()
+                filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+                
+                # Check for critical missing fields if any (optional)
                 
                 # Create object
-                result = ObserverValidationResult(**data)
-                self.history.append(result)
+                result = ObserverValidationResult(**filtered_data)
+                loaded_history.append(result)
+            
+            self.history = loaded_history
             
             # Recompute global bests
             self._recompute_ces_scores()
@@ -261,4 +315,6 @@ class ValidationMetricsTracker:
                 print(f"[TRACKER] Loaded {len(self.history)} validation records (no valid CES found yet).")
             
         except Exception as e:
-            print(f"[TRACKER] Failed to load history from {csv_path}: {e}")
+            print(f"[TRACKER] 🛑 FATAL: Failed to load history from {csv_path}: {e}")
+            print(f"[TRACKER] Aborting load to prevent overwriting valid data with empty state.")
+            raise  # Re-raise to let caller handle (likely abort)

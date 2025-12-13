@@ -2279,7 +2279,7 @@ class ObserverOfflineBatchTrainer:
 
             self._trajectory_log.append(
                 {
-                    "batch_idx": b,
+                    "batch_idx": batch_idx,
                     "timestep": t,
                     "trigger": trigger_str,
                     "rebalanced": is_rebalance_b0,

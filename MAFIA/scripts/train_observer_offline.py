@@ -269,53 +269,86 @@ def train_observer_offline_iteration(
 
     current_global_step = global_step_start
 
-    # Resume logic: Check for existing checkpoints in temp dir
+            # Resume logic: Check for existing checkpoints in temp dir
     # Priority: latest_checkpoint.pth > epoch_{N}.pth (best checkpoints)
     start_epoch = 0
     smart_print(f"[DEBUG] Checking for resume in: {temp_ckpt_dir}")
     if os.path.exists(temp_ckpt_dir):
-        smart_print(f"[DEBUG] temp_ckpt_dir exists, contents: {os.listdir(temp_ckpt_dir)}")
+        # fast check contents
+        dir_contents = os.listdir(temp_ckpt_dir)
+        smart_print(f"[DEBUG] temp_ckpt_dir exists, contents: {dir_contents}")
+        
         latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
+        
+        # Stale Checkpoint Detection
+        # If 'latest_checkpoint.pth' is missing but we have 'epoch_X.pth', it implies 
+        # the previous run might have finished/crashed but 'latest' wasn't written 
+        # or we are picking up a "best" checkpoint from a long-ago run.
+        has_epoch_ckpts = any(f.startswith("epoch_") and f.endswith(".pth") for f in dir_contents)
+        if has_epoch_ckpts and not os.path.exists(latest_ckpt_path):
+            smart_print("\n" + "!" * 80)
+            smart_print("⚠️  WARNING: Stale Checkpoint Risk!")
+            smart_print("   Found 'epoch_X.pth' (best ckpts) but NO 'latest_checkpoint.pth'.")
+            smart_print("   This usually means a previous run finished or was stopped, and we are")
+            smart_print("   dangerously resuming from a BEST checkpoint rather than the LATEST state.")
+            smart_print("   This can cause 'time travel' where we resume from epoch 8 (best) ")
+            smart_print("   even though the run actually went to epoch 50.")
+            smart_print("!" * 80 + "\n")
 
         # Try latest_checkpoint.pth first (most recent training state)
+        resume_path = None
         if os.path.exists(latest_ckpt_path):
+            resume_path = latest_ckpt_path
+            smart_print(f"[RESUME] Found latest checkpoint: {latest_ckpt_path}")
+        elif has_epoch_ckpts:
+            # Fallback: Find best epoch checkpoints (epoch_{N}.pth)
+            existing_ckpts = [f for f in dir_contents if f.startswith("epoch_") and f.endswith(".pth")]
+            epoch_nums = [int(f.split("_")[1].split(".")[0]) for f in existing_ckpts]
+            max_epoch = max(epoch_nums)
+            resume_path = os.path.join(temp_ckpt_dir, f"epoch_{max_epoch}.pth")
+            smart_print(f"[RESUME] WARN: Fallback to best checkpoint: {resume_path}")
+
+        if resume_path:
             try:
-                smart_print(f"[RESUME] Found latest checkpoint: {latest_ckpt_path}")
-                loaded_epoch = trainer.observer.load_checkpoint(latest_ckpt_path)
+                loaded_epoch = trainer.observer.load_checkpoint(resume_path)
                 start_epoch = loaded_epoch + 1
 
                 # Restore Validation Tracker History
                 valid_csv_path = os.path.join(iter_output_dir, "valid_metrics.csv")
                 if os.path.exists(valid_csv_path):
                     smart_print(f"[RESUME] Restoring validation history from: {valid_csv_path}")
-                    tracker.load_history_from_csv(valid_csv_path)
+                    try:
+                        tracker.load_history_from_csv(valid_csv_path)
+                    except Exception as load_err:
+                        smart_print(f"\n[CRITICAL] Failed to load validation history: {load_err}")
+                        smart_print("[CRITICAL] Aborting training to prevent data loss/corruption.")
+                        raise load_err
+                    
+                    # Truncate history to remove any stale "future" epochs
+                    # (e.g. if we resumed from epoch 10 but history has data up to epoch 15 from a failed run)
+                    # We strictly trust the CHECKPOINT's epoch count.
+                    original_len = len(tracker.history)
+                    tracker.history = [h for h in tracker.history if h.epoch < start_epoch]
+                    new_len = len(tracker.history)
+                    
+                    if new_len < original_len:
+                        smart_print(f"[RESUME] Truncated validation history from {original_len} to {new_len} records (removed future epochs).")
+                    
+                    tracker._recompute_ces_scores()
 
                 smart_print(f"[RESUME] Will continue from epoch {start_epoch}")
             except Exception as e:
-                smart_print(f"[WARN] Failed to load latest checkpoint: {e}")
+                smart_print(f"[WARN] Failed to load checkpoint: {e}")
+                # If critical error loading history, we already raised. 
+                # If just checkpoint load fail, maybe safer to crash than start from 0 if files exist?
+                # For now, let's allow fail->start 0 coupled with warning, 
+                # BUT if we start at 0, we should probably backup existing metric file?
+                # If we fail to resume but have data, we might overwrite it.
+                if os.path.exists(valid_csv_path):
+                     smart_print("[CRITICAL] Checkpoint load failed but valid_metrics.csv exists.")
+                     smart_print("[CRITICAL] Starting from Epoch 0 would overwrite it. Aborting for safety.")
+                     raise e
                 start_epoch = 0
-        else:
-            # Fallback: Find best epoch checkpoints (epoch_{N}.pth)
-            existing_ckpts = [f for f in os.listdir(temp_ckpt_dir) if f.startswith("epoch_") and f.endswith(".pth")]
-            if existing_ckpts:
-                try:
-                    epoch_nums = [int(f.split("_")[1].split(".")[0]) for f in existing_ckpts]
-                    max_epoch = max(epoch_nums)
-                    resume_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{max_epoch}.pth")
-
-                    smart_print(f"[RESUME] Found best checkpoint: {resume_ckpt_path}")
-                    loaded_epoch = trainer.observer.load_checkpoint(resume_ckpt_path)
-                    start_epoch = loaded_epoch + 1
-
-                    # Restore Validation Tracker History
-                    valid_csv_path = os.path.join(iter_output_dir, "valid_metrics.csv")
-                    if os.path.exists(valid_csv_path):
-                        smart_print(f"[RESUME] Restoring validation history from: {valid_csv_path}")
-                        tracker.load_history_from_csv(valid_csv_path)
-
-                    smart_print(f"[RESUME] Will continue from epoch {start_epoch}")
-                except Exception as e:
-                    smart_print(f"[WARN] Failed to resume from temp checkpoints: {e}")
 
     # Training Loop
     if start_epoch >= num_epochs:
@@ -341,110 +374,113 @@ def train_observer_offline_iteration(
         smart_print(f"\n📊 Charts will be saved to: {os.path.abspath(plots_dir)}")
         smart_print(f"   (Updated after each batch for real-time progress)\n")
 
-    for epoch in range(start_epoch, num_epochs):
-        # Create per-batch visualization callback
-        def on_batch_viz(batch_idx, total_batches):
-            # Generate charts after each batch for real-time progress
+    # Wrap loop in try-finally to ensure validation metrics are saved
+    try:
+        for epoch in range(start_epoch, num_epochs):
+            # Create per-batch visualization callback
+            def on_batch_viz(batch_idx, total_batches):
+                # Generate charts after each batch for real-time progress
+                try:
+                    generate_epoch_report(tracker.output_dir, epoch)
+                except Exception:
+                    pass  # Silent fail - don't interrupt training
+            
+            # 1. Train
+            train_res = trainer.train_epoch(
+                data_tensors=train_tensors,
+                steps_per_epoch=batches_per_epoch,
+                writer=writer,
+                global_step_offset=current_global_step,
+                on_batch_done=on_batch_viz,  # Real-time chart updates
+            )
+            current_global_step += batches_per_epoch
+
+            # 2. Validate (returns ObserverValidationResult)
+            val_result = trainer.validate_epoch(
+                data_tensors=valid_tensors,
+                steps=max(1, batches_per_epoch // 4),
+            )
+
+            # 3. Track metrics and compute CES
+            is_best = tracker.add_epoch(val_result)
+            
+            # 4. Log to TensorBoard
+            if writer:
+                writer.add_scalar("Valid/Loss/Total", val_result.loss_total, epoch)
+                writer.add_scalar("Valid/Loss/PG", val_result.loss_pg, epoch)
+                writer.add_scalar("Valid/Loss/Risk", val_result.loss_risk, epoch)
+                writer.add_scalar("Valid/Loss/Dir", val_result.loss_dir, epoch)
+                writer.add_scalar("Valid/Metrics/Sharpe", val_result.topk_sharpe_ratio, epoch)
+                writer.add_scalar("Valid/Metrics/Dir_F1", val_result.direction_f1_macro, epoch)
+                writer.add_scalar("Valid/Metrics/Risk_MSE", val_result.risk_mse, epoch)
+                writer.add_scalar("Valid/Metrics/CES", val_result.ces_score, epoch)
+
+            # 5. Update Live Dashboard
+            update_observer(
+                loss=train_res.get("loss_total", 0.0),
+                loss_eta=val_result.risk_mse,
+                loss_dir=val_result.loss_dir,
+            )
+            
+            update_walkforward_score(
+                current_score=val_result.ces_score,
+                best_score=tracker.best_ces,
+                best_epoch=tracker.best_epoch if tracker.best_epoch is not None else epoch,
+            )
+
+            # 6. Save checkpoints
+            # Always save latest checkpoint for resume (overwrites previous)
+            latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
+            trainer.observer.save_checkpoint(latest_ckpt_path, epoch=epoch)
+
+            # Save best checkpoint separately (for final selection)
+            if is_best:
+                best_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
+                trainer.observer.save_checkpoint(best_ckpt_path, epoch=epoch)
+
+            # 7. Progress logging
+            if verbose:
+                smart_print(val_result.summary_str())
+
+            # Save validation history after each epoch to support resume
+            tracker.save_validation_history()
+            
+            # 8. Generate Real-time Visualization (Insights)
+            if verbose:
+                smart_print(f"      Running Visualization for Epoch {epoch}...")
             try:
                 generate_epoch_report(tracker.output_dir, epoch)
-            except Exception:
-                pass  # Silent fail - don't interrupt training
-        
-        # 1. Train
-        train_res = trainer.train_epoch(
-            data_tensors=train_tensors,
-            steps_per_epoch=batches_per_epoch,
-            writer=writer,
-            global_step_offset=current_global_step,
-            on_batch_done=on_batch_viz,  # Real-time chart updates
-        )
-        current_global_step += batches_per_epoch
+                
+                # Log generated charts to TensorBoard
+                if trainer.tb_logger is not None and trainer.tb_logger.log_images:
+                    plots_dir = os.path.join(tracker.output_dir, "plots")
+                    
+                    # Log dashboard chart
+                    dashboard_path = os.path.join(plots_dir, "dashboard_latest.png")
+                    if os.path.exists(dashboard_path):
+                        trainer.tb_logger.log_image("charts/dashboard", dashboard_path, epoch, phase="valid")
+                    
+                    # Log loss history chart
+                    loss_history_path = os.path.join(plots_dir, "loss_history.png")
+                    if os.path.exists(loss_history_path):
+                        trainer.tb_logger.log_image("charts/loss_history", loss_history_path, epoch, phase="valid")
+                    
+                    # Log dynamics chart
+                    dynamics_path = os.path.join(plots_dir, "dynamics_latest.png")
+                    if os.path.exists(dynamics_path):
+                        trainer.tb_logger.log_image("charts/dynamics", dynamics_path, epoch, phase="valid")
+                    
+                    # Flush to ensure images are written
+                    trainer.tb_logger.flush()
+                    
+            except Exception as e:
+                smart_print(f"      [WARN] Visualization failed: {e}")
 
-        # 2. Validate (returns ObserverValidationResult)
-        val_result = trainer.validate_epoch(
-            data_tensors=valid_tensors,
-            steps=max(1, batches_per_epoch // 4),
-        )
-
-        # 3. Track metrics and compute CES
-        is_best = tracker.add_epoch(val_result)
-        
-        # 4. Log to TensorBoard
-        if writer:
-            writer.add_scalar("Valid/Loss/Total", val_result.loss_total, epoch)
-            writer.add_scalar("Valid/Loss/PG", val_result.loss_pg, epoch)
-            writer.add_scalar("Valid/Loss/Risk", val_result.loss_risk, epoch)
-            writer.add_scalar("Valid/Loss/Dir", val_result.loss_dir, epoch)
-            writer.add_scalar("Valid/Metrics/Sharpe", val_result.topk_sharpe_ratio, epoch)
-            writer.add_scalar("Valid/Metrics/Dir_F1", val_result.direction_f1_macro, epoch)
-            writer.add_scalar("Valid/Metrics/Risk_MSE", val_result.risk_mse, epoch)
-            writer.add_scalar("Valid/Metrics/CES", val_result.ces_score, epoch)
-
-        # 5. Update Live Dashboard
-        update_observer(
-            loss=train_res.get("loss_total", 0.0),
-            loss_eta=val_result.risk_mse,
-            loss_dir=val_result.loss_dir,
-        )
-        
-        update_walkforward_score(
-            current_score=val_result.ces_score,
-            best_score=tracker.best_ces,
-            best_epoch=tracker.best_epoch if tracker.best_epoch is not None else epoch,
-        )
-
-        # 6. Save checkpoints
-        # Always save latest checkpoint for resume (overwrites previous)
-        latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
-        trainer.observer.save_checkpoint(latest_ckpt_path, epoch=epoch)
-
-        # Save best checkpoint separately (for final selection)
-        if is_best:
-            best_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
-            trainer.observer.save_checkpoint(best_ckpt_path, epoch=epoch)
-
-        # 7. Progress logging
+    finally:
+        # Save validation history to CSV (ensure save on interrupt/error)
+        csv_path = tracker.save_validation_history()
         if verbose:
-            smart_print(val_result.summary_str())
-
-        # Save validation history after each epoch to support resume
-        tracker.save_validation_history()
-        
-        # 8. Generate Real-time Visualization (Insights)
-        if verbose:
-            smart_print(f"      Running Visualization for Epoch {epoch}...")
-        try:
-            generate_epoch_report(tracker.output_dir, epoch)
-            
-            # Log generated charts to TensorBoard
-            if trainer.tb_logger is not None and trainer.tb_logger.log_images:
-                plots_dir = os.path.join(tracker.output_dir, "plots")
-                
-                # Log dashboard chart
-                dashboard_path = os.path.join(plots_dir, "dashboard_latest.png")
-                if os.path.exists(dashboard_path):
-                    trainer.tb_logger.log_image("charts/dashboard", dashboard_path, epoch, phase="valid")
-                
-                # Log loss history chart
-                loss_history_path = os.path.join(plots_dir, "loss_history.png")
-                if os.path.exists(loss_history_path):
-                    trainer.tb_logger.log_image("charts/loss_history", loss_history_path, epoch, phase="valid")
-                
-                # Log dynamics chart
-                dynamics_path = os.path.join(plots_dir, "dynamics_latest.png")
-                if os.path.exists(dynamics_path):
-                    trainer.tb_logger.log_image("charts/dynamics", dynamics_path, epoch, phase="valid")
-                
-                # Flush to ensure images are written
-                trainer.tb_logger.flush()
-                
-        except Exception as e:
-            smart_print(f"      [WARN] Visualization failed: {e}")
-
-    # Save validation history to CSV
-    csv_path = tracker.save_validation_history()
-    if verbose:
-        smart_print(f"\n[OFFLINE] Validation history saved to: {csv_path}")
+            smart_print(f"\n[OFFLINE] Validation history saved to: {csv_path}")
     
     # Get best checkpoint info
     best_info = tracker.get_best_checkpoint_info()
@@ -579,7 +615,7 @@ def run_offline_observer_training(
         market_file = os.path.join(getattr(config, "dataDir", "./data"), index_file_name)
         if not os.path.exists(market_file):
              # Fallback to hardcoded name if config name not found
-             market_file = os.path.join(getattr(config, "dataDir", "./data"), "vnindex_data.csv")
+             market_file = os.path.join(getattr(config, "dataDir", "./data"), "VNINDEX_1d_index.csv")
         if os.path.exists(market_file):
             market_data = pd.read_csv(market_file, parse_dates=["date"])
             if verbose:

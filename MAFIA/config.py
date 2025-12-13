@@ -14,6 +14,7 @@ from RL_controller.compressed_replay_buffer import (
     CompressedDictReplayBuffer,
     CompressedReplayBuffer,
 )
+
 # from RL_controller.TD3_controller import TD3PolicyOriginal
 # from RL_controller.feature_extractors import (
 #     MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
@@ -173,8 +174,8 @@ class Config:
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
         # Penalty coefficients (stronger to stand against reward scaling=100)
-        self.mafia_pg_alpha_turnover = 0.5  # Turnover penalty coefficient
-        self.mafia_pg_alpha_change = 0.5  # Membership change penalty coefficient
+        self.mafia_pg_alpha_turnover = 1.5  # Turnover penalty coefficient
+        self.mafia_pg_alpha_change = 2.0  # Membership change penalty coefficient
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
         self.direction_label_delta = (
@@ -804,7 +805,7 @@ class Config:
 
         # Trajectory Configuration (Spec §6)
         self.mafia_trajectory_length = 128  # T_m: trajectory length
-        self.mafia_batch_size = 32  # B: batch size for random trajectory sampling
+        self.mafia_batch_size = 64  # B: batch size for random trajectory sampling
         self.mafia_sampling_strategy = (
             "random_trajectory"  # "random_trajectory" or "recent_trajectory"
         )
@@ -830,7 +831,7 @@ class Config:
         # Trade compute for memory by recomputing activations during backward pass
         # Reduces VRAM for activations by ~30-40%
         self.use_gradient_checkpointing = (
-            True  # Enable for Router LSTM and Expert Transformers
+            False  # Enable for Router LSTM and Expert Transformers
         )
 
         # ===== TensorBoard Configuration =====
@@ -864,7 +865,7 @@ class Config:
         # Curriculum Learning (spec §7.1) - Penalty Warm-up
         # DISABLED: Full penalties from epoch 0 (λ_epoch = 1.0 always)
         self.curriculum_warmup_epochs = 0  # No warmup phase
-        self.curriculum_penalty_rampup = 5 # Rampup over 3 epochs (Planned: 3)
+        self.curriculum_penalty_rampup = 5  # Rampup over 3 epochs (Planned: 3)
 
         # Direction Labeling
         self.mafia_direction_threshold = (
@@ -1030,6 +1031,7 @@ class Config:
         else:
             if self.rl_model_name == "TD3":
                 from RL_controller.TD3_controller import TD3PolicyOriginal
+
                 policy_name = TD3PolicyOriginal
             else:
                 if self.mode in ["RLonly", "RLcontroller"]:
@@ -1151,6 +1153,7 @@ class Config:
             from RL_controller.feature_extractors import (
                 MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
             )
+
             mi_policy_kwargs = {
                 "features_extractor_class": MAFIASingleStageMLP,
                 "features_extractor_kwargs": extractor_kwargs,
