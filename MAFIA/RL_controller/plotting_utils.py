@@ -85,7 +85,8 @@ def plot_loss_components(
 def plot_validation_metrics_grid(
     csv_path: str,
     output_path: Optional[str] = None,
-    title: str = "Validation Metrics"
+    title: str = "Validation Metrics",
+    min_best_epoch: int = 0
 ) -> plt.Figure:
     """
     Plot validation metrics in 2×2 grid with best epoch marked.
@@ -97,8 +98,21 @@ def plot_validation_metrics_grid(
       - Bottom-right: CES Score (highlighted)
     """
     df = pd.read_csv(csv_path)
-    best_idx = df['ces_score'].idxmax()
-    best_epoch = df.loc[best_idx, 'epoch']
+    
+    # Filter for valid 'Best' candidates (Curriculum Logic)
+    valid_candidates = df[df['epoch'] >= min_best_epoch]
+    if not valid_candidates.empty:
+        best_idx = valid_candidates['ces_score'].idxmax()
+        best_epoch = df.loc[best_idx, 'epoch']
+        best_ces = df.loc[best_idx, 'ces_score']
+        best_label = f'Best: Epoch {int(best_epoch)}'
+    else:
+        # Fallback if no valid candidates yet (early curriculum phase)
+        # Just pick max CES but label it as "Pending" or similar
+        best_idx = df['ces_score'].idxmax()
+        best_epoch = df.loc[best_idx, 'epoch']
+        best_ces = df.loc[best_idx, 'ces_score']
+        best_label = f'Best (Curriculum): {int(best_epoch)}'
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=14, fontweight='bold')
@@ -131,9 +145,17 @@ def plot_validation_metrics_grid(
     
     # CES Score (highlighted)
     axes[1, 1].plot(df['epoch'], df['ces_score'], 'o-', color='purple', linewidth=2.5, markersize=6)
-    axes[1, 1].scatter(best_epoch, df.loc[best_idx, 'ces_score'], 
-                       s=300, c='gold', marker='*', edgecolor='black', linewidth=2, zorder=5,
-                       label=f'Best: Epoch {int(best_epoch)}')
+    
+    # Only show start if it is a VALID best (passed curriculum)
+    if not valid_candidates.empty:
+        axes[1, 1].scatter(best_epoch, best_ces, 
+                           s=300, c='gold', marker='*', edgecolor='black', linewidth=2, zorder=5,
+                           label=best_label)
+    else:
+        # Show "Pending" indicator
+        axes[1, 1].text(0.5, 0.5, "Best Checkpoint: Pending\n(Curriculum Phase)", 
+                       transform=axes[1, 1].transAxes, ha='center', va='center',
+                       bbox=dict(facecolor='white', alpha=0.8))
     axes[1, 1].set_title('Composite Efficiency Score (CES)')
     axes[1, 1].set_ylabel('CES Score')
     axes[1, 1].set_xlabel('Epoch')
@@ -315,7 +337,8 @@ def plot_trigger_distribution(
 def plot_ces_components_breakdown(
     csv_path: str,
     output_path: Optional[str] = None,
-    title: str = "CES Score Components Breakdown"
+    title: str = "CES Score Components Breakdown",
+    min_best_epoch: int = 0
 ) -> plt.Figure:
     """
     Visualize how each component (Sharpe, Direction F1, Risk MSE) contributes to CES.
@@ -326,6 +349,7 @@ def plot_ces_components_breakdown(
         csv_path: Path to valid_metrics.csv with ces_rank_* columns
         output_path: Optional path to save figure
         title: Figure title
+        min_best_epoch: Minimum epoch index to consider for "Best" selection (Curriculum)
     """
     df = pd.read_csv(csv_path)
 
@@ -338,8 +362,21 @@ def plot_ces_components_breakdown(
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=14, fontweight='bold')
 
-    best_idx = df['ces_score'].idxmax()
-    best_epoch = df.loc[best_idx, 'epoch']
+    # Filter for valid 'Best' candidates (Curriculum Logic)
+    valid_candidates = df[df['epoch'] >= min_best_epoch]
+    if not valid_candidates.empty:
+        best_idx = valid_candidates['ces_score'].idxmax()
+        best_epoch = df.loc[best_idx, 'epoch']
+        best_ces = df.loc[best_idx, 'ces_score']
+        best_label = f'Best (Epoch {int(best_epoch)})'
+        best_color = 'gold'
+    else:
+        # Fallback
+        best_idx = df['ces_score'].idxmax()
+        best_epoch = df.loc[best_idx, 'epoch']
+        best_ces = df.loc[best_idx, 'ces_score']
+        best_label = f'Best (Curriculum Phase)'
+        best_color = 'lightgray'
 
     # Plot 1: Stacked bar chart showing component contributions
     ax1 = axes[0, 0]
@@ -353,7 +390,11 @@ def plot_ces_components_breakdown(
     ax1.bar(epochs, sharpe_contrib, label='Sharpe (60%)', color='#2196F3', alpha=0.8)
     ax1.bar(epochs, dir_f1_contrib, bottom=sharpe_contrib, label='Direction F1 (20%)', color='#4CAF50', alpha=0.8)
     ax1.bar(epochs, risk_mse_contrib, bottom=sharpe_contrib + dir_f1_contrib, label='Risk (20%)', color='#FF9800', alpha=0.8)
-    ax1.axvline(best_epoch, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Best (Epoch {int(best_epoch)})')
+    
+    if not valid_candidates.empty:
+        ax1.axvline(best_epoch, color='red', linestyle='--', linewidth=2, alpha=0.7, label=best_label)
+    else:
+         ax1.text(0.5, 0.9, "Curriculum Phase (No Best Yet)", transform=ax1.transAxes, ha='center', color='gray')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('CES Contribution')
     ax1.set_title('Weighted Component Contributions')
@@ -365,7 +406,8 @@ def plot_ces_components_breakdown(
     ax2.plot(epochs, df['ces_rank_sharpe'], 'o-', color='#2196F3', linewidth=2, label='Sharpe Rank')
     ax2.plot(epochs, df['ces_rank_dir_f1'], 's-', color='#4CAF50', linewidth=2, label='Direction F1 Rank')
     ax2.plot(epochs, 1 - df['ces_rank_risk_mse'], '^-', color='#FF9800', linewidth=2, label='1 - Risk MSE Rank')
-    ax2.axvline(best_epoch, color='red', linestyle='--', linewidth=2, alpha=0.7)
+    if not valid_candidates.empty:
+        ax2.axvline(best_epoch, color='red', linestyle='--', linewidth=2, alpha=0.7)
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Normalized Rank [0-1]')
     ax2.set_title('Individual Component Ranks')
@@ -396,13 +438,24 @@ def plot_ces_components_breakdown(
     # Plot 4: CES over epochs with trend
     ax4 = axes[1, 1]
     ax4.plot(epochs, df['ces_score'], 'o-', color='purple', linewidth=2.5, markersize=8)
-    ax4.scatter(best_epoch, best_row['ces_score'], s=300, c='gold', marker='*',
-                edgecolor='black', linewidth=2, zorder=5, label=f'Best: {best_row["ces_score"]:.3f}')
+    
+    if not valid_candidates.empty:
+        ax4.scatter(best_epoch, best_row['ces_score'], s=300, c='gold', marker='*',
+                    edgecolor='black', linewidth=2, zorder=5, label=f'Best: {best_row["ces_score"]:.3f}')
+    else:
+        ax4.text(0.5, 0.5, "Curriculum Phase", transform=ax4.transAxes, ha='center', bbox=dict(facecolor='white', alpha=0.8))
 
     # Add trend line
-    z = np.polyfit(epochs, df['ces_score'], 1)
-    p = np.poly1d(z)
-    ax4.plot(epochs, p(epochs), '--', color='gray', alpha=0.5, label=f'Trend (slope: {z[0]:.4f})')
+    if len(epochs) > 1 and df['ces_score'].notna().all() and np.isfinite(df['ces_score']).all():
+        try:
+            z = np.polyfit(epochs, df['ces_score'], 1)
+            p = np.poly1d(z)
+            ax4.plot(epochs, p(epochs), '--', color='gray', alpha=0.5, label=f'Trend (slope: {z[0]:.4f})')
+        except Exception as e:
+            print(f"[WARN] Trend line fitting failed: {e}")
+            pass
+    elif len(epochs) <= 1:
+        pass # Not enough data for trend line
 
     ax4.set_xlabel('Epoch')
     ax4.set_ylabel('CES Score')
@@ -564,6 +617,13 @@ def plot_risk_calibration(
     best_idx = df['risk_mse'].idxmin()
     best_epoch = df.loc[best_idx, 'epoch']
     best_mse = df.loc[best_idx, 'risk_mse']
+    
+    # Simple check: if best epoch < min_best_epoch, maybe mark it differently?
+    # For Risk Calibration, we might care about best technical risk even if penalties aren't full.
+    # But for consistency, let's keep it simple or update later if requested.
+    # Leaving Risk Calibration as-is for now (mostly technical), or user can request update.
+    # The user specifically mentioned "best checkpoint" which usually refers to CES.
+    
     ax1.scatter(best_epoch, best_mse, s=200, c='gold', marker='*', edgecolor='black',
                 linewidth=2, zorder=5, label=f'Best: {best_mse:.4f}')
 
@@ -667,11 +727,15 @@ def plot_turnover_sharpe_tradeoff(
                           s=150, edgecolors='black', linewidths=1, alpha=0.8)
 
     # Add trend line
-    z = np.polyfit(turnover, sharpe, 1)
-    p = np.poly1d(z)
-    x_trend = np.linspace(turnover.min(), turnover.max(), 100)
-    ax1.plot(x_trend, p(x_trend), '--', color='red', alpha=0.7,
-             label=f'Trend (slope: {z[0]:.2f})')
+    if len(turnover) > 1 and turnover.notna().all() and np.isfinite(turnover).all() and sharpe.notna().all() and np.isfinite(sharpe).all():
+        try:
+            z = np.polyfit(turnover, sharpe, 1)
+            p = np.poly1d(z)
+            x_trend = np.linspace(turnover.min(), turnover.max(), 100)
+            ax1.plot(x_trend, p(x_trend), '--', color='red', alpha=0.7,
+                    label=f'Trend (slope: {z[0]:.2f})')
+        except Exception:
+            pass
 
     # Highlight best CES point
     if 'ces_score' in df.columns:
@@ -831,6 +895,154 @@ def create_all_charts(
     print(f"Output: {output_dir}")
     print(f"{'='*70}\n")
 
+
+
+def plot_cockpit_dashboard(
+    csv_path: str,
+    output_path: Optional[str] = None,
+    title: str = "MAFIA Training Cockpit"
+) -> plt.Figure:
+    """
+    Generate a high-density 'Cockpit' dashboard (3x2 grid) for monitoring training health.
+    
+    Panels:
+    1. CES Score (North Star Metric)
+    2. Component Breakdown (Sharpe, F1, Risk) - Stacked Area or Bar
+    3. Direction Intelligence (F1 per class Heatmap)
+    4. Risk Calibration (MSE & Correlation dual-axis)
+    5. Efficiency (Turnover vs Sharpe Tradeoff)
+    6. Training Stability (Loss Components)
+    
+    Args:
+        csv_path: Path to valid_metrics.csv
+        output_path: Optional path to save figure
+    """
+    df = pd.read_csv(csv_path)
+    epochs = df['epoch']
+    best_idx = df['ces_score'].idxmax()
+    best_epoch = df.loc[best_idx, 'epoch']
+    
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.2)
+    fig.suptitle(f"{title} (Best Epoch: {int(best_epoch)}, CES: {df.loc[best_idx, 'ces_score']:.3f})", 
+                 fontsize=16, fontweight='bold', y=0.95)
+
+    # --- Panel 1: CES Score Progression (The North Star) ---
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(epochs, df['ces_score'], 'o-', color='purple', linewidth=2, label='CES Score')
+    ax1.scatter(best_epoch, df.loc[best_idx, 'ces_score'], s=200, c='gold', marker='*', 
+               edgecolor='black', zorder=5, label='Best Model')
+    # Trend line
+    if len(epochs) > 1 and df['ces_score'].notna().all() and np.isfinite(df['ces_score']).all():
+        try:
+            z = np.polyfit(epochs, df['ces_score'], 1)
+            p = np.poly1d(z)
+            ax1.plot(epochs, p(epochs), '--', color='gray', alpha=0.5, label=f'Trend (slope={z[0]:.4f})')
+        except Exception:
+            pass
+    ax1.set_ylabel('CES Score')
+    ax1.set_title('1. Overall Performance (CES)', fontweight='bold')
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # --- Panel 2: Component Breakdown (Stacked) ---
+    ax2 = fig.add_subplot(gs[0, 1])
+    # Spec weights: 0.6 Sharpe, 0.2 F1, 0.2 (1-Risk)
+    w_sharpe = 0.6 * df['ces_rank_sharpe']
+    w_f1 = 0.2 * df['ces_rank_dir_f1']
+    w_risk = 0.2 * (1 - df['ces_rank_risk_mse'])
+    
+    ax2.stackplot(epochs, w_sharpe, w_f1, w_risk, 
+                 labels=['Sharpe (60%)', 'Dir F1 (20%)', 'Risk (20%)'],
+                 colors=['#2196F3', '#4CAF50', '#FF9800'], alpha=0.7)
+    ax2.axvline(best_epoch, color='red', linestyle='--', alpha=0.8)
+    ax2.set_ylabel('Weighted Contribution')
+    ax2.set_title('2. CES Component Contribution', fontweight='bold')
+    ax2.legend(loc='upper left', fontsize=8)
+    ax2.set_ylim(0, 1.05)
+    ax2.grid(True, alpha=0.3)
+
+    # --- Panel 3: Direction Intelligence (Heatmap) ---
+    ax3 = fig.add_subplot(gs[1, 0])
+    cols = ['direction_f1_bear', 'direction_f1_side', 'direction_f1_bull']
+    # Check if cols exist (some validation sets might miss classes like Bear in 2017)
+    valid_cols = [c for c in cols if c in df.columns]
+    
+    if valid_cols:
+        data = df[valid_cols].values.T
+        im = ax3.imshow(data, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+        ax3.set_yticks(range(len(valid_cols)))
+        ax3.set_yticklabels([c.replace('direction_f1_', '').title() for c in valid_cols])
+        # Annotate
+        for i in range(len(valid_cols)):
+            for j in range(len(epochs)):
+                val = data[i, j]
+                color = 'white' if val < 0.5 else 'black'
+                # Only label every Nth epoch if too many
+                if len(epochs) < 20 or j % (len(epochs)//10) == 0:
+                     ax3.text(j, i, f'{val:.2f}', ha='center', va='center', color=color, fontsize=7)
+    
+        ax3.set_title('3. Direction F1 by Regime (Heatmap)', fontweight='bold')
+        plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
+    else:
+        ax3.text(0.5, 0.5, "No Direction Data", ha='center', va='center')
+
+    # --- Panel 4: Risk Calibration (Dual Axis) ---
+    ax4 = fig.add_subplot(gs[1, 1])
+    color_mse = '#F44336'
+    color_corr = '#2196F3'
+    
+    line1 = ax4.plot(epochs, df['risk_mse'], 'o-', color=color_mse, label='MSE (Lower=Better)')
+    ax4.set_ylabel('MSE', color=color_mse)
+    ax4.tick_params(axis='y', labelcolor=color_mse)
+    ax4.invert_yaxis() # MSE lower is better, so visually Up is Good
+    
+    ax4_twin = ax4.twinx()
+    line2 = ax4_twin.plot(epochs, df['risk_correlation'], 's--', color=color_corr, label='Correlation (Higher=Better)')
+    ax4_twin.set_ylabel('Correlation', color=color_corr)
+    ax4_twin.tick_params(axis='y', labelcolor=color_corr)
+    ax4_twin.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax4.legend(lines, labels, loc='upper center', fontsize=8)
+    ax4.set_title('4. Risk Calibration Quality', fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+
+    # --- Panel 5: Efficiency (Turnover vs Sharpe) ---
+    ax5 = fig.add_subplot(gs[2, 0])
+    # Scatter trace
+    sc = ax5.scatter(df['topk_turnover'], df['topk_sharpe_ratio'], c=epochs, cmap='viridis', s=100, edgecolors='k')
+    # Best epoch marker
+    ax5.scatter(df.loc[best_idx, 'topk_turnover'], df.loc[best_idx, 'topk_sharpe_ratio'], 
+               s=250, c='gold', marker='*', edgecolors='k', label='Best Model')
+    
+    ax5.set_xlabel('Turnover (Avg Daily)')
+    ax5.set_ylabel('Sharpe Ratio')
+    ax5.set_title('5. Efficiency Frontier (Turnover vs Sharpe)', fontweight='bold')
+    plt.colorbar(sc, ax=ax5, label='Epoch')
+    ax5.grid(True, alpha=0.3)
+
+    # --- Panel 6: Training Stability (Losses) ---
+    ax6 = fig.add_subplot(gs[2, 1])
+    # Normalize losses to start at 1.0 for comparison? Or just log scale?
+    # Let's use simple plot but with secondary axis for Total vs Components
+    l1 = ax6.plot(epochs, df['loss_total'], 'k-', linewidth=2, label='Total Loss')
+    l2 = ax6.plot(epochs, df['loss_pg'], '--', label='Selection (PG)')
+    l3 = ax6.plot(epochs, df['loss_dir'], ':', label='Direction')
+    l4 = ax6.plot(epochs, df['loss_risk'], '-.', label='Risk')
+    
+    ax6.set_ylabel('Loss Value')
+    ax6.set_title('6. Training Convergence', fontweight='bold')
+    ax6.legend(fontsize=8, loc='upper right')
+    ax6.grid(True, alpha=0.3)
+    ax6.set_xlabel('Epoch')
+
+    if output_path:
+        plt.savefig(output_path, bbox_inches='tight')
+        print(f"[PLOT] Saved Cockpit Dashboard to {output_path}")
+
+    return fig
 
 if __name__ == "__main__":
     # Demo usage

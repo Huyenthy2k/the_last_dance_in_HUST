@@ -1079,8 +1079,6 @@ class DenseMoESignalGenerator(nn.Module):
 
         # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
         # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
-        # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
-        # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
         self.direction_head = DirectionHead(config)
 
         # Macro Adapter: Projects raw context for Direction/Risk (Macro Task)
@@ -1282,9 +1280,6 @@ class DenseMoESignalGenerator(nn.Module):
             topk_indices_exp = topk_indices.unsqueeze(-1).expand(-1, top_k, self.D)
             topk_embeddings = th.gather(fused_stock_embedding, 1, topk_indices_exp)
         topk_scores = th.gather(market_vector, 1, topk_indices)  # (batch, K)
-
-        # Apply Macro Adapter to create "Macro View" of the context
-        context_macro = self.macro_adapter(raw_context)  # (batch, D)
 
         # Compute risk from market + portfolio context
         # GRADIENT FIREWALL: Detach portfolio_context to prevent L_Risk from

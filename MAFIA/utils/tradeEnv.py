@@ -15,23 +15,14 @@ import pandas as pd
 import time
 import copy
 
-# Handle gym/gymnasium compatibility
+import gymnasium as gym
+from gymnasium import spaces
+
+GYMNASIUM_AVAILABLE = True
+
+# Seeding compatibility
 try:
-    import gymnasium as gym
-    from gymnasium import spaces
-
-    GYMNASIUM_AVAILABLE = True
-except ImportError:
-    try:
-        import gym
-        from gym import spaces
-
-        GYMNASIUM_AVAILABLE = False
-    except ImportError:
-        raise ImportError("Neither gymnasium nor gym is installed")
-try:
-    from gym.utils import seeding
-
+    from gymnasium.utils import seeding
     GYM_SEEDING_AVAILABLE = True
 except ImportError:
     GYM_SEEDING_AVAILABLE = False

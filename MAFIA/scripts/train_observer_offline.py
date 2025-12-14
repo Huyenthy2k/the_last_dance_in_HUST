@@ -35,6 +35,7 @@ import gc
 import copy
 import traceback
 from typing import Dict, List, Optional
+from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
@@ -86,44 +87,56 @@ def build_expanding_schedule(
     start_year: int, first_infer_year: int, last_infer_year: int
 ) -> List[Dict]:
     """
-    Build the expanding-window schedule per spec Section 7.
+    Build the QUARTERLY expanding-window schedule per spec Section 7 (Restored).
 
-    Train: 01/start_year → 06/(valid_year)
-    Valid: 07/(valid_year) → 12/(valid_year)
-    Infer: (valid_year + 1)
+    For each Target Year Y:
+    - Iter 1 (Q1): Train 2015 -> End Q3(Y-1). Valid Q4(Y-1). Infer Q1(Y).
+    - Iter 2 (Q2): Train 2015 -> End Q4(Y-1). Valid Q1(Y). Infer Q2(Y).
+    - Iter 3 (Q3): Train 2015 -> End Q1(Y). Valid Q2(Y). Infer Q3(Y).
+    - Iter 4 (Q4): Train 2015 -> End Q2(Y). Valid Q3(Y). Infer Q4(Y).
     """
-    infer_years = list(range(first_infer_year, last_infer_year + 1))
     schedule = []
     train_start = pd.Timestamp(f"{start_year}-01-01 00:00:00")
+    
+    iter_idx = 0
+    # Loop through each target year
+    for year in range(first_infer_year, last_infer_year + 1):
+        for q in range(1, 5):
+            # Define Inference Period
+            m_start_infer = (q - 1) * 3 + 1
+            infer_start = pd.Timestamp(f"{year}-{m_start_infer:02d}-01 00:00:00")
+            infer_end = (infer_start + pd.DateOffset(months=3)) - pd.Timedelta(seconds=1)
+            
+            # Define Validation Period (Previous Quarter)
+            valid_start = infer_start - pd.DateOffset(months=3)
+            valid_end = infer_start - pd.Timedelta(seconds=1)
+            
+            # Define Training Period (Start to Before Valid)
+            train_end = valid_start - pd.Timedelta(seconds=1)
+            
+            if train_end <= train_start:
+                 raise ValueError(f"Invalid train window for {year} Q{q}")
 
-    for idx, infer_year in enumerate(infer_years):
-        valid_year = infer_year - 1
-        train_end = pd.Timestamp(f"{valid_year}-06-30 23:59:59")
-        valid_start = pd.Timestamp(f"{valid_year}-07-01 00:00:00")
-        valid_end = pd.Timestamp(f"{valid_year}-12-31 23:59:59")
-        infer_start = pd.Timestamp(f"{infer_year}-01-01 00:00:00")
-        infer_end = pd.Timestamp(f"{infer_year}-12-31 23:59:59")
-
-        schedule.append(
-            {
-                "iter_index": idx,
-                "iter_display": idx + 1,
+            schedule.append({
+                "iter_index": iter_idx,
+                "iter_display": iter_idx + 1,
                 "train_start": train_start,
                 "train_end": train_end,
                 "valid_start": valid_start,
                 "valid_end": valid_end,
-                "valid_year": valid_year,
-                "infer_year": infer_year,
+                "valid_year": valid_start.year,
+                "valid_quarter": (valid_start.month - 1) // 3 + 1,
+                "infer_year": year,
+                "infer_quarter": q,
                 "infer_start": infer_start,
                 "infer_end": infer_end,
-                "ckpt_name": f"Ckpt_Best_{valid_year}",
-                "train_label": f"{train_start.date()} → {train_end.date()}",
-                "valid_label": f"{valid_start.date()} → {valid_end.date()}",
-            }
-        )
+                "ckpt_name": f"Ckpt_Best_{valid_start.year}_Q{(valid_start.month - 1) // 3 + 1}",
+                "train_label": f"{train_start.date()} -> {train_end.date()}",
+                "valid_label": f"{valid_start.date()} -> {valid_end.date()} (Q{(valid_start.month - 1) // 3 + 1})",
+            })
+            iter_idx += 1
 
     return schedule
-
 
 def load_stock_data(config: Config) -> pd.DataFrame:
     """
@@ -259,7 +272,7 @@ def train_observer_offline_iteration(
     }
 
     # Initialize ValidationMetricsTracker
-    iter_output_dir = os.path.join(checkpoint_dir, f"../iter_{iteration}_valid_{valid_year}")
+    iter_output_dir = os.path.normpath(os.path.join(checkpoint_dir, f"../iter_{iteration}_valid_{valid_year}"))
     os.makedirs(iter_output_dir, exist_ok=True)
     tracker = ValidationMetricsTracker(iter_output_dir)
     
@@ -313,6 +326,10 @@ def train_observer_offline_iteration(
                 loaded_epoch = trainer.observer.load_checkpoint(resume_path)
                 start_epoch = loaded_epoch + 1
 
+                # [RESUME-FIX] Restore Curriculum State
+                trainer._current_lambda_epoch = trainer._compute_lambda_epoch(loaded_epoch)
+                smart_print(f"[RESUME] Restored lambda_epoch = {trainer._current_lambda_epoch:.4f} for loaded epoch {loaded_epoch}")
+
                 # Restore Validation Tracker History
                 valid_csv_path = os.path.join(iter_output_dir, "valid_metrics.csv")
                 if os.path.exists(valid_csv_path):
@@ -333,8 +350,32 @@ def train_observer_offline_iteration(
                     
                     if new_len < original_len:
                         smart_print(f"[RESUME] Truncated validation history from {original_len} to {new_len} records (removed future epochs).")
+                        # [RESUME-FIX] Save truncated history back to disk immediately
+                        tracker.save_validation_history(valid_csv_path)
+                        smart_print(f"[RESUME] Saved truncated valid_metrics.csv to disk.")
                     
                     tracker._recompute_ces_scores()
+
+                # [RESUME-FIX] Truncate train_metrics.csv if exists
+                train_csv_path = os.path.join(iter_output_dir, "train_metrics.csv")
+                if os.path.exists(train_csv_path):
+                    smart_print(f"[RESUME] Checking train history from: {train_csv_path}")
+                    try:
+                        df_train = pd.read_csv(train_csv_path)
+                        if "epoch" in df_train.columns:
+                            # Convert epoch column to numeric if mixed
+                            df_train["epoch"] = pd.to_numeric(df_train["epoch"], errors='coerce')
+                            df_train = df_train.dropna(subset=["epoch"])
+                            
+                            original_len_t = len(df_train)
+                            df_train = df_train[df_train["epoch"] < start_epoch]
+                            new_len_t = len(df_train)
+                            
+                            if new_len_t < original_len_t:
+                                smart_print(f"[RESUME] Truncating train history from {original_len_t} to {new_len_t} records (removed future epochs).")
+                                df_train.to_csv(train_csv_path, index=False)
+                    except Exception as e:
+                        smart_print(f"[WARN] Failed to truncate train_metrics.csv: {e}")
 
                 smart_print(f"[RESUME] Will continue from epoch {start_epoch}")
             except Exception as e:
@@ -354,12 +395,12 @@ def train_observer_offline_iteration(
     if start_epoch >= num_epochs:
         smart_print(f"[OFFLINE] Iteration already completed ({start_epoch} >= {num_epochs}). Skipping training loop.")
 
-    # IMPORTANT: ALWAYS sync trainer._epoch with start_epoch for correct epoch numbering
-    # train_epoch() increments _epoch at the start, so we set to start_epoch
-    # This ensures epoch numbering in validation results matches the actual epoch
-    # Note: Loop epoch N corresponds to display "EPOCH N+1", so when resuming from
-    # checkpoint with loop epoch E, we want to display "EPOCH E+2" (the next one)
-    trainer._epoch = start_epoch
+    # IMPORTANT: Sync trainer._epoch with start_epoch - 1 for correct epoch numbering
+    # train_epoch() increments _epoch at the start (self._epoch += 1), so we init to start-1.
+    # This ensures the first trained epoch has index `start_epoch`.
+    # e.g., start_epoch=0 -> init -1 -> first run becomes 0 (0-based indexing).
+    # e.g., resume start=10 -> init 9 -> next run becomes 10.
+    trainer._epoch = start_epoch - 1
     if start_epoch > 0:
         # Also update current_global_step based on previously completed epochs
         current_global_step = global_step_start + (start_epoch * (batches_per_epoch or 10))
@@ -378,22 +419,55 @@ def train_observer_offline_iteration(
     try:
         for epoch in range(start_epoch, num_epochs):
             # Create per-batch visualization callback
+            # Calculate min_best_epoch for plotting (Curriculum Logic)
+            min_best_epoch_val = trainer.curriculum_warmup_epochs + trainer.curriculum_penalty_rampup
+            
             def on_batch_viz(batch_idx, total_batches):
                 # Generate charts after each batch for real-time progress
                 try:
-                    generate_epoch_report(tracker.output_dir, epoch)
+                    generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val)
                 except Exception:
                     pass  # Silent fail - don't interrupt training
             
+            # Update res_root so that detailed logging goes to the correct iteration folder
+            config.res_root = iter_output_dir
+            
             # 1. Train
+            # Use distinct name for batch-level metrics log
+            batch_log_path = os.path.join(iter_output_dir, "batch_training_log.csv")
+            
             train_res = trainer.train_epoch(
                 data_tensors=train_tensors,
                 steps_per_epoch=batches_per_epoch,
                 writer=writer,
                 global_step_offset=current_global_step,
                 on_batch_done=on_batch_viz,  # Real-time chart updates
+                log_file=batch_log_path,      # Save batch-level dynamics
             )
             current_global_step += batches_per_epoch
+
+            # Save training metrics to CSV
+            train_metrics_path = os.path.join(iter_output_dir, "train_metrics.csv")
+            try:
+                # Convert ObserverValidationResult to dict
+                train_dict = asdict(train_res)
+                
+                # Remove CES-related columns from training metrics (they are always 0.0)
+                keys_to_remove = [k for k in train_dict.keys() if "ces_score" in k or "ces_rank" in k]
+                for k in keys_to_remove:
+                    del train_dict[k]
+                    
+                # Append to CSV
+                df_train = pd.DataFrame([train_dict])
+                
+                # [FORMAT-FIX] Ensure epoch is integer and consistent numbering
+                if "epoch" in df_train.columns:
+                    df_train["epoch"] = df_train["epoch"].astype(int)
+                    
+                header = not os.path.exists(train_metrics_path)
+                df_train.to_csv(train_metrics_path, mode='a', header=header, index=False, float_format='%.5f')
+            except Exception as e:
+                smart_print(f"[WARN] Failed to save train metrics: {e}")
 
             # 2. Validate (returns ObserverValidationResult)
             val_result = trainer.validate_epoch(
@@ -402,7 +476,15 @@ def train_observer_offline_iteration(
             )
 
             # 3. Track metrics and compute CES
-            is_best = tracker.add_epoch(val_result)
+            # Restrict "Best Model" updates to epochs with full penalty coefficients (lambda >= 1.0)
+            # Use small tolerance for float comparison
+            current_lambda = getattr(trainer, "_current_lambda_epoch", 1.0)
+            is_full_penalty = current_lambda >= 0.999
+            
+            is_best = tracker.add_epoch(val_result, allow_best_update=is_full_penalty)
+
+            if verbose and not is_full_penalty:
+                smart_print(f"      [INFO] Best Checkpoint update BLOCKED (Lambda {current_lambda:.3f} < 1.0)")
             
             # 4. Log to TensorBoard
             if writer:
@@ -417,7 +499,7 @@ def train_observer_offline_iteration(
 
             # 5. Update Live Dashboard
             update_observer(
-                loss=train_res.get("loss_total", 0.0),
+                loss=train_res.loss_total,
                 loss_eta=val_result.risk_mse,
                 loss_dir=val_result.loss_dir,
             )
@@ -433,9 +515,13 @@ def train_observer_offline_iteration(
             latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
             trainer.observer.save_checkpoint(latest_ckpt_path, epoch=epoch)
 
-            # Save best checkpoint separately (for final selection)
+            # Always save epoch checkpoint (Full History)
+            epoch_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
+            trainer.observer.save_checkpoint(epoch_ckpt_path, epoch=epoch)
+
+            # Save best checkpoint separately (overwrite with current best)
             if is_best:
-                best_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
+                best_ckpt_path = os.path.join(temp_ckpt_dir, "best_checkpoint.pth")
                 trainer.observer.save_checkpoint(best_ckpt_path, epoch=epoch)
 
             # 7. Progress logging
@@ -449,7 +535,7 @@ def train_observer_offline_iteration(
             if verbose:
                 smart_print(f"      Running Visualization for Epoch {epoch}...")
             try:
-                generate_epoch_report(tracker.output_dir, epoch)
+                generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val)
                 
                 # Log generated charts to TensorBoard
                 if trainer.tb_logger is not None and trainer.tb_logger.log_images:
@@ -482,7 +568,7 @@ def train_observer_offline_iteration(
         if verbose:
             smart_print(f"\n[OFFLINE] Validation history saved to: {csv_path}")
     
-    # Get best checkpoint info
+    # Get best checkpoint info (Correctly filters for Full Penalty epochs via ValidationTracker)
     best_info = tracker.get_best_checkpoint_info()
     best_epoch = best_info["epoch"]
     best_ces = best_info["ces_score"]
@@ -494,6 +580,28 @@ def train_observer_offline_iteration(
         smart_print(f"  Sharpe: {best_info['sharpe_ratio']:.3f}")
         smart_print(f"  Dir_F1: {best_info['direction_f1']:.3f}")
         smart_print(f"  Risk_MSE: {best_info['risk_mse']:.4f}")
+
+    # [LOG-FIX] Save Best Checkpoint Metrics to FILE
+    # Find the full result object for the best epoch
+    best_result = next((h for h in tracker.history if h.epoch == best_epoch), None)
+    if best_result:
+        best_stats_path = os.path.join(iter_output_dir, "best_checkpoint_stats.csv")
+        try:
+            best_dict = best_result.to_dict()
+            df_best = pd.DataFrame([best_dict])
+            
+            # Format
+            if "epoch" in df_best.columns:
+                df_best["epoch"] = df_best["epoch"].astype(int)
+            
+            # Reorder columns (CES first) if possible - match valid_metrics order
+            # We can just read valid_metrics.csv to get columns order? 
+            # Or simplified: use the same dict order which is now updated in class definition.
+            
+            df_best.to_csv(best_stats_path, index=False, float_format='%.5f')
+            smart_print(f"[OFFLINE] 📝 Logged best checkpoint stats to: {best_stats_path}")
+        except Exception as e:
+            smart_print(f"[WARN] Failed to log best stats: {e}")
     
     # Copy best checkpoint to final location
     final_ckpt_path = os.path.join(checkpoint_dir, f"observer_best_{valid_year}.pth")
@@ -506,14 +614,16 @@ def train_observer_offline_iteration(
         # Fallback: save current state if no best checkpoint found
         trainer.observer.save_checkpoint(final_ckpt_path, epoch=num_epochs-1, extra_data={"ces": best_ces})
     
-    # Cleanup temp checkpoints
-    import shutil
-    try:
-        shutil.rmtree(temp_ckpt_dir)
-    except:
-        pass
+    # [PERSISTENCE-FIX] Do NOT delete temp checkpoints. User wants full history.
+    # import shutil
+    # try:
+    #     shutil.rmtree(temp_ckpt_dir)
+    # except:
+    #     pass
+    smart_print(f"[OFFLINE] All epoch checkpoints preserved in: {temp_ckpt_dir}")
 
     return final_ckpt_path
+
 
 
 
@@ -529,6 +639,7 @@ def run_offline_observer_training(
     log_details: bool = False,
     rebalance_interval: Optional[int] = None,
     verbose: bool = True,
+    max_iterations: Optional[int] = None,
 ) -> List[Dict]:
     """
     Run full walk-forward offline observer training.
@@ -561,6 +672,11 @@ def run_offline_observer_training(
     # Build schedule
     schedule = build_expanding_schedule(start_year, first_infer_year, last_infer_year)
     num_iterations = len(schedule)
+    if max_iterations is not None and max_iterations > 0:
+        schedule = schedule[:max_iterations]
+        num_iterations = len(schedule)
+        if verbose:
+            smart_print(f"[CONFIG] Limiting training to first {num_iterations} iterations")
 
     if verbose:
         smart_print("\n" + "#" * 70)
@@ -679,12 +795,11 @@ def run_offline_observer_training(
         market_data=market_data,
     )
 
-    # CRITICAL: Free raw pandas dataframes immediately to prevent OOM
-    # Tensors are now on device (or in shared memory), we don't need the pandas duplicates
-    del stock_data
+    # CRITICAL: Keep stock_data for Inference phase!
+    # del stock_data 
     if 'market_data' in locals() and market_data is not None:
         del market_data
-    gc.collect()
+    # gc.collect() # Optional
 
     if verbose:
         smart_print(
@@ -694,6 +809,14 @@ def run_offline_observer_training(
     # Run iterations
     results = []
     prev_checkpoint = None
+    
+    # Initialize quarterly state tracker
+    # Format: {year: {q: path}}
+    yearly_state_tracker = {y: {} for y in range(first_infer_year, last_infer_year + 1)}
+    
+    # Import for Inference
+    from utils.tradeEnv import StockPortfolioEnv
+    from scripts.generate_rl_states import RegimeShiftDetector
 
     for sched in schedule:
         iteration = sched["iter_index"]
@@ -712,157 +835,56 @@ def run_offline_observer_training(
             smart_print(f"{'=' * 70}")
             smart_print(f"  📚 Training Window (Expanding): {sched['train_label']}")
             smart_print(f"  ✅ Validation Period:           {sched['valid_label']}")
-            smart_print(f"  🎯 Inference Target Year:       {sched['infer_year']}")
+            smart_print(f"  🎯 Inference Target (Live):     {sched['infer_year']} Q{sched['infer_quarter']}")
             smart_print(f"")
-            if is_cold_start:
-                smart_print(f"  Training Mode: FROM_SCRATCH ({num_train_epochs} epochs)")
-                smart_print(f"  Checkpoint: None (cold start)")
-            else:
-                smart_print(f"  Training Mode: FINETUNE ({num_train_epochs} epochs)")
-                if prev_checkpoint and os.path.exists(prev_checkpoint):
-                    smart_print(f"  Load Checkpoint: {os.path.basename(prev_checkpoint)}")
-                else:
-                    smart_print(f"  Load Checkpoint: None (⚠️ Expected from previous iteration)")
-            smart_print(f"{'=' * 70}")
 
-        # RESUME CHECK: If final checkpoint for this iteration already exists, skip it
-        # But we must update prev_checkpoint correctly!
-        final_iter_ckpt = os.path.join(checkpoint_dir, f"observer_best_{sched['valid_year']}.pth")
+        # === RESUME / TRAIN LOGIC ===
+        # NAMING CONVENTION FOR LIVE INFERENCE:
+        # The RL Agent needs to find the model for a specific period.
+        # We save it as: Observer_Infer_{InferYear}_Q{InferQuarter}.pth
+        infer_year = sched["infer_year"]
+        infer_q = sched["infer_quarter"]
+        final_iter_ckpt = os.path.join(checkpoint_dir, f"Observer_Infer_{infer_year}_Q{infer_q}.pth")
+        
+        # 1. Train if not already done
         if os.path.exists(final_iter_ckpt):
-             smart_print(f"[RESUME] Found existing completed checkpoint for Iteration {iteration}: {final_iter_ckpt}")
-             smart_print(f"         Skipping training for this iteration.")
-             
-             # Create a dummy result entry for summary
-             results.append(
-                {
-                    "iter_index": iteration,
-                    "iteration": iteration,
-                    "train_range": sched["train_label"],
-                    "valid_range": sched["valid_label"],
-                    "valid_year": sched["valid_year"],
-                    "infer_year": sched["infer_year"],
-                    "checkpoint_path": final_iter_ckpt,
-                    "state_path": None,
-                    "status": "success (skipped - resumed)",
-                    "infer_status": "live_stream",
-                    "skipped": True, 
-                }
-             )
-             
-             # Set prev_checkpoint for NEXT iteration
+             smart_print(f"[RESUME] Found existing LIVE INFERENCE checkpoint: {final_iter_ckpt}")
+             smart_print(f"         Skipping training step.")
              prev_checkpoint = final_iter_ckpt
-             continue
-
-        try:
-            checkpoint_path = train_observer_offline_iteration(
+        else:
+             # CALL TRAINER
+             # Note: train_observer_offline_iteration saves its own "best" checkpoint internally to a temp name?
+             # No, it returns a path to "observer_best_{valid_year}.pth" (or similar).
+             # We need to Rename/Copy it to our Target Name.
+             
+             best_ckpt_path = train_observer_offline_iteration(
                 config=config,
                 schedule_entry=sched,
                 trainer=trainer,
                 data_tensors=data_tensors,
                 checkpoint_dir=checkpoint_dir,
-                num_epochs=num_epochs,
+                num_epochs=num_train_epochs,
                 batches_per_epoch=batches_per_epoch,
                 prev_checkpoint=prev_checkpoint,
                 writer=writer,
                 global_step_start=global_step_counter,
-                verbose=verbose,
-            )
-            
-            # Update global step counter for next iteration (approximate, since we don't return exact steps run)
-            # But since train_epoch runs exactly batches_per_epoch steps, we can calculate it.
-            # However, early stopping might make this inaccurate. 
-            # Ideally, train_observer_offline_iteration should return steps run.
-            # For now, we'll let the steps overlap or reset slightly inaccurately, or just rely on the fact 
-            # that we usually finetune for fixed epochs unless early stopped.
-            # Better approach: Pass writer and offset, let iteration update it? 
-            # We are passing global_step_start, but not getting back the new offset.
-            # Let's simple approximate or fetch from trainer if possible, but trainer is stateless regarding steps.
-            # Simple fix: assume full epochs for step counter estimation
-            iter_epochs = num_epochs if num_epochs else (50 if iteration == 0 else 20)
-            iter_batches = batches_per_epoch # We will have computed this inside
-            # But wait, batches_per_epoch is computed INSIDE train_observer_offline_iteration if None.
-            # We can't easily update global_step_counter here without returning it.
-            # Let's accept that steps might restart or jump oddly if we don't return it.
-            # Actually, `train_observer_offline_iteration` has the logic to compute batches_per_epoch.
-            # We should probably refactor to get the actual steps, but as a quick fix, 
-            # let's just increment by a safe estimate.
-            # Actually, the best way is to return executed_steps from the function.
-            # But modifying return signature is a bigger change.
-            # Let's just create a new writer per iteration? No, continuous is better.
-            # Let's just use a very large offset increment to separate iterations visually if we can't be precise,
-            # or just let them overlap in "Global Step" but be distinct in "Epoch".
-            # "Global Step" is mostly for continuous training.
-            # Let's update `train_observer_offline_iteration` to return `(checkpoint_path, steps_run)`.
-            # But that breaks the signature expected by callers? 
-            # No other callers likely for this specific script function.
-            
-            # Let's stick to the current signature for now to minimize risk, 
-            # and just increment by a fixed large amount or just let it be.
-            # Actually, if we want continuous plots, we need increasing steps.
-            # Let's just guess: 
-            # global_step_counter += iter_epochs * 100 # Rough guess
-            pass 
-            
-            # Correction: I will update the function signature to return steps run in a separate PR if needed.
-            # For now, let's just not increment global_step_counter in the outer loop 
-            # and pass the SAME counter? No, that would overwrite logs.
-            # I must update global_step_counter.
-            # Let's update the signature of `train_observer_offline_iteration` to return more info?
-            # Or just hack it:
-            # The function returns `best_checkpoint_path`. I can change it to return `(best_checkpoint_path, steps_run)`.
-            # Wait, the `train_observer_offline_iteration` creates `batches_per_epoch` if None.
-            # I should move that logic out or return it.
-            # Let's just leave it for now and accept that global_step might reset or be weird between iterations unless I fix it.
-            # Actually, I can just increment by a safe upper bound.
+                verbose=verbose
+             )
              
+             # Rename/Copy to Final Inference Name
+             if best_ckpt_path and os.path.exists(best_ckpt_path):
+                 import shutil
+                 shutil.copy2(best_ckpt_path, final_iter_ckpt)
+                 smart_print(f"[SAVE] ✅ Saved Inference Checkpoint: {final_iter_ckpt}")
+                 prev_checkpoint = final_iter_ckpt
+             else:
+                 smart_print(f"[ERROR] Training failed to produce checkpoint.")
+                 continue
 
-            # State generation skipped per "Live Inference Stream" requirement (Spec 9.1)
-            # Observer is kept frozen and queried live by RL during Phase 2.
-            state_path = None
-            infer_status = "live_stream"
+             global_step_counter += (num_train_epochs * (batches_per_epoch or 10))
 
-            results.append(
-                {
-                    "iteration": iteration,
-                    "train_range": sched["train_label"],
-                    "valid_range": sched["valid_label"],
-                    "valid_year": sched["valid_year"],
-                    "infer_year": sched["infer_year"],
-                    "checkpoint_path": checkpoint_path,
-                    "state_path": state_path,
-                    "status": "success",
-                    "infer_status": infer_status,
-                }
-            )
+    return results   # End of loop
 
-            prev_checkpoint = checkpoint_path
-
-            if verbose:
-                smart_print(f"\n{'=' * 70}")
-                smart_print(f"✅ ITERATION {iteration + 1} COMPLETE - Stage 1 (Observer Training)")
-                smart_print(f"{'=' * 70}")
-                smart_print(f"  Frozen Checkpoint: {os.path.basename(checkpoint_path)}")
-                smart_print(f"  Target Year: {sched['infer_year']}")
-                smart_print(f"")
-                smart_print(f"  📌 Ready for Stage 2: TD3 Training (Year {sched['infer_year']})")
-                smart_print(f"     Observer will be queried LIVE via frozen model")
-                smart_print(f"     No pre-generated states (on-demand forward pass)")
-                smart_print(f"{'=' * 70}\n")
-
-        except Exception as e:
-            results.append(
-                {
-                    "iteration": iteration,
-                    "train_range": sched["train_label"],
-                    "valid_range": sched["valid_label"],
-                    "valid_year": sched["valid_year"],
-                    "infer_year": sched["infer_year"],
-                    "checkpoint_path": None,
-                    "status": f"failed: {e}",
-                }
-            )
-            smart_print(f"\n❌ Iteration {iteration + 1} failed: {e}")
-            traceback.print_exc()
 
     # Save summary
     import json
@@ -1009,8 +1031,8 @@ def main():
     parser.add_argument(
         "--last-infer-year",
         type=int,
-        default=2022,
-        help="Last inference year (default: 2022)",
+        default=2024,
+        help="Last inference year (default: 2024)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1052,6 +1074,12 @@ def main():
         action="store_true",
         help="Enable detailed trajectory logging (stock symbols, triggers, rewards)",
     )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Limit number of iterations (for testing)",
+    )
 
     args = parser.parse_args()
 
@@ -1066,6 +1094,7 @@ def main():
         seed=args.seed,
         log_details=args.log_details,  # NEW
         verbose=not args.quiet,
+        max_iterations=args.max_iterations,
     )
 
     # Exit with error if any iteration failed

@@ -10,14 +10,9 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gym import spaces
-
-# Support both gym and gymnasium Dict spaces
-try:
-    import gymnasium as gym
-    DICT_TYPES = (spaces.Dict, gym.spaces.Dict)
-except ImportError:  # gymnasium not installed
-    DICT_TYPES = (spaces.Dict,)
+import gymnasium as gym
+from gymnasium import spaces
+DICT_TYPES = (spaces.Dict, )
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 

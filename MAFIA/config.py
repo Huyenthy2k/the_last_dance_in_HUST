@@ -83,7 +83,7 @@ class Config:
         # Live display (can be re-enabled with env: MAFIA_USE_LIVE_DISPLAY=1)
         env_live_display = os.environ.get("MAFIA_USE_LIVE_DISPLAY")
         if env_live_display is None:
-            self.use_live_display = False
+            self.use_live_display = True  # Default True (can be disabled via env var)
         else:
             self.use_live_display = env_live_display.strip().lower() not in (
                 "0",
@@ -174,8 +174,8 @@ class Config:
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
         # Penalty coefficients (stronger to stand against reward scaling=100)
-        self.mafia_pg_alpha_turnover = 1.5  # Turnover penalty coefficient
-        self.mafia_pg_alpha_change = 2.0  # Membership change penalty coefficient
+        self.mafia_pg_alpha_turnover = 1.25  # Turnover penalty coefficient
+        self.mafia_pg_alpha_change = 1.5  # Membership change penalty coefficient
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
         self.direction_label_delta = (
@@ -395,10 +395,10 @@ class Config:
         self.walkforward_finetune_patience = 5  # Early stopping patience (finetune)
 
         # Composite score weights for checkpoint selection
-        # Score = w_sharpe × SR + w_ic × IC + w_f1 × F1
+        # Score = w_sharpe × SR + w_f1 × F1 + w_risk × (1 - MSE)
         self.walkforward_score_w_sharpe = 0.5  # Top-K Sharpe Ratio weight
-        self.walkforward_score_w_ic = 0.3  # Information Coefficient weight
-        self.walkforward_score_w_f1 = 0.2  # Direction F1-Macro weight
+        self.walkforward_score_w_f1 = 0.3  # Direction F1-Macro weight (Increased)
+        self.walkforward_score_w_risk = 0.2  # Risk MSE weight (Inverted)
 
         # ============================================================
         # Expanding Window Mode Configuration (New Training Paradigm)
@@ -502,6 +502,10 @@ class Config:
         self.mafia_log_realtime = (
             True  # [ENV-STATUS] all-in-one realtime status on 1 line
         )
+        
+        # Trajectory Logging: Default to logging only representative sample (idx=0)
+        # Set to True (via config or CLI --log-details) to log ALL trajectories in batch.
+        self.log_trajectory_details = False
 
         if self.mode == "Benchmark":
             self.trained_best_model_type = "max_capital"
@@ -645,8 +649,7 @@ class Config:
         self._market_risk_warned_insufficient = False
 
         # LiveDisplay configuration (real-time terminal updates)
-        # Set to False to disable LiveDisplay and use legacy print-based logging
-        self.use_live_display = True  # Default disabled until fully tested
+        # Configured at top of file (defaults to True, override via MAFIA_USE_LIVE_DISPLAY)
 
         # Web Dashboard configuration (replaces terminal display for stable layout)
         # Set to True to enable web-based dashboard at http://localhost:5050
@@ -799,7 +802,7 @@ class Config:
         # ===== Offline Batch Training Configuration (Spec §6) =====
         # Training Duration per Iteration
         self.mafia_observer_base_epochs = 50  # Base training (iter 0) epochs
-        self.mafia_observer_finetune_epochs = 20  # Finetune (iter > 0) epochs
+        self.mafia_observer_finetune_epochs = 5  # Finetune (iter > 0) epochs
         # Steps per epoch: auto-computed as ceil((Len(Data) - T_m - h) / Batch_Size)
         # No manual override needed; calculated dynamically per dataset
 
@@ -857,15 +860,15 @@ class Config:
         # At time t, when Observer selects a portfolio, h determines how many days forward
         # to accumulate returns for evaluating that decision
         # Stronger portfolio churn penalties (penalty ~25–30% reward at λ=1 with typical turnover/symdiff)
-        self.mafia_pg_alpha_turnover = 0.40  # α_turnover: turnover penalty coefficient
-        self.mafia_pg_alpha_change = (
-            0.50  # α_change: membership change penalty coefficient
-        )
+        # Old override removed to respect lines 177-178
 
-        # Curriculum Learning (spec §7.1) - Penalty Warm-up
-        # DISABLED: Full penalties from epoch 0 (λ_epoch = 1.0 always)
-        self.curriculum_warmup_epochs = 0  # No warmup phase
-        self.curriculum_penalty_rampup = 5  # Rampup over 3 epochs (Planned: 3)
+        # SOFT LANDING for Resume at Epoch 7:
+        # Start ramp-up from Epoch 6 (Index 6), so Warmup = 5.
+        # Epoch 7: (7 - 5)/5 = 0.4 (40% penalty).
+        # Turnover: 0.6 | Change: 0.8 (Higher than old 0.4/0.5)
+        self.curriculum_warmup_epochs = 0  # Start ramp-up immediately (Epoch 0)
+
+        self.curriculum_penalty_rampup = 5  # Rampup over 5 epochs
 
         # Direction Labeling
         self.mafia_direction_threshold = (

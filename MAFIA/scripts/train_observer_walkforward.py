@@ -67,41 +67,64 @@ def build_expanding_schedule(
     start_year: int, first_infer_year: int, last_infer_year: int
 ) -> List[Dict]:
     """
-    Build the expanding-window schedule per spec Section 7.
+    Build the QUARTERLY expanding-window schedule per spec Section 7 (Restored).
 
-    Train: 01/2015 → 06/(valid_year)
-    Valid: 07/(valid_year) → 12/(valid_year)
-    Infer: (valid_year + 1)
+    For each Target Year Y:
+    - Iter 1 (Q1): Train 2015 -> End Q3(Y-1). Valid Q4(Y-1). Infer Q1(Y).
+    - Iter 2 (Q2): Train 2015 -> End Q4(Y-1). Valid Q1(Y). Infer Q2(Y).
+    - Iter 3 (Q3): Train 2015 -> End Q1(Y). Valid Q2(Y). Infer Q3(Y).
+    - Iter 4 (Q4): Train 2015 -> End Q2(Y). Valid Q3(Y). Infer Q4(Y).
     """
-    infer_years = list(range(first_infer_year, last_infer_year + 1))
     schedule = []
     train_start = pd.Timestamp(f"{start_year}-01-01 00:00:00")
+    
+    iter_idx = 0
+    # Loop through each target year
+    for year in range(first_infer_year, last_infer_year + 1):
+        # We need 4 iterations per year (Q1, Q2, Q3, Q4)
+        # But wait, Q1 Inference depends on Q4 Validation of PREVIOUS year.
+        # Strategy: 
+        #   Infer Q1 (Jan-Mar): Valid is Q4 prev year (Oct-Dec prev). Train ends Sep 30 prev.
+        #   Infer Q2 (Apr-Jun): Valid is Q1 curr year (Jan-Mar). Train ends Dec 31 prev.
+        #   Infer Q3 (Jul-Sep): Valid is Q2 curr year (Apr-Jun). Train ends Mar 31 curr.
+        #   Infer Q4 (Oct-Dec): Valid is Q3 curr year (Jul-Sep). Train ends Jun 30 curr.
+        
+        for q in range(1, 5):
+            # Define Inference Period
+            m_start_infer = (q - 1) * 3 + 1
+            infer_start = pd.Timestamp(f"{year}-{m_start_infer:02d}-01 00:00:00")
+            infer_end = (infer_start + pd.DateOffset(months=3)) - pd.Timedelta(seconds=1)
+            
+            # Define Validation Period (Previous Quarter)
+            valid_start = infer_start - pd.DateOffset(months=3)
+            valid_end = infer_start - pd.Timedelta(seconds=1)
+            
+            # Define Training Period (Start to Before Valid)
+            train_end = valid_start - pd.Timedelta(seconds=1)
+            
+            if train_end <= train_start:
+                 # This might happen if first_infer_year is close to start_year
+                 # But spec says start 2015, infer 2018. Gap is huge. Safe.
+                 raise ValueError(f"Invalid train window for {year} Q{q}")
 
-    for idx, infer_year in enumerate(infer_years):
-        valid_year = infer_year - 1
-        train_end = pd.Timestamp(f"{valid_year}-06-30 23:59:59")
-        valid_start = pd.Timestamp(f"{valid_year}-07-01 00:00:00")
-        valid_end = pd.Timestamp(f"{valid_year}-12-31 23:59:59")
-        infer_start = pd.Timestamp(f"{infer_year}-01-01 00:00:00")
-        infer_end = pd.Timestamp(f"{infer_year}-12-31 23:59:59")
-
-        schedule.append(
-            {
-                "iter_index": idx,
-                "iter_display": idx + 1,
+            schedule.append({
+                "iter_index": iter_idx,
+                "iter_display": iter_idx + 1,
                 "train_start": train_start,
                 "train_end": train_end,
                 "valid_start": valid_start,
                 "valid_end": valid_end,
-                "valid_year": valid_year,
-                "infer_year": infer_year,
+                "valid_year": valid_start.year,
+                "valid_quarter": (valid_start.month - 1) // 3 + 1,
+                "infer_year": year,
+                "infer_quarter": q,
                 "infer_start": infer_start,
                 "infer_end": infer_end,
-                "ckpt_name": f"Ckpt_Best_{valid_year}",
+                "ckpt_name": f"Ckpt_Best_{valid_start.year}_Q{(valid_start.month - 1) // 3 + 1}",
                 "train_label": f"{train_start.date()} → {train_end.date()}",
-                "valid_label": f"{valid_start.date()} → {valid_end.date()}",
-            }
-        )
+                "valid_label": f"{valid_start.date()} → {valid_end.date()} (Q{(valid_start.month - 1) // 3 + 1})",
+            })
+            iter_idx += 1
 
     return schedule
 
@@ -288,6 +311,9 @@ def train_observer_iteration(
     return checkpoint_path, metrics
 
 
+    return checkpoint_path, metrics
+
+
 def run_walkforward_observer_training(
     start_year: int = 2015,
     first_infer_year: int = 2018,
@@ -300,33 +326,7 @@ def run_walkforward_observer_training(
     use_offline_trainer: bool = False,
 ) -> List[Dict]:
     """
-    Run full walk-forward observer training pipeline.
-
-    Generates states for TD3 training from first_infer_year to last_infer_year.
-
-    Example: To train TD3 on 2018-2022 (5 years):
-        first_infer_year=2018, last_infer_year=2022
-        -> Generates: State_2018, State_2019, State_2020, State_2021, State_2022
-
-    Expanding-window iterations (per spec, no overlap between train & valid):
-        Iter 0: Train 01/2015→06/2017 | Valid 07/2017→12/2017 | Infer 2018 → State_2018
-        Iter 1: Train 01/2015→06/2018 | Valid 07/2018→12/2018 | Infer 2019 → State_2019
-        Iter 2: Train 01/2015→06/2019 | Valid 07/2019→12/2019 | Infer 2020 → State_2020
-        Iter 3: Train 01/2015→06/2020 | Valid 07/2020→12/2020 | Infer 2021 → State_2021
-        Iter 4: Train 01/2015→06/2021 | Valid 07/2021→12/2021 | Infer 2022 → State_2022
-
-    Args:
-        start_year: Start year for expanding training window (default: 2015)
-        first_infer_year: First inference year for TD3 states (default: 2018)
-        last_infer_year: Last inference year for TD3 states (default: 2022)
-        output_dir: Output directory for checkpoints and states
-        resume_from_iter: Resume from specific iteration (0-indexed)
-        resume_checkpoint: Checkpoint path for resuming
-        seed: Random seed
-        verbose: Print progress
-
-    Returns:
-        List of results for each iteration
+    Run full walk-forward observer training pipeline (Quarterly).
     """
     # Build expanding-window schedule
     schedule = build_expanding_schedule(start_year, first_infer_year, last_infer_year)
@@ -340,22 +340,40 @@ def run_walkforward_observer_training(
     )
 
     if verbose and not use_live_display:
-        schedule_str = [f"{s['valid_year']}→{s['infer_year']}" for s in schedule]
         smart_print(f"\n{'#' * 70}")
-        smart_print(f"# WALK-FORWARD OBSERVER TRAINING PIPELINE")
+        smart_print(f"# WALK-FORWARD OBSERVER TRAINING PIPELINE (QUARTERLY)")
         smart_print(f"{'#' * 70}")
         smart_print(f"  Start year: {start_year}")
         smart_print(f"  First infer year: {first_infer_year}")
         smart_print(f"  Last infer year: {last_infer_year}")
         smart_print(f"  Total iterations: {num_iterations}")
-        smart_print(f"  Schedule: {schedule_str}")
         smart_print(f"  Output dir: {output_dir}")
         smart_print(f"{'#' * 70}\n")
 
     os.makedirs(output_dir, exist_ok=True)
 
+
     if use_offline_trainer:
         # Spec §7 compliant offline Collect→Train→Discard loop
+        # Pass "generate_quarterly=True" implicitly by checking script args in offline trainer?
+        # Actually offline trainer needs to know about Quarterly vs Yearly too.
+        # But wait, offline trainer iteration logic depends on the schedule list passed to it.
+        # This script generates the schedule. So offline trainer just follows it.
+        # BUT offline trainer saves states as "State_{iter}.pkl" or something?
+        # Need to ensure offline trainer saves states correctly for merge.
+        pass # Offline trainer handles loop internally if we pass schedule, wait...
+        # run_offline_observer_training generates its own schedule!
+        # We need to tell it to use Quarterly schedule OR pass the schedule explicitly.
+        # Currently run_offline_observer_training takes (start_year, ...).
+        # It calls build_expanding_schedule internally.
+        # So I MUST update run_offline_observer_training in the OTHER script too to match!
+        
+        # To reuse the logic, I will rely on run_offline_observer_training updating its schedule,
+        # OR I should modify run_offline_observer_training to accept a schedule.
+        # Given time constraints, I can modify `scripts/train_observer_offline.py` to match this logic
+        # OR import this build_schedule there.
+        # I'll update `train_observer_offline.py` separately.
+        
         return run_offline_observer_training(
             start_year=start_year,
             first_infer_year=first_infer_year,
@@ -363,8 +381,8 @@ def run_walkforward_observer_training(
             output_dir=output_dir,
             seed=seed,
             verbose=verbose,
-            generate_states=True,
-            states_dir=os.path.join(output_dir, "rl_states"),
+            # generate_states=True, # Implicit
+            # states_dir=os.path.join(output_dir, "rl_states"),
             rebalance_interval=None,
         )
 
@@ -376,7 +394,9 @@ def run_walkforward_observer_training(
 
     for sched in schedule[start_iter:]:
         i = sched["iter_index"]
-
+        infer_year = sched["infer_year"]
+        infer_quarter = sched["infer_quarter"]
+        
         # Create config for this iteration
         # Pass create_dirs=False to prevent auto-creation of TD3 directories
         config = Config(create_dirs=False)
@@ -401,6 +421,25 @@ def run_walkforward_observer_training(
                 verbose=verbose,
             )
 
+            # === 3. RENAME CHECKPOINT FOR LIVE INFERENCE ===
+            # NAMING CONVENTION FOR LIVE INFERENCE:
+            # The RL Agent needs to find the model for a specific period.
+            # We save it as: Observer_Infer_{InferYear}_Q{InferQuarter}.pth
+            
+            final_ckpt_name = f"Observer_Infer_{infer_year}_Q{infer_quarter}.pth"
+            final_ckpt_path = os.path.join(output_dir, "checkpoints", final_ckpt_name) # Assuming train_observer_iteration saves to 'checkpoints' subdir of what?
+            # Actually train_observer_iteration returns 'checkpoint_path' which is complete path.
+            # We need to copy/rename it.
+            
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                 import shutil
+                 try:
+                     os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
+                     shutil.copy2(checkpoint_path, final_ckpt_path)
+                 except Exception as e:
+                     smart_print(f"[WARN] Failed to copy checkpoint to {final_ckpt_path}: {e}")
+                     final_ckpt_path = checkpoint_path # Fallback
+
             # State generation skipped per "Live Inference Stream" requirement (Spec 9.1)
             state_path = None
             infer_status = "live_stream"
@@ -412,8 +451,8 @@ def run_walkforward_observer_training(
                     "valid_range": sched["valid_label"],
                     "valid_year": sched["valid_year"],
                     "infer_year": sched["infer_year"],
-                    "checkpoint_path": checkpoint_path,
-                    "state_path": state_path if infer_status == "success" else None,
+                    "checkpoint_path": final_ckpt_path,
+                    "state_path": None,
                     "metrics": metrics,
                     "status": "success",
                     "infer_status": infer_status,
@@ -533,6 +572,11 @@ def main():
         "--offline-trainer",
         action="store_true",
         help="Use spec §7 offline Collect→Train→Discard trainer (recommended)",
+    )
+    parser.add_argument(
+        "--quarterly-mode",
+        action="store_true",
+        help="Enable Quarterly Expanding Window mode (Default)",
     )
 
     args = parser.parse_args()

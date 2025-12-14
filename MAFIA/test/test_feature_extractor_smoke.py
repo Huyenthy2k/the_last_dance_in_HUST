@@ -8,10 +8,10 @@ import numpy as np
 import torch
 try:
     import gymnasium as gym
-    SPACES = gym.spaces
+    print("Gymnasium installed")
 except ImportError:
     import gym
-    SPACES = gym.spaces
+    print("Gym installed")
 from stable_baselines3.td3.policies import MultiInputPolicy
 
 from RL_controller.feature_extractors import MAFIASingleStageMLP

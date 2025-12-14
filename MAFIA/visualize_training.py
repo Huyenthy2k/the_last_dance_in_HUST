@@ -28,7 +28,7 @@ import matplotlib.gridspec as gridspec
 # Metric Groups for organized visualization
 # ============================================================================
 PERFORMANCE_METRICS = ["ces_score", "reward_sum", "final_capital", "sharpeRatio", "annualReturn_pct", "netProfit_pct"]
-RISK_METRICS = ["volatility", "mdd"]
+RISK_METRICS = ["risk_mse", "risk_correlation", "topk_volatility"]
 LOSS_METRICS = ["mafia_loss", "mafia_pg_loss", "mafia_risk_loss", "mafia_direction_loss", "td3_actor_loss", "td3_critic_loss"]
 
 # Phase styling
@@ -193,7 +193,7 @@ def plot_metric_group(
         # Y-axis formatting for specific metrics
         if metric in ["final_capital"]:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{x/1e6:.2f}M"))
-        elif metric in ["mdd", "volatility", "annualReturn_pct", "netProfit_pct"]:
+        elif metric in ["mdd", "volatility", "annualReturn_pct", "netProfit_pct", "topk_volatility"]:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{x*100:.1f}%"))
 
     # Hide unused axes
@@ -227,11 +227,14 @@ def _format_metric_name(metric: str) -> str:
         "annualReturn_pct": "Annual Return",
         "netProfit_pct": "Net Profit",
         "volatility": "Volatility (σ)",
+        "topk_volatility": "Portfolio Volatility",
         "mdd": "Max Drawdown",
         "mafia_loss": "Observer Total Loss",
         "mafia_direction_loss": "Observer Direction Loss",
         "td3_actor_loss": "TD3 Actor Loss",
         "td3_critic_loss": "TD3 Critic Loss",
+        "risk_mse": "Risk MSE",
+        "risk_correlation": "Risk Correlation",
     }
     return replacements.get(metric, metric.replace("_", " ").title())
 
@@ -239,7 +242,7 @@ def _format_metric_name(metric: str) -> str:
 def plot_combined_dashboard(df: pd.DataFrame, output_path: str):
     """Create a single dashboard with all key metrics."""
     # Select key metrics for dashboard
-    key_metrics = ["ces_score", "sharpeRatio", "final_capital", "mdd", "volatility", "mafia_loss"]
+    key_metrics = ["ces_score", "sharpeRatio", "final_capital", "mdd", "topk_volatility", "mafia_loss"]
     available = [m for m in key_metrics if m in df.columns]
 
     if len(available) < 2:
@@ -293,7 +296,7 @@ def plot_combined_dashboard(df: pd.DataFrame, output_path: str):
         # Formatting
         if metric == "final_capital":
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{x/1e6:.1f}M"))
-        elif metric in ["mdd", "volatility"]:
+        elif metric in ["mdd", "volatility", "topk_volatility"]:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{x*100:.0f}%"))
 
     for ax in axes_flat[n:]:
@@ -388,7 +391,12 @@ def plot_trajectory_dynamics(traj_file: str, output_path: str):
         print(f"⚠️  Could not read trajectory log: {e}")
         return
 
-    # Create figure with GridSpec for hierarchical layout
+    # Check for required columns
+    required_cols = ["grad_norm", "pg_loss", "risk_loss", "dir_loss"]
+    if not all(col in df.columns for col in required_cols):
+        print(f"⚠️  Missing required columns in trajectory log. Have: {df.columns.tolist()}")
+        return
+
     # Create figure with GridSpec for hierarchical layout
     fig = plt.figure(figsize=(20, 16))
     gs = gridspec.GridSpec(4, 2, height_ratios=[1, 1, 1, 1])
@@ -502,7 +510,7 @@ def plot_trajectory_dynamics(traj_file: str, output_path: str):
     print(f"📉 Saved detailed trajectory analysis to {output_path}")
 
 
-def generate_epoch_report(res_dir: str, epoch: int):
+def generate_epoch_report(res_dir: str, epoch: int, min_best_epoch: int = 0):
     """
     Generate MAFIA Observer insight charts for the current epoch.
 
@@ -514,6 +522,11 @@ def generate_epoch_report(res_dir: str, epoch: int):
     5. Direction breakdown - Per-class F1 analysis (NEW)
     6. Risk calibration - Risk prediction quality (NEW)
     7. Turnover trade-off - Turnover vs Sharpe analysis (NEW)
+    
+    Args:
+        res_dir: Result directory
+        epoch: Current epoch
+        min_best_epoch: Minimum epoch to consider as 'Best Checkpoint' (Curriculum Learning)
     """
     # Import new plotting functions
     try:
@@ -521,7 +534,8 @@ def generate_epoch_report(res_dir: str, epoch: int):
             plot_ces_components_breakdown,
             plot_direction_breakdown,
             plot_risk_calibration,
-            plot_turnover_sharpe_tradeoff
+            plot_turnover_sharpe_tradeoff,
+            plot_validation_metrics_grid
         )
     except ImportError:
         # Fallback for different import paths
@@ -531,12 +545,12 @@ def generate_epoch_report(res_dir: str, epoch: int):
             plot_ces_components_breakdown,
             plot_direction_breakdown,
             plot_risk_calibration,
-            plot_turnover_sharpe_tradeoff
+            plot_turnover_sharpe_tradeoff,
+            plot_validation_metrics_grid
         )
 
-    # Put plots in the root observer_offline folder (parent of res_dir)
-    root_dir = os.path.dirname(res_dir)
-    plots_dir = os.path.join(root_dir, "plots")
+    # Put plots in the iteration folder
+    plots_dir = os.path.join(res_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
     # Find metrics file
@@ -547,9 +561,35 @@ def generate_epoch_report(res_dir: str, epoch: int):
         metrics_file = os.path.join(root_dir, "valid_metrics.csv")
 
     # 1. Update Epoch-Level Charts (Dashboard + Loss History)
+    # 1. Update Epoch-Level Charts (Dashboard + Loss History)
     try:
+        df_merged = pd.DataFrame()
+
+        # Load Validation Metrics
         if os.path.exists(metrics_file):
-            df = pd.read_csv(metrics_file)
+            df_valid = pd.read_csv(metrics_file)
+            if "phase" not in df_valid.columns:
+                df_valid["phase"] = "valid"
+            df_merged = df_valid
+
+        # Load Training Metrics (if available)
+        train_metrics_file = os.path.join(res_dir, "train_metrics.csv")
+        if os.path.exists(train_metrics_file):
+            try:
+                df_train = pd.read_csv(train_metrics_file)
+                if "phase" not in df_train.columns:
+                    df_train["phase"] = "train"
+                
+                # Align columns (fill missing with NaN if necessary)
+                if not df_merged.empty:
+                    df_merged = pd.concat([df_merged, df_train], ignore_index=True)
+                else:
+                    df_merged = df_train
+            except Exception as e:
+                print(f"[WARN] Failed to load train_metrics.csv: {e}")
+
+        if not df_merged.empty:
+            df = df_merged
 
             # Map columns if valid_metrics.csv format
             if "topk_sharpe_ratio" in df.columns:
@@ -562,22 +602,27 @@ def generate_epoch_report(res_dir: str, epoch: int):
                 }
                 df.rename(columns=rename_map, inplace=True)
 
-            if "phase" not in df.columns:
-                df["phase"] = "valid"
-
             df["window"] = 0
             df["global_epoch"] = df["epoch"]
 
             # Core charts (always generate)
             plot_combined_dashboard(df, os.path.join(plots_dir, "dashboard_latest.png"))
             plot_metric_group(df, LOSS_METRICS, "Loss History", os.path.join(plots_dir, "loss_history.png"))
+            
+            # Additional Performance/Risk charts for combined view
+            plot_metric_group(df, PERFORMANCE_METRICS, "Performance Metrics", os.path.join(plots_dir, "metrics_performance.png"))
+            plot_metric_group(df, RISK_METRICS, "Risk Metrics", os.path.join(plots_dir, "metrics_risk.png"))
 
-            # NEW: Insight charts (generate from valid_metrics.csv)
-            # These use the original file format, not the renamed df
-            plot_ces_components_breakdown(metrics_file, os.path.join(plots_dir, "ces_breakdown.png"))
-            plot_direction_breakdown(metrics_file, os.path.join(plots_dir, "direction_breakdown.png"))
-            plot_risk_calibration(metrics_file, os.path.join(plots_dir, "risk_calibration.png"))
-            plot_turnover_sharpe_tradeoff(metrics_file, os.path.join(plots_dir, "turnover_tradeoff.png"))
+            # NEW: Insight charts (generate from valid_metrics.csv ONLY)
+            # These use the original file format/path, specific to validation analysis
+            if os.path.exists(metrics_file):
+                plot_ces_components_breakdown(metrics_file, os.path.join(plots_dir, "ces_breakdown.png"), min_best_epoch=min_best_epoch)
+                plot_direction_breakdown(metrics_file, os.path.join(plots_dir, "direction_breakdown.png"))
+                plot_risk_calibration(metrics_file, os.path.join(plots_dir, "risk_calibration.png"))
+                plot_turnover_sharpe_tradeoff(metrics_file, os.path.join(plots_dir, "turnover_tradeoff.png"))
+                
+                # Plot detailed grid metrics (This was missing)
+                plot_validation_metrics_grid(metrics_file, os.path.join(plots_dir, "validation_metrics.png"), min_best_epoch=min_best_epoch)
 
     except Exception as e:
         print(f"[WARN] Error generating epoch-level charts: {e}")

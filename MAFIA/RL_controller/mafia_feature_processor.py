@@ -28,13 +28,68 @@ except ImportError:
         "Warning: TA-Lib not available. Using fallback implementations for technical indicators."
     )
 
-# Numba disabled to reduce memory usage during imports
-# DC features will be pre-computed during data preparation instead
-NUMBA_AVAILABLE = False
-_compute_dc_sequence_numba = None
+# Numba enabled for performance
+try:
+    from numba import jit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: Numba not found. DC feature computation will be slow.")
 
+@jit(nopython=True)
+def _compute_dc_sequence_jit(close, high, low, threshold):
+    T_w = len(close)
+    state = np.zeros(T_w)
+    magnitude = np.zeros(T_w)
+    duration = np.zeros(T_w)
+    event_flag = np.zeros(T_w)
+
+    # Initialize: start with upward trend
+    current_trend = 1
+    current_extreme = close[0]
+    event_price = close[0]
+    event_time = 0
+
+    state[0] = current_trend
+    magnitude[0] = 0.0
+    duration[0] = 0
+    event_flag[0] = 1.0
+
+    for t in range(1, T_w):
+        if current_trend == 1:
+            if close[t] <= current_extreme * (1 - threshold):
+                current_trend = -1
+                current_extreme = close[t]
+                event_price = close[t]
+                event_time = t
+                event_flag[t] = 1.0
+            else:
+                if high[t] > current_extreme:
+                    current_extreme = high[t]
+                event_flag[t] = 0.5
+        else:
+            if close[t] >= current_extreme * (1 + threshold):
+                current_trend = 1
+                current_extreme = close[t]
+                event_price = close[t]
+                event_time = t
+                event_flag[t] = 1.0
+            else:
+                if low[t] < current_extreme:
+                    current_extreme = low[t]
+                event_flag[t] = 0.5
+
+        state[t] = current_trend
+        magnitude[t] = (close[t] / event_price) - 1.0 if event_price > 0 else 0.0
+        duration[t] = t - event_time
+
+    return state, magnitude, duration, event_flag
 
 class MAFIAFeatureProcessor:
+    # ... (rest of class init, skipped for brevity in replacement) ...
+    # REDEFINING _compute_dc_sequence inside class is hard with tool.
+    # I will replace the block from "NUMBA_AVAILABLE = False" down to "_compute_dc_sequence" logic.
+
     """
     Feature processor for MAFIA agents.
 
@@ -202,7 +257,10 @@ class MAFIAFeatureProcessor:
             duration: (T_w,) - Days since last DC event
             event_flag: (T_w,) - 1.0 (DC event) or 0.5 (OS event)
         """
-        # Pure Python implementation (Numba disabled to save memory)
+        if NUMBA_AVAILABLE:
+            return _compute_dc_sequence_jit(close, high, low, float(threshold))
+        
+        # Pure Python implementation (Fallback)
         T_w = len(close)
         state = np.zeros(T_w)
         magnitude = np.zeros(T_w)

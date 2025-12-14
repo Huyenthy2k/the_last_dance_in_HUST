@@ -2,15 +2,9 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
-# Handle gym/gymnasium compatibility
-try:
-    import gymnasium as gym
+import gymnasium as gym
 
-    GYMNASIUM_AVAILABLE = True
-except ImportError:
-    import gym
-
-    GYMNASIUM_AVAILABLE = False
+GYMNASIUM_AVAILABLE = True
 import numpy as np
 import torch as th
 from torch.nn import functional as F

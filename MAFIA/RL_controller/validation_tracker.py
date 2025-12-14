@@ -58,13 +58,14 @@ class ValidationMetricsTracker:
         self.best_ces: float = -np.inf
         self.ces_rank_n = ces_rank_n if ces_rank_n is not None else self.CES_RANK_N_FIXED
         
-    def add_epoch(self, result: ObserverValidationResult) -> bool:
+    def add_epoch(self, result: ObserverValidationResult, allow_best_update: bool = True) -> bool:
         """
         Add validation result for an epoch and update CES scores.
         If epoch already exists (from resume), replace it instead of duplicating.
 
         Args:
             result: Validation result to add
+            allow_best_update: If False, this epoch cannot be selected as new best even if score is higher.
 
         Returns:
             True if this is a new best checkpoint
@@ -82,7 +83,7 @@ class ValidationMetricsTracker:
             self.history.append(result)
 
         self._recompute_ces_scores()
-        is_best = self._update_best()
+        is_best = self._update_best(allow_best_update=allow_best_update)
         return is_best
     
     def _recompute_ces_scores(self):
@@ -145,19 +146,22 @@ class ValidationMetricsTracker:
             hist.ces_rank_dir_f1 = (r_d - 1) / max(1, N_norm - 1)
             hist.ces_rank_risk_mse = (r_r - 1) / max(1, N_norm - 1)
 
-            # CES formula from Spec §7.1200
-            # CES = 1.0 × Ŝ_Sharpe + 0.5 × Ŝ_Dir_F1 + 0.5 × (1 - Ŝ_Risk_MSE)
+            # CES formula from Spec §7.1200 (Updated)
+            # CES = 0.5 × Ŝ_Sharpe + 0.3 × Ŝ_Dir_F1 + 0.2 × (1 - Ŝ_Risk_MSE)
             # Note: (1 - Ŝ_Risk_MSE) inverts the score since lower MSE is better
             hist.ces_score = (
-                1.0 * hist.ces_rank_sharpe +
-                0.5 * hist.ces_rank_dir_f1 +
-                0.5 * (1 - hist.ces_rank_risk_mse)
+                0.5 * hist.ces_rank_sharpe +
+                0.3 * hist.ces_rank_dir_f1 +
+                0.2 * hist.ces_rank_risk_mse
             )
     
-    def _update_best(self) -> bool:
+    def _update_best(self, allow_best_update: bool = True) -> bool:
         """
         Update best checkpoint tracker.
         
+        Args:
+            allow_best_update: If False, block update even if score is higher.
+
         Returns:
             True if last added result is new best
         """
@@ -167,7 +171,8 @@ class ValidationMetricsTracker:
         last_idx = len(self.history) - 1
         last_ces = self.history[last_idx].ces_score
         
-        if last_ces > self.best_ces:
+        # Only update "best" if allowed AND score improved
+        if allow_best_update and last_ces > self.best_ces:
             self.best_ces = last_ces
             self.best_epoch = last_idx
             return True
@@ -223,11 +228,18 @@ class ValidationMetricsTracker:
         temp_path = csv_path + ".tmp"
         
         try:
-            # Write to temp file first
-            df.to_csv(temp_path, index=False)
+            # Format epoch as integer
+            if "epoch" in df.columns:
+                 df["epoch"] = df["epoch"].astype(int)
+                 
+            # Write to temp file first (force 5 decimal places)
+            df.to_csv(temp_path, index=False, float_format='%.5f')
             
             # Atomic rename
             os.replace(temp_path, csv_path)
+            
+
+                
         except Exception as e:
             print(f"[TRACKER] Failed to save validation history: {e}")
             if os.path.exists(temp_path):

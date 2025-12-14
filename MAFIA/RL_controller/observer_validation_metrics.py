@@ -70,35 +70,35 @@ class ObserverValidationResult:
     
     epoch: int
     
-    # Loss components
-    loss_total: float
-    loss_pg: float
-    loss_risk: float
-    loss_dir: float
-    
-    # Selection performance
-    topk_sharpe_ratio: float
-    topk_mean_return: float
-    topk_volatility: float
-    topk_turnover: float
-    
-    # Direction performance
-    direction_accuracy: float
-    direction_f1_bear: float
-    direction_f1_side: float
-    direction_f1_bull: float
-    direction_f1_macro: float
-    
-    # Risk performance
-    risk_mse: float
-    risk_mae: float
-    risk_correlation: float
-    
-    # CES components (updated by ValidationMetricsTracker)
+    # Composite Efficiency Score (Moved to top as requested)
     ces_score: float = 0.0
     ces_rank_sharpe: float = 0.0
     ces_rank_dir_f1: float = 0.0
     ces_rank_risk_mse: float = 0.0
+
+    # Loss components
+    loss_total: float = 0.0
+    loss_pg: float = 0.0
+    loss_risk: float = 0.0
+    loss_dir: float = 0.0
+    
+    # Selection performance
+    topk_sharpe_ratio: float = 0.0
+    topk_mean_return: float = 0.0
+    topk_volatility: float = 0.0
+    topk_turnover: float = 0.0
+    
+    # Direction performance
+    direction_accuracy: float = 0.0
+    direction_f1_bear: float = 0.0
+    direction_f1_side: float = 0.0
+    direction_f1_bull: float = 0.0
+    direction_f1_macro: float = 0.0
+    
+    # Risk performance
+    risk_mse: float = 0.0
+    risk_mae: float = 0.0
+    risk_correlation: float = 0.0
     
     # Additional metrics
     topk_advantage: float = 0.0
@@ -106,6 +106,10 @@ class ObserverValidationResult:
     net_reward: float = 0.0
     turnover_penalty: float = 0.0
     symdiff_penalty: float = 0.0
+    
+
+    
+    # Removed RL metrics (always 0 in validation)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for CSV export."""

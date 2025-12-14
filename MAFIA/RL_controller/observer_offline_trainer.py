@@ -27,7 +27,9 @@ import pandas as pd
 import torch as th
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+
+from RL_controller.observer_validation_metrics import ObserverValidationResult
 
 # LiveDisplay smart_print for terminal-safe logging
 try:
@@ -1545,6 +1547,11 @@ class ObserverOfflineBatchTrainer:
         days_since_last_rebal = th.zeros(B, dtype=th.long, device=self.device)
         rebal_interval = self.rebalance_interval
 
+        # Track start index for retrospective log update
+        if not hasattr(self, "_trajectory_log"):
+             self._trajectory_log = []
+        start_log_idx = len(self._trajectory_log)
+
         for t in range(T_m):
             # Get feature window [t_s + t - T_w + 1, t_s + t + 1] for each batch item
             # Since we need T_w history, we need to index into full data
@@ -2277,31 +2284,62 @@ class ObserverOfflineBatchTrainer:
             if not hasattr(self, "_trajectory_log"):
                 self._trajectory_log = []
 
-            self._trajectory_log.append(
-                {
-                    "batch_idx": batch_idx,
-                    "timestep": t,
-                    "trigger": trigger_str,
-                    "rebalanced": is_rebalance_b0,
-                    "selected_stocks": ",".join([str(idx) for idx in sel_stocks]),
-                    "risk_eta": risk_eta[b].item(),
-                    "dir_logit_bear": direction_logits[b, 0].item(),
-                    "dir_logit_side": direction_logits[b, 1].item(),
-                    "dir_logit_bull": direction_logits[b, 2].item(),
-                    "c_mkt_norm": market_context[b].norm().item(),
-                    "c_mkt_diff": c_mkt_diff,
-                    "raw_return": R_raw[b].item(),
-                    "turnover_penalty": turnover[b].item() * self.alpha_turnover,
-                    "symdiff_penalty": symdiff[b].item() * self.alpha_change,
-                    "net_reward": R_net[b].item(),
-                    "baseline": baseline[b].item(),
-                    "advantage": A_t_raw[b].item(),
-                    "advantage_norm": A_t[b].item(),
-                    "pg_loss": pg_val,  # Note: pg_val is tensor, need item()
-                    "risk_loss": risk_loss.item(),
-                    "dir_loss": dir_loss.item(),
-                }
-            )
+            # Determine whether to log ALL trajectories or just the representative one (b=0)
+            log_all = getattr(self.config, "log_trajectory_details", False)
+            log_indices = range(B) if log_all else [0]
+
+            for b_log in log_indices:
+                # Reconstruct triggers for this sample
+                triggers_b = []
+                if sched_trigger[b_log].item():
+                    triggers_b.append("Schedule")
+                if batch.vol_std20[b_log, t] > vol_shock_threshold:
+                    triggers_b.append("Vol Shock")
+                if batch.dc_event_flag[b_log, t] > 0.5:
+                    triggers_b.append("Struct Break (DC)")
+                
+                # Regime Shift logic
+                if dir_trigger[b_log].item():
+                    prev_s_idx_b = int(min(max(prev_pred_state[b_log].item(), 0), 2))
+                    curr_s_idx_b = int(min(max(pred_state[b_log].item(), 0), 2))
+                    prev_s_str = ["Bear", "Side", "Bull"][prev_s_idx_b]
+                    curr_s_str = ["Bear", "Side", "Bull"][curr_s_idx_b]
+                    triggers_b.append(f"Regime Shift ({prev_s_str}->{curr_s_str})")
+                elif t == 0:
+                    triggers_b.append("Regime Shift (Initial)")
+                
+                trigger_str_b = " | ".join(triggers_b) if triggers_b else "None"
+                
+                # Context Diff (Only available for b=0 or just put 0.0)
+                # Re-computing it for log is expensive/complex without state tracking.
+                c_mkt_diff_b = c_mkt_diff if b_log == 0 else 0.0
+
+                self._trajectory_log.append(
+                    {
+                        "batch_idx": batch_idx,
+                        "sample_idx": b_log,
+                        "timestep": t,
+                        "trigger": trigger_str_b,
+                        "rebalanced": effective_mask[b_log].item() > 0.5,
+                        "selected_stocks": ",".join([str(idx) for idx in topk_indices[b_log].cpu().tolist()]),
+                        "risk_eta": risk_eta[b_log].item(),
+                        "dir_logit_bear": direction_logits[b_log, 0].item(),
+                        "dir_logit_side": direction_logits[b_log, 1].item(),
+                        "dir_logit_bull": direction_logits[b_log, 2].item(),
+                        "c_mkt_norm": market_context[b_log].norm().item(),
+                        "c_mkt_diff": c_mkt_diff_b,
+                        "raw_return": R_raw[b_log].item(),
+                        "turnover_penalty": turnover[b_log].item() * self.alpha_turnover,
+                        "symdiff_penalty": symdiff[b_log].item() * self.alpha_change,
+                        "net_reward": R_net[b_log].item(),
+                        "baseline": baseline[b_log].item(),
+                        "advantage": A_t_raw[b_log].item(),
+                        "advantage_norm": A_t[b_log].item(),
+                        "pg_loss": step_pg_loss.item(),  # Log aggregated PG loss (scalar)
+                        "risk_loss": risk_loss.item(),   # Log aggregated Risk loss
+                        "dir_loss": dir_loss.item(),     # Log aggregated Dir loss
+                    }
+                )
 
             # Note: Hidden state is automatically maintained inside the LSTM
             # via _cached_state (detached for TBPTT)
@@ -2330,6 +2368,11 @@ class ObserverOfflineBatchTrainer:
             if th.is_tensor(grad_norm):
                 grad_norm = grad_norm.item()
 
+            # Retrospective Log Update
+            if hasattr(self, "_trajectory_log"):
+                for i in range(start_log_idx, len(self._trajectory_log)):
+                    self._trajectory_log[i]["grad_norm"] = grad_norm
+
             # Update weights
             self.optimizer.step()
             # If an LR scheduler is used, step it here. Assuming it's self.lr_scheduler
@@ -2344,6 +2387,10 @@ class ObserverOfflineBatchTrainer:
                 self.optimizer.zero_grad()
                 skipped_update = True
                 grad_norm = -1.0  # Indicator for failure
+
+                if start_log_idx != -1 and hasattr(self, "_trajectory_log"):
+                    for i in range(start_log_idx, len(self._trajectory_log)):
+                        self._trajectory_log[i]["grad_norm"] = -1.0
             else:
                 raise e
         else:
@@ -2402,6 +2449,71 @@ class ObserverOfflineBatchTrainer:
             batch_turn_pens = np.array([])
             batch_symdiff_pens = np.array([])
 
+        # Compute Selection Metrics (Sharpe, Turnover, etc.) for this batch
+        # We need (B, T_m, K) indices.
+        if collected_topk_indices:
+            batch_topk_indices = th.stack(collected_topk_indices, dim=1)  # (B, T_m, K)
+            # Scores (optional, just stacking for completeness if needed later)
+            batch_topk_scores = th.stack(collected_topk_scores, dim=1) if collected_topk_scores else None
+            
+            selection_metrics = self.compute_selection_metrics(
+                topk_indices=batch_topk_indices,
+                topk_scores=batch_topk_scores,
+                price_returns=batch.price_returns,
+                market_returns=batch.market_returns
+            )
+        else:
+            selection_metrics = {
+                "sharpe_ratio": 0.0,
+                "mean_return": 0.0,
+                "volatility": 0.0,
+                "turnover": 0.0,
+                "topk_advantage": 0.0,
+            }
+
+        # Compute Direction Metrics (F1, etc.) for this batch
+        # We need (B, T_m, 3) logits and (B, T_m) labels
+        if collected_direction_logits:
+            batch_dir_logits = th.stack(collected_direction_logits, dim=1)  # (B, T_m, 3)
+            # Ensure labels are same length (T_m)
+            batch_dir_labels = batch.direction_labels[:, :T_m]
+            
+            direction_metrics = self.compute_direction_metrics(
+                direction_logits=batch_dir_logits,
+                direction_labels=batch_dir_labels
+            )
+        else:
+            direction_metrics = {
+                "accuracy": 0.0,
+                "f1_bear": 0.0,
+                "f1_side": 0.0,
+                "f1_bull": 0.0,
+                "f1_macro": 0.0,
+            }
+
+        # Compute Risk Metrics (MSE, MAE) for this batch
+        if collected_risk_eta:
+             batch_risk_pred = th.stack(collected_risk_eta, dim=1) # (B, T_m) which was actually (B,) in loop list -> (B, T_m)?
+             # collected_risk_eta is list of (B,) tensors?
+             # Let's check loop: collected_risk_eta.append(risk_eta) where risk_eta is (B,)
+             # So stack dim=1 gives (B, T_m)
+             # batch.risk_targets is (B, T_m)
+             
+             batch_risk_pred = th.stack(collected_risk_eta, dim=1)
+             batch_risk_target = batch.risk_targets[:, :T_m]
+             
+             risk_metrics_val = self.compute_risk_metrics(
+                 risk_pred=batch_risk_pred,
+                 risk_target=batch_risk_target
+             )
+        else:
+             risk_metrics_val = {
+                 "mse": 0.0,
+                 "mae": 0.0,
+                 "correlation": 0.0,
+             }
+
+        # Merge all metrics
         metrics = {
             "loss_total": total_disp,
             "loss_pg": avg_pg,
@@ -2417,7 +2529,7 @@ class ObserverOfflineBatchTrainer:
             "lr": self.optimizer.param_groups[0]["lr"],
             "grad_norm": grad_norm,
             "skipped_update": 1.0 if skipped_update else 0.0,
-            # Direction stats for epoch accumulation
+            # Direction stats for epoch accumulation (keeping raw for fallback)
             "dir_preds": batch_dir_preds,
             "dir_targets": batch_dir_targets,
             "batch_returns": batch_returns,
@@ -2425,92 +2537,31 @@ class ObserverOfflineBatchTrainer:
             "batch_net_rewards": batch_net_rewards,
             "batch_turn_pens": batch_turn_pens,
             "batch_symdiff_pens": batch_symdiff_pens,
+            
+            # Detailed Selection Metrics
+            "topk_sharpe_ratio": selection_metrics["sharpe_ratio"],
+            "topk_mean_return": selection_metrics["mean_return"],
+            "topk_volatility": selection_metrics["volatility"],
+            "topk_turnover": selection_metrics["turnover"],
+            "topk_advantage": selection_metrics["topk_advantage"],
+            
+            # Detailed Direction Metrics
+            "direction_accuracy": direction_metrics["accuracy"],
+            "direction_f1_bear": direction_metrics["f1_bear"],
+            "direction_f1_side": direction_metrics["f1_side"],
+            "direction_f1_bull": direction_metrics["f1_bull"],
+            "direction_f1_macro": direction_metrics["f1_macro"],
+            
+            # Detailed Risk Metrics
+            "risk_mse": risk_metrics_val["mse"],
+            "risk_mae": risk_metrics_val["mae"],
+            "risk_correlation": risk_metrics_val["correlation"],
+            
+            # Raw data for global epoch aggregation
+            "dir_logits": batch_dir_logits.detach().cpu() if collected_direction_logits else None,
+            "risk_pred_raw": batch_risk_pred.detach().cpu() if collected_risk_eta else None,
+            "risk_target_raw": batch_risk_target.detach().cpu() if collected_risk_eta else None,
         }
-
-        if hasattr(self, "_trajectory_log") and self._trajectory_log:
-            for entry in self._trajectory_log:
-                entry["grad_norm"] = grad_norm
-                entry["skipped_update"] = 1.0 if skipped_update else 0.0
-
-        # ============================================================
-        # TENSORBOARD LOGGING (Batch-level)
-        # ============================================================
-        if self.tb_logger is not None:
-            # Calculate global step (epoch * batches_per_epoch + batch_idx)
-            global_step = epoch_idx * 1000 + batch_idx  # Approximate
-
-            # Log scalar losses
-            self.tb_logger.log_scalar(
-                "loss/total", total_disp, global_step, phase="train"
-            )
-            self.tb_logger.log_scalar("loss/pg", avg_pg, global_step, phase="train")
-            self.tb_logger.log_scalar("loss/risk", avg_risk, global_step, phase="train")
-            self.tb_logger.log_scalar(
-                "loss/direction", avg_dir, global_step, phase="train"
-            )
-
-            # Log gradient metrics
-            self.tb_logger.log_scalar(
-                "gradients/norm", grad_norm, global_step, phase="train"
-            )
-            self.tb_logger.log_scalar(
-                "gradients/skipped_update",
-                1.0 if skipped_update else 0.0,
-                global_step,
-                phase="train",
-            )
-
-            # Log learning rate
-            self.tb_logger.log_scalar(
-                "optimizer/learning_rate",
-                self.optimizer.param_groups[0]["lr"],
-                global_step,
-                phase="train",
-            )
-
-            # Log portfolio metrics
-            self.tb_logger.log_scalar(
-                "portfolio/rebalance_ratio",
-                metrics["rebalance_ratio"],
-                global_step,
-                phase="train",
-            )
-            self.tb_logger.log_scalar(
-                "portfolio/mean_risk_eta",
-                metrics["mean_risk_eta"],
-                global_step,
-                phase="train",
-            )
-
-            # Log curriculum learning weight
-            self.tb_logger.log_scalar(
-                "curriculum/lambda_epoch",
-                self._current_lambda_epoch,
-                global_step,
-                phase="train",
-            )
-
-            # Log histograms every N batches
-            if batch_idx % self.tb_logger.histogram_freq == 0:
-                # Log model weights and gradients
-                self.tb_logger.log_model_weights(
-                    self.observer.mafia_model, global_step, phase="train"
-                )
-                self.tb_logger.log_model_gradients(
-                    self.observer.mafia_model, global_step, phase="train"
-                )
-
-                # Log action distribution (portfolio weights)
-                if collected_topk_scores:
-                    topk_scores_stacked = th.stack(
-                        collected_topk_scores, dim=1
-                    )  # (B, T_m, K)
-                    self.tb_logger.log_histogram(
-                        "actions/portfolio_weights",
-                        topk_scores_stacked,
-                        global_step,
-                        phase="train",
-                    )
 
         # Clear memory
         del ochlv_batch, market_ochlv_batch
@@ -2558,6 +2609,7 @@ class ObserverOfflineBatchTrainer:
         writer: Optional[Any] = None,
         global_step_offset: int = 0,
         on_batch_done: Optional[Any] = None,
+        log_file: Optional[str] = None,  # NEW: Path to save detailed trajectory log
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -2565,9 +2617,10 @@ class ObserverOfflineBatchTrainer:
         Args:
             data_tensors: Prepared data tensors from prepare_data_tensors()
             steps_per_epoch: Number of training steps (default: auto-computed)
+            log_file: Optional path to append detailed step metrics (CSV)
 
         Returns:
-            Dict of epoch-averaged metrics
+            ObserverValidationResult: containing all training metrics
         """
         T_total = data_tensors["T_total"]
 
@@ -2591,7 +2644,41 @@ class ObserverOfflineBatchTrainer:
             "loss_dir": 0.0,
             "rebalance_ratio": 0.0,
             "mean_risk_eta": 0.0,
+            
+            # Selection Metrics
+            "topk_sharpe_ratio": 0.0,
+            "topk_mean_return": 0.0,
+            "topk_volatility": 0.0,
+            "topk_turnover": 0.0,
+            "topk_advantage": 0.0,
+            
+            # Direction Metrics
+            "direction_accuracy": 0.0,
+            "direction_f1_bear": 0.0,
+            "direction_f1_side": 0.0,
+            "direction_f1_bull": 0.0,
+            "direction_f1_macro": 0.0,
+            
+            # Risk Metrics
+            "risk_mse": 0.0,
+            "risk_mae": 0.0,
+            "risk_correlation": 0.0,
+            
+            # Additional Reward components for manual accumulation if needed
+            "reward": 0.0, # Will be sum(net_reward)? or mean? 
+            # Note: valid_metrics has 'reward' and 'net_reward'. 
+            # In validation result class:
+            # reward: float = 0.0
+            # net_reward: float = 0.0
+            # turnover_penalty: float = 0.0
+            # symdiff_penalty: float = 0.0
         }
+        
+        # Accumulators for reward info to match ObserverValidationResult additional fields
+        acc_reward_raw = 0.0
+        acc_reward_net = 0.0
+        acc_turnover_pen = 0.0
+        acc_symdiff_pen = 0.0
 
         # Tracking for epoch-level direction summary
         epoch_dir_preds = []  # List of prediction arrays
@@ -2601,6 +2688,15 @@ class ObserverOfflineBatchTrainer:
         epoch_net_rewards = []  # List of net reward values
         epoch_turn_pens = []  # List of turnover penalty values
         epoch_symdiff_pens = []  # List of symdiff penalty values
+        
+        # Accumulators for Global Metrics (to match validation logic)
+        epoch_dir_logits = []
+        epoch_dir_labels = []
+        epoch_risk_preds = []
+        epoch_risk_targets = []
+        
+        # NEW: Log details container
+        detailed_log_data = []
 
         # ============================================================
         # EPOCH HEADER
@@ -2641,6 +2737,34 @@ class ObserverOfflineBatchTrainer:
                 f"[BATCH {step + 1}/{steps_per_epoch}] ✅ Completed - {self.batch_size} trajectories trained in parallel",
                 flush=True,
             )
+            
+            # --- Collect Detailed Log Data ---
+            if log_file:
+                # We have step_metrics for the BATCH. To be perfectly accurate for visualization,
+                # we might want sub-step dynamics (time t=0..T_m). 
+                # But `collect_and_train_step` aggregates losses over T_m.
+                # However, it runs a loop t=0..T_m internally. 
+                # The returned `step_metrics` is averaged/aggregated.
+                # If we want T_m level dynamics, we need `collect_and_train_step` to return trace.
+                # For now, let's log the batch-level average as a simplified "step".
+                # User wants "Training Stability (Gradient Norm)" -> This IS at update step level (Batch).
+                # User wants "Loss Dynamics" -> This also varies per batch update.
+                # So Batch-level logging is correct for "Trajectory Dynamics" in terms of training steps.
+                
+                log_row = {
+                    "epoch": self._epoch,
+                    "batch": step,
+                    "global_step": global_step_offset + step,
+                    "total_loss": step_metrics["loss_total"],
+                    "pg_loss": step_metrics["loss_pg"],
+                    "risk_loss": step_metrics["loss_risk"],
+                    "dir_loss": step_metrics["loss_dir"],
+                    "grad_norm": step_metrics["grad_norm"],
+                    "skipped_update": step_metrics["skipped_update"],
+                    "risk_eta": step_metrics["mean_risk_eta"],
+                    # "c_mkt_norm": ??? (Not returned by step_metrics currently, but useful)
+                }
+                detailed_log_data.append(log_row)
 
             # Accumulate epoch-level direction stats
             if "dir_preds" in step_metrics and len(step_metrics["dir_preds"]) > 0:
@@ -2657,6 +2781,15 @@ class ObserverOfflineBatchTrainer:
                 epoch_turn_pens.append(step_metrics["batch_turn_pens"])
             if "batch_symdiff_pens" in step_metrics and len(step_metrics["batch_symdiff_pens"]) > 0:
                 epoch_symdiff_pens.append(step_metrics["batch_symdiff_pens"])
+                
+            # Collect raw data for global metrics
+            if step_metrics.get("dir_logits") is not None:
+                epoch_dir_logits.append(step_metrics["dir_logits"])
+                epoch_dir_labels.append(step_metrics["dir_targets"]) # Using existing targets (numpy)
+            
+            if step_metrics.get("risk_pred_raw") is not None:
+                epoch_risk_preds.append(step_metrics["risk_pred_raw"])
+                epoch_risk_targets.append(step_metrics["risk_target_raw"])
 
             # Save trajectory logs if enabled
             self._save_trajectory_log()
@@ -2710,6 +2843,67 @@ class ObserverOfflineBatchTrainer:
 
         epoch_metrics["epoch"] = self._epoch
         epoch_metrics["lr"] = self.observer.optimizer.param_groups[0]["lr"]
+        
+        # Accumulate reward stuff manually from step lists if available, or just take from step_metrics average if we added them there?
+        # We didn't add "reward", "net_reward" etc to step_metrics explicitly above, but we have "batch_net_rewards" list.
+        # Let's use the epoch-level lists we collected to compute these accurately for the Result object.
+        
+        # We have epoch_returns, epoch_net_rewards, etc. computed below for printing.
+        # Let's reuse them or just use the averaged values in epoch_metrics if we added them? 
+        # Actually I added "topk_mean_return" etc to epoch_metrics, which are averaged from batch metrics.
+        
+        # For 'reward', 'net_reward' scalar fields in ObserverValidationResult:
+        # These are usually epoch-averaged values.
+        
+        if epoch_returns:
+            all_rets = np.concatenate(epoch_returns)
+            all_nets = np.concatenate(epoch_net_rewards)
+            all_turn = np.concatenate(epoch_turn_pens)
+            all_sym = np.concatenate(epoch_symdiff_pens)
+            # ObserverValidationResult expects floats
+            final_reward_raw = all_rets.mean()
+            final_reward_net = all_nets.mean()
+            final_turn_pen = all_turn.mean()
+            final_sym_pen = all_sym.mean()
+        else:
+            final_reward_raw = 0.0
+            final_reward_net = 0.0
+            final_turn_pen = 0.0
+            final_sym_pen = 0.0
+            
+        # ============================================================
+        # GLOBAL METRIC COMPUTATION (Synchronized with Validation)
+        # ============================================================
+        
+        # 1. Global Direction Metrics
+        if epoch_dir_logits and epoch_dir_labels:
+            # Concatenate
+            all_logits = th.cat([t if isinstance(t, th.Tensor) else th.from_numpy(t) for t in epoch_dir_logits], dim=0)
+            all_labels = th.cat([t if isinstance(t, th.Tensor) else th.from_numpy(t) for t in epoch_dir_labels], dim=0)
+            
+            # Compute global metrics using same function as validation
+            global_dir_metrics = self.compute_direction_metrics(all_logits, all_labels)
+            
+            # Overwrite averaged metrics with global ones
+            epoch_metrics["direction_accuracy"] = global_dir_metrics["accuracy"]
+            epoch_metrics["direction_f1_bear"] = global_dir_metrics["f1_bear"]
+            epoch_metrics["direction_f1_side"] = global_dir_metrics["f1_side"]
+            epoch_metrics["direction_f1_bull"] = global_dir_metrics["f1_bull"]
+            epoch_metrics["direction_f1_macro"] = global_dir_metrics["f1_macro"]
+            
+        # 2. Global Risk Metrics
+        if epoch_risk_preds and epoch_risk_targets:
+            # Concatenate
+            all_risk_p = th.cat([t if isinstance(t, th.Tensor) else th.from_numpy(t) for t in epoch_risk_preds], dim=0)
+            all_risk_t = th.cat([t if isinstance(t, th.Tensor) else th.from_numpy(t) for t in epoch_risk_targets], dim=0)
+            
+            # Compute global metrics
+            global_risk_metrics = self.compute_risk_metrics(all_risk_p, all_risk_t)
+            
+            # Overwrite averaged metrics
+            epoch_metrics["risk_mse"] = global_risk_metrics["mse"]
+            epoch_metrics["risk_mae"] = global_risk_metrics["mae"]
+            epoch_metrics["risk_correlation"] = global_risk_metrics["correlation"]
 
         # TensorBoard logging (Epoch-level)
         if writer:
@@ -2726,6 +2920,10 @@ class ObserverOfflineBatchTrainer:
                 "Train/Epoch/Loss_Dir", epoch_metrics["loss_dir"], self._epoch
             )
             writer.add_scalar("Train/Epoch/LR", epoch_metrics["lr"], self._epoch)
+            # Add new metrics
+            writer.add_scalar("Train/Epoch/Sharpe", epoch_metrics["topk_sharpe_ratio"], self._epoch)
+            writer.add_scalar("Train/Epoch/Dir_F1", epoch_metrics["direction_f1_macro"], self._epoch)
+            writer.add_scalar("Train/Epoch/Risk_MSE", epoch_metrics["risk_mse"], self._epoch)
 
         # ============================================================
         # EPOCH SUMMARY
@@ -2806,8 +3004,63 @@ class ObserverOfflineBatchTrainer:
         )
         smart_print(f"  Learning Rate:    {epoch_metrics['lr']:.6f}")
         smart_print("=" * 100 + "\n")
+        
+        # --- Save Detailed Log Data to CSV ---
+        if log_file and detailed_log_data:
+            try:
+                import os
+                import pandas as pd
+                df_log = pd.DataFrame(detailed_log_data)
+                header = not os.path.exists(log_file)
+                df_log.to_csv(log_file, mode='a', header=header, index=False)
+                # print(f"📝 Appended {len(df_log)} rows to detailed log: {log_file}")
+            except Exception as e:
+                smart_print(f"[WARN] Failed to write detailed trajectory log: {e}")
 
-        return epoch_metrics
+        # Convert to ObserverValidationResult
+        result = ObserverValidationResult(
+            epoch=self._epoch,
+            # Loss
+            loss_total=epoch_metrics["loss_total"],
+            loss_pg=epoch_metrics["loss_pg"],
+            loss_risk=epoch_metrics["loss_risk"],
+            loss_dir=epoch_metrics["loss_dir"],
+            
+            # Selection
+            topk_sharpe_ratio=epoch_metrics["topk_sharpe_ratio"],
+            topk_mean_return=epoch_metrics["topk_mean_return"],
+            topk_volatility=epoch_metrics["topk_volatility"],
+            topk_turnover=epoch_metrics["topk_turnover"],
+            
+            # Direction
+            direction_accuracy=epoch_dir_accuracy, # Use epoch aggregated accuracy (0-100)
+            direction_f1_bear=epoch_metrics.get("direction_f1_bear", 0.0),
+            direction_f1_side=epoch_metrics.get("direction_f1_side", 0.0),
+            direction_f1_bull=epoch_metrics.get("direction_f1_bull", 0.0),
+            direction_f1_macro=epoch_metrics.get("direction_f1_macro", 0.0),
+            
+            # Risk
+            risk_mse=epoch_metrics.get("risk_mse", 0.0),
+            risk_mae=epoch_metrics.get("risk_mae", 0.0),
+            risk_correlation=epoch_metrics.get("risk_correlation", 0.0),
+            
+            # Additional Metrics
+            topk_advantage=epoch_metrics.get("topk_advantage", 0.0),
+            
+
+            
+            # Raw Components
+            # Approximate gross reward for Logging
+            reward=epoch_mean_net_reward + epoch_mean_turn_pen + epoch_mean_symdiff_pen,
+            net_reward=epoch_mean_net_reward,
+            turnover_penalty=epoch_mean_turn_pen,
+            symdiff_penalty=epoch_mean_symdiff_pen,
+            
+            # CES placeholders
+            ces_score=0.0
+        )
+
+        return result
 
     @th.no_grad()
     def compute_selection_metrics(
