@@ -99,6 +99,13 @@ class TrajectoryBatch:
     # High Vol + flat Price = Distribution warning
     signed_vpi_zscore: Optional[th.Tensor] = None
 
+    # 5. Drawdown60: (B, T_m) - Rolling Max Drawdown (Pain Index)
+    # Drawdown = (Price - Rolling_Peak_60) / Rolling_Peak_60
+    # Measures market stress and "Pain".
+    # - Low Drawdown (~0): Bull market / High confidence.
+    # - High Drawdown (<-10%): Correction / Bear market.
+    drawdown60: Optional[th.Tensor] = None
+
 
 from RL_controller.mafia_modules import MAFIAModel
 
@@ -241,9 +248,8 @@ class ObserverOfflineBatchTrainer:
         self.K = int(getattr(config, "mafia_top_k", 10))  # Top-K stocks
         self.horizon = int(
             getattr(config, "mafia_pg_reward_horizon", 5)
-        )  # h: Look-ahead horizon for rewards (default: 5 days)
-
-        # Rebalance interval
+        )  # h: Look-ahead horizon for        # Spec 3.4: Rebalance Interval T_r
+        # Fixed interval for rebalancing events (e.g. 14 days)
         self.rebalance_interval = int(
             getattr(
                 config,
@@ -251,6 +257,9 @@ class ObserverOfflineBatchTrainer:
                 getattr(config, "rebalance_interval", 14),
             )
         )
+
+        # Holding Reward Config
+        self.r_hold_alpha = float(getattr(config, "mafia_reward_alpha_hold", 0.0))  # Trend bonus
 
         # Loss weights (Spec §5 Hyperparameters)
         self.lambda_pg = float(
@@ -959,6 +968,7 @@ class ObserverOfflineBatchTrainer:
         batch_breadth_gap = []        # (B, T_m) - avg(RSI_stocks) - RSI_index
         batch_div_signal = []         # (B, T_m) - RSI vs Price divergence
         batch_signed_vpi_zscore = []  # (B, T_m) - Volume-price efficiency
+        batch_drawdown60 = []         # (B, T_m) - Rolling Drawdown 60 (New)
 
         # Risk params from config or defaults
         risk_lambda = float(getattr(self.config, "risk_eta_range", 0.3))
@@ -1179,7 +1189,10 @@ class ObserverOfflineBatchTrainer:
                     mu_fut = prices.mean().item()
                     std_fut = prices.std().item()
                     eps = 1e-6
-                    z_score = (mu_fut - p_t) / (std_fut + eps)
+                    # Stabilized Z-score: Prevent explosion when vol is near zero
+                    # Min denominator: 0.5% of price or eps
+                    denom = max(std_fut, max(p_t * 0.005, eps))
+                    z_score = (mu_fut - p_t) / denom
                     term_val = (
                         lambda_val * np.tanh(z_score)
                     )  # Note: Removing kappa per strict spec eq 1025? No, spec 5.1.2 simply says tanh(Z_fut).
@@ -1375,11 +1388,32 @@ class ObserverOfflineBatchTrainer:
                 if idx < len(vpi_zscore_full):
                     signed_vpi_zscore_traj[t] = vpi_zscore_full[idx]
 
+            # === 5. Drawdown60: Rolling Max Drawdown (Pain Index) ===
+            # Relative to 60-day rolling peak
+            dd60_traj = np.zeros(T_actual, dtype=np.float32)
+            
+            # Calculate rolling peak over past 60 days
+            rolling_peak = np.zeros(len(market_closes), dtype=np.float32)
+            for i in range(len(market_closes)):
+                start_w = max(0, i - 60 + 1)
+                rolling_peak[i] = np.max(market_closes[start_w : i + 1])
+                
+            # Drawdown = (Price - Peak) / Peak
+            drawdowns_full = (market_closes - rolling_peak) / (rolling_peak + 1e-8)
+            
+            # Fill trajectory
+            for t in range(T_actual):
+                idx = traj_offset + t
+                if idx < len(drawdowns_full):
+                    dd60_traj[t] = drawdowns_full[idx]
+
             batch_vol_std20.append(th.from_numpy(vol_std20_traj).to(self.device))
             batch_dc_event_flag.append(th.from_numpy(dc_event_flag_traj).to(self.device))
             batch_breadth_gap.append(th.from_numpy(breadth_gap_traj).to(self.device))
             batch_div_signal.append(th.from_numpy(div_signal_traj).to(self.device))
             batch_signed_vpi_zscore.append(th.from_numpy(signed_vpi_zscore_traj).to(self.device))
+            # New field
+            batch_drawdown60.append(th.from_numpy(dd60_traj).to(self.device))
 
         # Stack into batch tensors and move to device
         batch = TrajectoryBatch(
@@ -1410,8 +1444,9 @@ class ObserverOfflineBatchTrainer:
             # Wide Path Explicit Signals (Spec §3.5.1 v2.1)
             dc_event_flag=th.stack(batch_dc_event_flag, dim=0).to(self.device),  # (B, T_m)
             breadth_gap=th.stack(batch_breadth_gap, dim=0).to(self.device),  # (B, T_m)
-            div_signal=th.stack(batch_div_signal, dim=0).to(self.device),  # (B, T_m)
-            signed_vpi_zscore=th.stack(batch_signed_vpi_zscore, dim=0).to(self.device),  # (B, T_m)
+            div_signal=th.stack(batch_div_signal, dim=0).to(self.device),
+            signed_vpi_zscore=th.stack(batch_signed_vpi_zscore, dim=0).to(self.device),
+            drawdown60=th.stack(batch_drawdown60, dim=0).to(self.device),
         )
 
         return batch
@@ -1479,6 +1514,11 @@ class ObserverOfflineBatchTrainer:
             th.tensor([], dtype=th.long, device=self.device) for _ in range(B)
         ]
 
+        # Initialize 'prev_holdings' Binary Mask for Memory Injection (Spec "Memory Injection")
+        # Shape: (B, N) - 1.0 if held, 0.0 otherwise
+        N_action = self.observer.action_dim
+        prev_holdings = th.zeros(B, N_action, device=self.device)
+
         # Initialize Context Buffer for Temporal Augmentation (Spec 3.6)
         # Cold start with zeros for each batch item
         W_route = int(getattr(self.config, "router_context_window", 5))
@@ -1536,6 +1576,7 @@ class ObserverOfflineBatchTrainer:
         collected_rewards = []
         collected_baselines = []
         collected_advantages = []
+        collected_hold_rewards = []  # New: Holding scores
 
         # Loss collections (needed for backward pass later)
         pg_losses = []
@@ -1673,11 +1714,6 @@ class ObserverOfflineBatchTrainer:
                     # - Prev indices for Hold items
                     # - New selected indices for Rebalance items (Wait, we don't have them yet!)
 
-                    # Implementation constraint: The model architecture usually supports either "All Force" or "All Select"
-                    # or "Force with provided matrix".
-                    # To support "Select New" for some batch items, we conceptually need to let the model
-                    # generate logits, sample indices, AND THEN overwrite the indices for "Hold" items with prev ones.
-
                     # Correct approach for Mixed Batch:
                     # 1. Run Forward with force_topk_indices=None (Always generate fresh Top-K candidates)
                     # 2. Get `new_indices`
@@ -1686,16 +1722,25 @@ class ObserverOfflineBatchTrainer:
                     pass
 
                 # Build explicit signals for Direction Head (Spec 3.5.1 v2.1 - Wide Path)
-                # 4 signals: DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore
+                # 6 signals: Vol_Std20, DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore, Drawdown60
+                vol_std20_value = batch.vol_std20[:, t : t + 1] # (B, 1)
                 dc_flag_value = batch.dc_event_flag[:, t : t + 1]  # (B, 1) - already binary [0, 1]
                 breadth_gap_value = batch.breadth_gap[:, t : t + 1]  # (B, 1) - already normalized [-1, 1]
                 div_signal_value = batch.div_signal[:, t : t + 1]  # (B, 1) - already {-1, 0, 1}
                 vpi_zscore_value = batch.signed_vpi_zscore[:, t : t + 1]  # (B, 1) - already z-scored [-3, 3]
+                drawdown60_value = batch.drawdown60[:, t : t + 1] # (B, 1)
 
                 # Signals are already normalized during computation, concat directly
                 explicit_signals = th.cat(
-                    [dc_flag_value, breadth_gap_value, div_signal_value, vpi_zscore_value], dim=-1
-                )  # (B, 4)
+                    [
+                        vol_std20_value,
+                        dc_flag_value,
+                        breadth_gap_value,
+                        div_signal_value,
+                        vpi_zscore_value,
+                        drawdown60_value,
+                    ], dim=-1
+                )  # (B, 6)
 
                 # Pass buffer to model (Spec 3.6)
                 outputs = self.observer.mafia_model(
@@ -1704,6 +1749,7 @@ class ObserverOfflineBatchTrainer:
                     force_topk_indices=None,  # Always fresh selection first
                     router_context_buffer=batch_context_buffer,  # Batched buffer for temporal augmentation
                     explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
+                    prev_holdings=prev_holdings,  # Memory Injection: Bias current logits with last holdings
                 )
 
                 (
@@ -1828,6 +1874,8 @@ class ObserverOfflineBatchTrainer:
                     topk_indices = final_indices
                     topk_scores = final_scores
 
+
+
             # Store in transient buffer
             risk_eta = th.nan_to_num(risk_eta, nan=1.0, posinf=1.0, neginf=1.0)
             collected_topk_scores.append(topk_scores)
@@ -1908,6 +1956,33 @@ class ObserverOfflineBatchTrainer:
                     s_val = (2 * (self.K - held_count)) / self.K
                     symdiff[b_i] = s_val
 
+            # Trend Holding Reward (R_hold)
+            # Bonus for holding profitable stocks (Trend Following)
+            # FIX: Must intersect prev_holdings with CURRENT holdings (mask_k indicates whether we kept indices)
+            # Actually, `topk_indices` represents the ACTUAL portfolio for step T (after logic).
+            # So we just need to check if `topk_indices` overlaps with `prev_holdings`.
+            
+            r_hold = th.zeros(B, device=self.device)
+            if self.r_hold_alpha > 0 and h_len > 0:
+                next_day_ret = future_returns_slice[:, 0, :]  # (B, N)
+                # Alpha Hold Bonus: Require return > 0 AND return > market_return
+                market_ret_b = market_returns_slice[:, 0] # (B,)
+                prof_mask = ((next_day_ret > 0) & (next_day_ret > market_ret_b.unsqueeze(1))).float()
+                
+                # Construct Binary Mask of Current Portfolio
+                curr_holdings = th.zeros(B, N_action, device=self.device)
+                curr_holdings.scatter_(1, topk_indices, 1.0)
+                
+                # Intersection: Held Yesterday AND Held Today AND Profitable
+                # rewarding "Gồng Lời" (Holding Winners)
+                gong_loi_mask = prev_holdings * curr_holdings * prof_mask
+                
+                hold_prof_count = gong_loi_mask.sum(dim=1)  # (B,)
+                # Normalize
+                r_hold = self.r_hold_alpha * (hold_prof_count / self.K)
+
+            # Penalties
+
             # Advantage (Spec §5.1.1)
             # A_raw = (R_t - λ_epoch × Penalties) - b_t
             # λ_epoch: Curriculum penalty weight (0 in warmup, ramps to 1)
@@ -1917,7 +1992,10 @@ class ObserverOfflineBatchTrainer:
             penalty = lambda_epoch * (
                 self.alpha_turnover * turnover + self.alpha_change * symdiff
             )
-            R_net = R_raw - penalty
+            # R_net = R_raw + R_hold - penalty
+            # Note: R_hold is added to R_net but usually penalties are subtracted.
+            # R_hold is a positive incentive.
+            R_net = R_raw + r_hold - penalty
             A_t_raw = R_net - baseline
 
             # Normalize Advantage (Batch statistics)
@@ -1934,6 +2012,7 @@ class ObserverOfflineBatchTrainer:
             collected_turnovers.append(turnover)
             collected_symdiffs.append(symdiff)
             collected_rewards.append(R_net)
+            collected_hold_rewards.append(r_hold)
             collected_baselines.append(baseline)
             collected_advantages.append(A_t)
 
@@ -2115,9 +2194,17 @@ class ObserverOfflineBatchTrainer:
             cost_str = f"TurnPen={turn_pen:.4f} | SymDiffPen={diff_pen:.4f}"
 
             # 3. Net & Advantage
-            # R_net = Raw - Costs
             r_net_val = R_net[b].item()
             net_str = f"NetReward={r_net_val:+.4f}"
+            
+            # Hold Bonus Logging
+            hold_val = r_hold[b].item()
+            # Check if this step is masked (not rebalancing)
+            is_rebal_b = effective_mask[b].item() > 0.5
+            mask_suffix = "" if is_rebal_b else " (Masked)"
+            
+            # Always display HoldBonus, even if 0.0, to keep log format consistent
+            hold_str = f"HoldBonus={hold_val:+.4f}{mask_suffix}"
 
             adv_str = (
                 f"Baseline={baseline[b].item():+.4f} | "
@@ -2126,7 +2213,7 @@ class ObserverOfflineBatchTrainer:
 
             smart_print(f"     📈 Market:    {raw_str} | CtxDiff={c_mkt_diff:.3f}")
             smart_print(f"     💸 Costs:     {cost_str}")
-            smart_print(f"     ⚖️  Outcome:   {net_str} | {adv_str}")
+            smart_print(f"     ⚖️  Outcome:   {net_str} | {adv_str} | {hold_str}")
             smart_print(
                 f"     📉 Losses:    L_PG={pg_val:.4f} | "
                 f"L_risk(B)={risk_loss.item():.4f} | L_risk(S)={risk_loss_sample.item():.4f} | "
@@ -2279,6 +2366,11 @@ class ObserverOfflineBatchTrainer:
 
             # Update previous indices for next timestep turnover calculation
             prev_indices = topk_indices
+
+            # --- Update Memory Injection State (prev_holdings) for NEXT step ---
+            # This must reflect the ACTUAL portfolio held after this step (whether rebalanced or held)
+            prev_holdings = th.zeros(B, N_action, device=self.device)
+            prev_holdings.scatter_(1, topk_indices, 1.0)
 
             # Store for CSV export
             if not hasattr(self, "_trajectory_log"):
@@ -2435,6 +2527,7 @@ class ObserverOfflineBatchTrainer:
             all_raw_advantages = all_rewards - all_baselines  # (B, T_m)
             all_turnovers = th.stack(collected_turnovers, dim=1)  # (B, T_m)
             all_symdiffs = th.stack(collected_symdiffs, dim=1)  # (B, T_m)
+            all_hold_rewards = th.stack(collected_hold_rewards, dim=1) if collected_hold_rewards else None
 
             # Mean across time for each trajectory
             batch_returns = all_returns.mean(dim=1).cpu().numpy()  # (B,)
@@ -2448,19 +2541,21 @@ class ObserverOfflineBatchTrainer:
             batch_net_rewards = np.array([])
             batch_turn_pens = np.array([])
             batch_symdiff_pens = np.array([])
+            all_hold_rewards = None
+            all_returns = None
+            all_turnovers = None
+            all_raw_advantages = None
 
         # Compute Selection Metrics (Sharpe, Turnover, etc.) for this batch
         # We need (B, T_m, K) indices.
-        if collected_topk_indices:
-            batch_topk_indices = th.stack(collected_topk_indices, dim=1)  # (B, T_m, K)
-            # Scores (optional, just stacking for completeness if needed later)
-            batch_topk_scores = th.stack(collected_topk_scores, dim=1) if collected_topk_scores else None
+        if collected_topk_indices and all_returns is not None:
+            # batch_topk_indices = th.stack(collected_topk_indices, dim=1)  # Unused for current metric calc
             
             selection_metrics = self.compute_selection_metrics(
-                topk_indices=batch_topk_indices,
-                topk_scores=batch_topk_scores,
-                price_returns=batch.price_returns,
-                market_returns=batch.market_returns
+                returns=all_returns,
+                turnover=all_turnovers,
+                advantages=all_raw_advantages,
+                hold_rewards=all_hold_rewards
             )
         else:
             selection_metrics = {
@@ -2544,6 +2639,7 @@ class ObserverOfflineBatchTrainer:
             "topk_volatility": selection_metrics["volatility"],
             "topk_turnover": selection_metrics["turnover"],
             "topk_advantage": selection_metrics["topk_advantage"],
+            "topk_hold_reward": selection_metrics["topk_hold_reward"],
             
             # Detailed Direction Metrics
             "direction_accuracy": direction_metrics["accuracy"],
@@ -2560,7 +2656,12 @@ class ObserverOfflineBatchTrainer:
             # Raw data for global epoch aggregation
             "dir_logits": batch_dir_logits.detach().cpu() if collected_direction_logits else None,
             "risk_pred_raw": batch_risk_pred.detach().cpu() if collected_risk_eta else None,
+            "risk_pred_raw": batch_risk_pred.detach().cpu() if collected_risk_eta else None,
             "risk_target_raw": batch_risk_target.detach().cpu() if collected_risk_eta else None,
+            
+            # Learnable Bias Param (Spec 5.3)
+            "mafia_holding_bias": self.observer.mafia_model.signal_generator.holding_bias.item() 
+            if hasattr(self.observer.mafia_model.signal_generator, "holding_bias") else 0.0
         }
 
         # Clear memory
@@ -2651,6 +2752,7 @@ class ObserverOfflineBatchTrainer:
             "topk_volatility": 0.0,
             "topk_turnover": 0.0,
             "topk_advantage": 0.0,
+            "topk_hold_reward": 0.0,
             
             # Direction Metrics
             "direction_accuracy": 0.0,
@@ -2842,7 +2944,7 @@ class ObserverOfflineBatchTrainer:
             epoch_metrics[k] /= steps_per_epoch
 
         epoch_metrics["epoch"] = self._epoch
-        epoch_metrics["lr"] = self.observer.optimizer.param_groups[0]["lr"]
+        epoch_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
         
         # Accumulate reward stuff manually from step lists if available, or just take from step_metrics average if we added them there?
         # We didn't add "reward", "net_reward" etc to step_metrics explicitly above, but we have "batch_net_rewards" list.
@@ -3046,6 +3148,7 @@ class ObserverOfflineBatchTrainer:
             
             # Additional Metrics
             topk_advantage=epoch_metrics.get("topk_advantage", 0.0),
+            topk_hold_reward=epoch_metrics.get("topk_hold_reward", 0.0),
             
 
             
@@ -3065,141 +3168,48 @@ class ObserverOfflineBatchTrainer:
     @th.no_grad()
     def compute_selection_metrics(
         self,
-        topk_indices: th.Tensor,  # (B, T_m, K)
-        topk_scores: th.Tensor,  # (B, T_m, K) - kept for possible weighted portfolio
-        price_returns: th.Tensor,  # (B, T_m, N)
-        market_returns: Optional[th.Tensor] = None,  # (B, T_m)
+        returns: th.Tensor,
+        turnover: th.Tensor,
+        advantages: th.Tensor = None,
+        hold_rewards: th.Tensor = None,
     ) -> Dict[str, float]:
         """
-        Compute Top-K portfolio selection performance metrics (TD3-Aligned).
+        Compute financial metrics for the selected portfolios.
 
         Args:
-            topk_indices: Selected Top-K stock indices for each timestep
-            topk_scores: Softmax scores for Top-K stocks (unused)
-            price_returns: Returns for all N stocks
-            market_returns: (Optional) Market index returns for advantage calculation
+            returns: (B, T) tensor of portfolio returns
+            turnover: (B, T) tensor of turnover
+            advantages: (B, T) tensor of advantage values (optional)
+            hold_rewards: (B, T) tensor of hold duration/profit bonuses (optional)
 
         Returns:
-            Dict with:
-                - sharpe_ratio: Sharpe Ratio (Annualized, Excess Return)
-                - mean_return: Annualized Return (CAGR)
-                - volatility: Annualized Volatility
-                - turnover: Average turnover rate
-                - topk_advantage: Annualized Advantage (Top-K Return - Market Return)
+            Dictionary of metrics
         """
-        B, T_m, K = topk_indices.shape
-        N = price_returns.shape[2]
+        metrics = {}
+        # Annualization factor: 252 trading days per year
+        # Fix: returns are NOT daily, they are cumulative over `pg_reward_horizon` (e.g. 14 days)
+        # So we must scale by sqrt(252 / horizon) instead of sqrt(252)
+        horizon = getattr(self, "pg_reward_horizon", 14)  # Default to 14 if not found
+        annual_factor = 252.0 / max(horizon, 1)
 
-        # Convert to numpy for easier computation
-        topk_indices_np = topk_indices.cpu().numpy()  # (B, T_m, K)
-        returns_np = price_returns[:, :T_m, :].cpu().numpy()  # (B, T_m, N)
-        
-        if market_returns is not None:
-            market_returns_np = market_returns[:, :T_m].cpu().numpy() # (B, T_m)
+        mean_return = returns.mean().item()
+        std_return = returns.std().item()
+
+        # Sharpe Ratio (Ann.) = Mean / Std * sqrt(252/h)
+        if std_return > 1e-6:
+            # Note: This is simplified Sharpe (assuming Rf=0)
+            sharpe = (mean_return / std_return) * (annual_factor**0.5)
         else:
-            market_returns_np = None
+            sharpe = 0.0
 
-        # Config parameters
-        tradeDays_per_year = getattr(self.config, "tradeDays_per_year", 252)
-        market_name = getattr(self.config, "market_name", "vnindex")
-        mkt_rf_map = getattr(self.config, "mkt_rf", {})
-        # Rf is usually stored as percentage (e.g. 6.0 for 6%) in config
-        rf_rate_percent = mkt_rf_map.get(market_name, 0.0)
-        rf_rate_decimal = rf_rate_percent / 100.0
-
-        # Store metrics per trajectory
-        traj_sharpes = []
-        traj_annual_returns = []
-        traj_volatilities = []
-        traj_turnovers = []
-        traj_advantages = []
-
-        for b in range(B):
-            # 1. Collect Daily Returns & Turnover
-            daily_returns = []
-            daily_market_returns = []
-            turnover_sum = 0.0
-            prev_set = None
-
-            for t in range(T_m):
-                selected_idx = topk_indices_np[b, t]  # (K,)
-                selected_ret = returns_np[b, t, selected_idx]  # (K,)
-
-                # Portfolio return (Equal Weighted)
-                port_ret = selected_ret.mean()
-                daily_returns.append(port_ret)
-                
-                if market_returns_np is not None:
-                    daily_market_returns.append(market_returns_np[b, t])
-
-                # Turnover
-                current_set = set(selected_idx)
-                if prev_set is not None:
-                    # Turnover = 1 - (Intersection / K)
-                    unchanged = len(current_set.intersection(prev_set))
-                    turnover = 1.0 - (unchanged / K)
-                    turnover_sum += turnover
-                prev_set = current_set
-
-            # 2. Compute Metrics for this Trajectory (Episode of length T_m)
-            daily_returns = np.array(daily_returns)
-            days = len(daily_returns)
-            if days < 2:
-                continue
-
-            # A. Net Profit (Cumulative)
-            # prod(1+r) - 1
-            net_profit_pct = np.prod(1 + daily_returns) - 1
-
-            # B. Annualized Return (CAGR)
-            # (1 + netProfit)^(252/D) - 1
-            annual_return_pct = (
-                np.power((1 + net_profit_pct), (tradeDays_per_year / days)) - 1
-            )
-
-            # C. Annualized Volatility
-            # std(daily) * sqrt(252)
-            # Use ddof=1 for sample standard deviation
-            std_daily = np.std(daily_returns, ddof=1)
-            volatility_annual = std_daily * np.sqrt(tradeDays_per_year)
-
-            # Avoid div/0
-            if volatility_annual < 1e-6:
-                volatility_annual = 1e-6
-
-            # D. Sharpe Ratio
-            # (AnnualReturn - Rf) / Volatility
-            # All in decimals. (TD3 converts to percent for num/denom, result is same)
-            sharpe_ratio = (annual_return_pct - rf_rate_decimal) / volatility_annual
-            
-            # E. Advantage (Annualized) 
-            # Approx: AnnualReturns - AnnualMarketReturns
-            advantage = 0.0
-            if market_returns_np is not None and len(daily_market_returns) > 0:
-                mkt_returns_arr = np.array(daily_market_returns)
-                mkt_net_profit = np.prod(1 + mkt_returns_arr) - 1
-                mkt_annual_return = (
-                    np.power((1 + mkt_net_profit), (tradeDays_per_year / days)) - 1
-                )
-                advantage = annual_return_pct - mkt_annual_return
-
-            # Turnover Avg
-            avg_turnover = turnover_sum / (days - 1) if days > 1 else 0.0
-
-            traj_sharpes.append(sharpe_ratio)
-            traj_annual_returns.append(annual_return_pct)
-            traj_volatilities.append(volatility_annual)
-            traj_turnovers.append(avg_turnover)
-            traj_advantages.append(advantage)
-
-        # Average across batch
-        metrics = {
-            "sharpe_ratio": np.mean(traj_sharpes) if traj_sharpes else 0.0,
-            "mean_return": np.mean(traj_annual_returns) if traj_annual_returns else 0.0,
-            "volatility": np.mean(traj_volatilities) if traj_volatilities else 0.0,
-            "turnover": np.mean(traj_turnovers) if traj_turnovers else 0.0,
-            "topk_advantage": np.mean(traj_advantages) if traj_advantages else 0.0,
-        }
+        # Review confirmed: Turnover, Advantage, HoldReward, Direction, Risk are OK.
+        # Fix: Annualize Return and Volatility for consistency with Sharpe Ratio
+        metrics["mean_return"] = mean_return * annual_factor
+        metrics["volatility"] = std_return * (annual_factor**0.5)
+        metrics["sharpe_ratio"] = sharpe
+        metrics["turnover"] = turnover.mean().item()
+        metrics["topk_advantage"] = advantages.mean().item() if advantages is not None else 0.0
+        metrics["topk_hold_reward"] = hold_rewards.mean().item() if hold_rewards is not None else 0.0
 
         return metrics
 
@@ -3350,6 +3360,11 @@ class ObserverOfflineBatchTrainer:
         total_symdiff_penalty = 0.0
 
         # Accumulators for metric computation
+        # Tensors for metric computation (for compute_selection_metrics)
+        all_return_tensors = []
+        all_turnover_tensors = []
+        all_advantage_tensors = []
+
         all_topk_indices = []
         all_topk_scores = []
         all_price_returns = []
@@ -3467,16 +3482,25 @@ class ObserverOfflineBatchTrainer:
                     pre_trigger = vol_trigger | sched_trigger | dc_trigger
 
                     # Build explicit signals for Direction Head (Spec 3.5.1 v2.1 - Wide Path)
-                    # 4 signals: DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore
+                    # 6 signals: Vol_Std20, DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore, Drawdown60
+                    vol_std20_value = batch.vol_std20[:, t : t + 1] # (B, 1)
                     dc_flag_value = batch.dc_event_flag[:, t : t + 1]  # (B, 1) - already binary [0, 1]
                     breadth_gap_value = batch.breadth_gap[:, t : t + 1]  # (B, 1) - already normalized [-1, 1]
                     div_signal_value = batch.div_signal[:, t : t + 1]  # (B, 1) - already {-1, 0, 1}
                     vpi_zscore_value = batch.signed_vpi_zscore[:, t : t + 1]  # (B, 1) - already z-scored [-3, 3]
+                    drawdown60_value = batch.drawdown60[:, t : t + 1] # (B, 1)
 
                     # Signals are already normalized during computation, concat directly
                     explicit_signals = th.cat(
-                        [dc_flag_value, breadth_gap_value, div_signal_value, vpi_zscore_value], dim=-1
-                    )  # (B, 4)
+                        [
+                            vol_std20_value,
+                            dc_flag_value,
+                            breadth_gap_value,
+                            div_signal_value,
+                            vpi_zscore_value,
+                            drawdown60_value,
+                        ], dim=-1
+                    )  # (B, 6)
 
                     outputs = self.observer.mafia_model(
                         ochlv_data=ochlv_batch,
@@ -3644,6 +3668,11 @@ class ObserverOfflineBatchTrainer:
                     curr_batch_turnover.append((turnover * lambda_epoch * self.alpha_turnover).mean().item())
                     curr_batch_symdiff.append((symdiff * lambda_epoch * self.alpha_change).mean().item())
 
+                    # Collect tensors for compute_selection_metrics
+                    all_return_tensors.append(R_raw)
+                    all_turnover_tensors.append(turnover)
+                    all_advantage_tensors.append(A_t_raw)
+
                     # Collect outputs
                     collected_topk_scores.append(final_scores)
                     collected_topk_indices.append(final_indices)
@@ -3723,12 +3752,18 @@ class ObserverOfflineBatchTrainer:
         all_direction_logits_cat = th.cat(all_direction_logits, dim=0)
         all_direction_labels_cat = th.cat(all_direction_labels, dim=0)
 
+        all_direction_labels_cat = th.cat(all_direction_labels, dim=0)
+
+        # Consolidate standard metric tensors
+        all_returns_cat = th.cat(all_return_tensors, dim=0) if all_return_tensors else th.tensor([], device=self.device)
+        all_turnovers_cat = th.cat(all_turnover_tensors, dim=0) if all_turnover_tensors else th.tensor([], device=self.device)
+        all_advantages_cat = th.cat(all_advantage_tensors, dim=0) if all_advantage_tensors else th.tensor([], device=self.device)
+
         # Compute metrics
         selection_metrics = self.compute_selection_metrics(
-            all_topk_indices_cat,
-            all_topk_scores_cat,
-            all_price_returns_cat,
-            all_market_returns_cat, # Pass market returns
+            returns=all_returns_cat,
+            turnover=all_turnovers_cat,
+            advantages=all_advantages_cat,
         )
 
         direction_metrics = self.compute_direction_metrics(

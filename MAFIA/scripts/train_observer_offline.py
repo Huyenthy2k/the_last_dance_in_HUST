@@ -385,7 +385,8 @@ def train_observer_offline_iteration(
                 # For now, let's allow fail->start 0 coupled with warning, 
                 # BUT if we start at 0, we should probably backup existing metric file?
                 # If we fail to resume but have data, we might overwrite it.
-                if os.path.exists(valid_csv_path):
+                valid_csv_path_check = os.path.join(iter_output_dir, "valid_metrics.csv")
+                if os.path.exists(valid_csv_path_check):
                      smart_print("[CRITICAL] Checkpoint load failed but valid_metrics.csv exists.")
                      smart_print("[CRITICAL] Starting from Epoch 0 would overwrite it. Aborting for safety.")
                      raise e
@@ -714,7 +715,8 @@ def run_offline_observer_training(
             smart_print(f"  Output: {output_dir}/trajectory_details.csv\n")
 
     # Initialize TensorBoard Writer
-    log_dir = os.path.join(output_dir, "tb_logs")
+    log_dir = os.path.abspath(os.path.join(output_dir, "tb_logs"))
+    os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     global_step_counter = 0
 

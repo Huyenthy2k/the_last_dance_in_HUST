@@ -920,12 +920,14 @@ class DirectionHead(nn.Module):
         self.num_classes = 3
         self.dropout_rate = getattr(config, "direction_head_dropout", 0.2)
 
-        # Explicit signals (Spec §3.5.1 v2.1): 4 dims (Wide Path)
+        # Explicit signals (Spec §3.5.1 v2.1): 6 dims (Wide Path)
         # 1. DC_Event_Flag: Structural break signal from Market-DC Agent
         # 2. Breadth_Gap: avg(RSI_stocks) - RSI_index ("Xanh vỏ đỏ lòng" detection)
         # 3. Div_Signal: RSI slope vs Price slope divergence (reversal signal)
         # 4. Signed_VPI_Zscore: Volume-price efficiency (money flow)
-        self.explicit_dim = 4
+        # 5. Vol_Std20: Rolling volatility (Risk)
+        # 6. Drawdown60: Rolling drawdown (Pain)
+        self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
 
         # Deep Path: Input Projection for LATENT only (2D → D)
         self.latent_dim = self.D * 2  # C_mkt(D) + Delta_C(D)
@@ -964,7 +966,14 @@ class DirectionHead(nn.Module):
     def _init_explicit_signal_weights(self):
         """
         Smart-initialize Wide Path weights to respect signal logic.
-        Signals: 0:DC, 1:Breadth, 2:Div, 3:VPI
+        SIGNAL ORDER (Input Tensor):
+        0: Vol_Std20
+        1: DC_Event_Flag
+        2: Breadth_Gap
+        3: Div_Signal
+        4: Signed_VPI_Zscore
+        5: Drawdown60
+
         Convention: -1 (Bearish), +1 (Bullish)
 
         Weight logic:
@@ -972,30 +981,69 @@ class DirectionHead(nn.Module):
         - Bull Class (2): Positive weight (so +1 input -> + logit)
         """
         with th.no_grad():
-            # Indices in the concatenated input (Deep=0..D-1, Wide=D..D+3)
-            # Weights shape: (3, D+4)
+            # Indices in the concatenated input (Deep=0..D-1, Wide=D..D+5)
 
-            # 1. DC Event Flag (Index D+0) - Strongest Signal
-            # Val: -1 (Bear), 1 (Bull)
-            self.classifier.weight[0, self.D + 0] = -1.0  # Bear class favors negative input
-            self.classifier.weight[2, self.D + 0] = 1.0  # Bull class favors positive input
+            # 0. Vol_Std20 (Index D+0) - Risk/Fear
+            # High Vol -> Bearish Bias
+            self.classifier.weight[0, self.D + 0] = 0.2   # High Vol increases Bear prob
+            self.classifier.weight[2, self.D + 0] = -0.2  # High Vol decreases Bull prob
 
-            # 2. Divergence Signal (Index D+2) - Reversal
+            # 1. DC Event Flag (Index D+1) - Strongest Signal (Trend Break)
+            # Val: 0 (No Event), 1 (Event) -> Wait, DC flag is binary 1.0.
+            # But is it directional?
+            # Trainer: `dc_flag_full` is 1.0 if Upward OR Downward break.
+            # It's an "Alert" signal, not strictly directional on its own?
+            # Let's check Trainer logic: dc_flag is just `1.0` if threshold broken.
+            # MAFIA Spec implication: DC Agents handle directionality internally.
+            # But here `explicit_signals` is just the flag.
+            # If so, DC Flag = 1.0 implies "Big Move Imminent/Happening".
+            # Usually implies Higher Volatility/Risk, fits "Vol" logic.
+            # But DirectionHead needs Direction.
+            # If the flag is non-directional, we shouldn't bias Direction with it heavily?
+            # Or does DC Agent output handle the direction?
+            # Reviewer Note: DC Flag in Wide Path might be less useful for Direction if it lacks sign.
+            # However, let's keep it neutral or slightly emphasis on 'Side' (volatility)?
+            # Actually, let's leave DC Flag weight small/zero if direction is ambiguous.
+            # Update: Re-reading Trainer: `dc_flag_full[i] = 1.0` regardless of Up/Down mode.
+            # So it's non-directional.
+            # Smart Init: Keep it 0.0 for Direction Head (let model learn if it correlates with Bear/Bull).
+            self.classifier.weight[:, self.D + 1] = 0.0
+
+            # 2. Breadth_Gap (Index D+2) - "Xanh vỏ đỏ lòng"
+            # High Positive (Stocks > Index) -> Healthy Bull?
+            # High Negative (Stocks < Index) -> Weakness/Distribution (Bearish)
+            # Range: [-1, 1]
+            self.classifier.weight[0, self.D + 2] = -0.3 # Neg Gap -> Bear
+            self.classifier.weight[2, self.D + 2] = 0.3  # Pos Gap -> Bull
+
+            # 3. Div_Signal (Index D+3) - Reversal
             # Val: -1 (Bear reversal), 1 (Bull reversal)
-            self.classifier.weight[0, self.D + 2] = -0.5
-            self.classifier.weight[2, self.D + 2] = 0.5
+            self.classifier.weight[0, self.D + 3] = -0.5
+            self.classifier.weight[2, self.D + 3] = 0.5
 
-            # 3. Breadth & VPI (Indices D+1, D+3) - Weaker correlation
-            # Breadth: High/Pos -> Bull, Low/Neg -> Bear
-            self.classifier.weight[0, self.D + 1] = -0.3
-            self.classifier.weight[2, self.D + 1] = 0.3
-            # VPI: Pos -> Bull efficient, Neg -> Bear efficient
-            self.classifier.weight[0, self.D + 3] = -0.3
-            self.classifier.weight[2, self.D + 3] = 0.3
+            # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
+            # Pos -> Bull efficient, Neg -> Bear efficient
+            self.classifier.weight[0, self.D + 4] = -0.3
+            self.classifier.weight[2, self.D + 4] = 0.3
+
+            # 5. Drawdown60 (Index D+5) - Mean Reversion Logic
+            # High Drawdown (Positive value? Trainer: (Price-Peak)/Peak -> Negative value!)
+            # Trainer: drawdowns_full = (market_closes - rolling_peak) / rolling_peak
+            # So range is [-0.5, 0.0]. It is NEGATIVE.
+            # "High Drawdown" means closer to -0.5 (More Negative).
+            # "Low Drawdown" means closer to 0.0.
+            # Logic:
+            # - Very Negative (Deep DD) -> Oversold -> Potential Bull Rebound?
+            # -  OR Deep Bear Trend.
+            # Let's assume Mean Reversion: More Negative -> Bullish Rebound.
+            # Input is Negative (e.g. -0.2).
+            # We want: -0.2 * Weight = Positive Logit for Bull.
+            # So Weight should be NEGATIVE. (-0.2 * -1.0 = +0.2)
+            self.classifier.weight[0, self.D + 5] = 0.2   # DD neg -> Bear Logit decreases (Oversold -> Less likely to continue crash?)
+            self.classifier.weight[2, self.D + 5] = -0.2  # DD neg -> Bull Logit increases (Oversold -> Bounce)
 
             # Ensure Side Class (1) remains neutral to these signals initially
-            # It relies more on the Deep Path (latent context)
-            self.classifier.weight[1, self.D : self.D + 4] = 0.0
+            self.classifier.weight[1, self.D : self.D + self.explicit_dim] = 0.0
 
     def forward(
         self,
@@ -1038,6 +1086,56 @@ class DirectionHead(nn.Module):
         return logits
 
 
+class RiskHead(nn.Module):
+    """
+    Wide & Deep Risk Head (Spec v2.1)
+
+    Architecture:
+    - Deep Path: [C_mkt_macro, Delta_C_mkt] -> MLP -> h_deep
+    - Wide Path: Explicit Signals (6 dims) -> Concat -> Output
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.D = config.mafia_D
+        self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
+
+        # Deep Path
+        self.input_dim = self.D * 2  # C_mkt + Delta_C
+        self.deep_net = nn.Sequential(
+            nn.Linear(self.input_dim, self.D),
+            nn.LayerNorm(self.D),
+            nn.GELU(),
+            nn.Linear(self.D, self.D),
+            nn.GELU(),
+        )
+
+        # Late Fusion
+        self.fusion_net = nn.Linear(self.D + self.explicit_dim, 1)
+
+    def forward(
+        self,
+        c_mkt_macro: th.Tensor,
+        delta_c_mkt: th.Tensor,
+        explicit_signals: th.Tensor,
+    ) -> th.Tensor:
+        """
+        Args:
+            c_mkt_macro: (B, D) - Macro-adapted context
+            delta_c_mkt: (B, D) - Momentum
+            explicit_signals: (B, 6) - [Vol20, DC, Breadth, Div, VPI, DD60]
+        """
+        # Deep Path
+        x_deep = th.cat([c_mkt_macro, delta_c_mkt], dim=-1)
+        h_deep = self.deep_net(x_deep)
+
+        # Wide Path & Fusion
+        h_final = th.cat([h_deep, explicit_signals], dim=-1)
+        eta_raw = self.fusion_net(h_final)
+
+        return eta_raw.squeeze(-1)
+
+
 class DenseMoESignalGenerator(nn.Module):
     """
     Dense Mixture of Experts Signal Generator.
@@ -1068,14 +1166,9 @@ class DenseMoESignalGenerator(nn.Module):
             th.tensor(self.tau_gumbel), requires_grad=False
         )
 
-        # Boundary risk network (from market context + weighted Top-K portfolio context)
-        # Outputs a raw scalar that will be mapped to eta via tanh and clamped in forward()
-        self.risk_network = nn.Sequential(
-            nn.Linear(self.D * 2, self.D),
-            nn.LayerNorm(self.D),
-            nn.GELU(),
-            nn.Linear(self.D, 1),
-        )
+        # Boundary risk network (Refactored to RiskHead v2.1)
+        # Uses Market Context + Explicit Signals (Wide & Deep)
+        self.risk_head = RiskHead(config)
 
         # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
         # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
@@ -1083,6 +1176,11 @@ class DenseMoESignalGenerator(nn.Module):
 
         # Macro Adapter: Projects raw context for Direction/Risk (Macro Task)
         self.macro_adapter = nn.Linear(self.D, self.D)
+
+        # Holding Bias (Learnable Inertia) - Spec "Memory Injection"
+        # Bias added to logits of currently held stocks to encourage retention
+        # Initialize to 0.0 (neutral), let model learn positive value if beneficial
+        self.holding_bias = nn.Parameter(th.zeros(1))
 
     def reset_router_state(self):
         """Reset stateful components inside the gating router (LSTM hidden/cache)."""
@@ -1115,6 +1213,9 @@ class DenseMoESignalGenerator(nn.Module):
         explicit_signals: Optional[
             th.Tensor
         ] = None,  # (batch, 2) [vol_shock_flag, dc_event_flag] for Direction Head (Spec 3.5)
+        prev_holdings: Optional[
+            th.Tensor
+        ] = None,  # (batch, N) Binary mask of stocks held at t-1 (Memory Injection)
     ) -> Tuple[
         th.Tensor,
         th.Tensor,
@@ -1180,6 +1281,16 @@ class DenseMoESignalGenerator(nn.Module):
         market_logits = th.sum(
             gate_weights_expanded * expert_logits_stacked, dim=1
         )  # (batch, N)
+
+        # Apply Holding Bias (Memory Injection)
+        # Logit_new = Logit_old + (Bias * Is_Held)
+        if prev_holdings is not None:
+            # Ensure shape match
+            if prev_holdings.shape != market_logits.shape:
+               raise ValueError(f"prev_holdings shape {prev_holdings.shape} mismatch with logits {market_logits.shape}")
+            
+            # Add bias (broadcast scalar * tensor)
+            market_logits = market_logits + (self.holding_bias * prev_holdings)
 
         # Optional: fuse per-stock ST embeddings from experts using gate weights
         fused_stock_embedding = None
@@ -1281,22 +1392,11 @@ class DenseMoESignalGenerator(nn.Module):
             topk_embeddings = th.gather(fused_stock_embedding, 1, topk_indices_exp)
         topk_scores = th.gather(market_vector, 1, topk_indices)  # (batch, K)
 
-        # Compute risk from market + portfolio context
-        # GRADIENT FIREWALL: Detach portfolio_context to prevent L_Risk from
-        # backpropagating to Stock Experts (Selection Stream).
-        risk_input = th.cat(
-            [context_macro, portfolio_context.detach()], dim=-1
-        )  # (batch, 2D)
-        eta_raw = self.risk_network(risk_input).squeeze(-1)  # (batch,)
-        eta_base = getattr(self.config, "mafia_eta_base", 1.0)
-        eta_amp = getattr(self.config, "mafia_eta_amplitude", 0.3)
-        eta_min = getattr(self.config, "mafia_eta_min", eta_base - eta_amp)
-        eta_max = getattr(self.config, "mafia_eta_max", eta_base + eta_amp)
-        eta = eta_base + eta_amp * th.tanh(eta_raw)
-        eta = th.clamp(eta, min=eta_min, max=eta_max)
+        # === Risk Head (Wide & Deep v2.1) ===
+        # 1. Apply Macro Adapter to raw_context -> Separation of Concerns
+        context_macro = self.macro_adapter(raw_context)  # (batch, D)
 
-        # === Direction Head with Augmented Input (Spec 3.5) ===
-        # Compute Delta_C_mkt (Momentum/Velocity) from context buffer
+        # 2. Compute Delta_C_mkt (Momentum/Velocity) using macro context
         delta_c_mkt = th.zeros_like(context_macro)  # Default: zeros (cold start)
 
         if router_context_buffer is not None:
@@ -1307,18 +1407,24 @@ class DenseMoESignalGenerator(nn.Module):
             else:  # (batch, W, D)
                 c_oldest_raw = router_context_buffer[:, 0, :]  # (B, D)
             
-            # Compute Raw Delta and Project via Macro Adapter
-            delta_raw = raw_context - c_oldest_raw
-            delta_c_mkt = self.macro_adapter(delta_raw)
+            # Project oldest raw -> oldest macro
+            c_oldest_macro = self.macro_adapter(c_oldest_raw)
+            delta_c_mkt = context_macro - c_oldest_macro  # Macro momentum
 
-        # Require explicit signals - Spec §3.5.1 Updated (5 signals)
-        # These signals provide critical market regime information to Direction Head
+        # Require explicit signals - Spec §3.5.1 Updated (6 signals)
         if explicit_signals is None:
-            raise ValueError(
-                "explicit_signals is required for Direction Head (Spec §3.5.1). "
-                "Must provide [Vol_Std20, DC_Event, KER_10, RSI_Grad, Breadth_Mom] "
-                "as (batch, 5) tensor. Caller must compute and normalize these values."
-            )
+            raise ValueError("explicit_signals is required for Risk/Direction Head.")
+
+        # 3. Risk Prediction
+        eta_raw = self.risk_head(
+            context_macro, delta_c_mkt, explicit_signals
+        )
+        eta_base = getattr(self.config, "mafia_eta_base", 1.0)
+        eta_amp = getattr(self.config, "mafia_eta_amplitude", 0.3)
+        eta_min = getattr(self.config, "mafia_eta_min", eta_base - eta_amp)
+        eta_max = getattr(self.config, "mafia_eta_max", eta_base + eta_amp)
+        eta = eta_base + eta_amp * th.tanh(eta_raw)
+        eta = th.clamp(eta, min=eta_min, max=eta_max)
 
         # Market direction logits (Spec 3.5: Context-Augmented Residual)
         sigma_logits = self.direction_head(
@@ -1423,6 +1529,7 @@ class MAFIAModel(nn.Module):
         explicit_signals: Optional[
             th.Tensor
         ] = None,  # (batch, 2) [vol_shock, dc_flag] for Direction Head (Spec 3.5)
+        prev_holdings: Optional[th.Tensor] = None,  # Memory Injection
     ) -> Tuple[
         th.Tensor,
         th.Tensor,
@@ -1595,6 +1702,7 @@ class MAFIAModel(nn.Module):
             force_topk_indices=force_topk_indices,
             router_context_buffer=router_context_buffer,  # Temporal augmentation (Spec 3.6)
             explicit_signals=explicit_signals,  # Direction Head explicit signals (Spec 3.5)
+            prev_holdings=prev_holdings,  # Memory Injection
         )
 
         return (

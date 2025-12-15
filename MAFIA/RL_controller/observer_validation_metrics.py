@@ -102,6 +102,7 @@ class ObserverValidationResult:
     
     # Additional metrics
     topk_advantage: float = 0.0
+    topk_hold_reward: float = 0.0
     reward: float = 0.0
     net_reward: float = 0.0
     turnover_penalty: float = 0.0

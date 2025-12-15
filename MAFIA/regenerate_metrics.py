@@ -138,6 +138,7 @@ def regenerate_metrics():
     if not ckpts:
         print(f"[REGEN] No epoch checkpoints found at {ckpt_dir}. Exiting.")
         return
+    print(f"[DEBUG] Found {len(ckpts)} checkpoints: {[os.path.basename(c) for c in ckpts]}")
 
     # Sort by epoch
     def extract_epoch(p):
@@ -192,10 +193,71 @@ def regenerate_metrics():
                     # print(f"[REGEN] Skipping Epoch {epoch_num} (already exists in both).")
                     continue
                 
+            # Load Checkpoint with MIGRATION logic for Architecture Mismatch
+            # Legacy: 'risk_network' -> New: 'risk_head.deep_net'
+            # Legacy: 'explicit_dim' 4 -> New: 6
             print(f"[REGEN] Processing Epoch {epoch_num}...")
-            loaded_epoch = trainer.observer.load_checkpoint(ckpt)
-            trainer._epoch = loaded_epoch
             
+            # Custom Load with Migration
+            checkpoint = th.load(ckpt, map_location=trainer.device)
+            # MAFIAObserver saves with 'mafia_model_state_dict'
+            state_key = 'mafia_model_state_dict' 
+            if state_key not in checkpoint:
+                 # Fallback if standard convention
+                 state_key = 'model_state_dict'
+            
+            state_dict = checkpoint[state_key]
+            
+            # 1. Rename 'signal_generator.risk_network' -> 'signal_generator.risk_head.deep_net'
+            params_to_rename = []
+            for k in state_dict.keys():
+                if "signal_generator.risk_network." in k:
+                    params_to_rename.append(k)
+            
+            for k in params_to_rename:
+                val = state_dict.pop(k)
+                new_k = k.replace("signal_generator.risk_network.", "signal_generator.risk_head.deep_net.")
+                state_dict[new_k] = val
+                # print(f"  [MIGRATE] Renamed {k} -> {new_k}")
+
+            # 2. Pad 'signal_generator.direction_head.classifier.weight' (68 -> 70)
+            # Old: 64 (Dense) + 4 (Wide) = 68
+            # New: 64 (Dense) + 6 (Wide) = 70
+            dir_weight_key = "signal_generator.direction_head.classifier.weight"
+            if dir_weight_key in state_dict:
+                w = state_dict[dir_weight_key]
+                if w.shape[1] == 68:
+                    # Pad last 2 dimensions with 0.0 (Neutral impact)
+                    padding = th.zeros((3, 2), device=w.device, dtype=w.dtype)
+                    new_w = th.cat([w, padding], dim=1)
+                    state_dict[dir_weight_key] = new_w
+                    print(f"  [MIGRATE] Padded {dir_weight_key}: {w.shape} -> {new_w.shape}")
+
+            # 3. Handle 'signal_generator.risk_head.fusion_net.weight' (Missing in Old)
+            # & Handle Size Mismatches (e.g. Risk Head architecture change [1, 64] vs [64, 64])
+            
+            # Detect size mismatches and remove them so strict=False can skip them
+            model_state = trainer.observer.mafia_model.state_dict()
+            keys_to_remove = []
+            
+            for k, v in state_dict.items():
+                if k in model_state:
+                    if v.shape != model_state[k].shape:
+                        print(f"  [MIGRATE] Size mismatch for {k}: ckpt {v.shape} vs model {model_state[k].shape} -> Dropping")
+                        keys_to_remove.append(k)
+                        
+            for k in keys_to_remove:
+                del state_dict[k]
+
+            # Load into model
+            try:
+                trainer.observer.mafia_model.load_state_dict(state_dict, strict=False)
+                trainer._epoch = checkpoint['epoch']
+                loaded_epoch = trainer._epoch
+            except Exception as e:
+                print(f"[ERROR] Migration Load Failed: {e}")
+                continue
+
             # Recalculate Lambda for correct "Best Model" logic
             trainer._current_lambda_epoch = trainer._compute_lambda_epoch(loaded_epoch)
             is_full_penalty = trainer._current_lambda_epoch >= 0.999

@@ -176,6 +176,7 @@ class Config:
         # Penalty coefficients (stronger to stand against reward scaling=100)
         self.mafia_pg_alpha_turnover = 1.25  # Turnover penalty coefficient
         self.mafia_pg_alpha_change = 1.5  # Membership change penalty coefficient
+        self.mafia_reward_alpha_hold = 1.5  # Trend Holding Bonus (Reward for holding profitable stocks)
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
         self.direction_label_delta = (
@@ -870,7 +871,9 @@ class Config:
 
         self.curriculum_penalty_rampup = 5  # Rampup over 5 epochs
 
-        # Direction Labeling
+        # Risk/Direction Head Config
+        self.mafia_explicit_dim = 6  # [Vol20, DC, Breadth, Div, VPI, DD60]
+        self.direction_head_dropout = 0.2
         self.mafia_direction_threshold = (
             0.02  # δ: threshold for bull/bear classification
         )
@@ -897,8 +900,11 @@ class Config:
         self.mafia_max_grad_norm = 1.0  # Max gradient norm for clipping
 
         # Top-K Selection
-        self.mafia_top_k = 10  # K: number of assets to select
-        self.mafia_topk_rebalance_interval = 14  # Rebalance interval (days)
+        self.mafia_top_k = 10  # Number of assets to select
+
+        # Rebalance settings
+        self.mafia_topk_rebalance_interval = 14  # Rebalance every 14 days (User Intent)
+        self.mafia_hard_topk_inference = True  # Use hard TopK at inference
 
         # Dense MoE Gating Configuration
         self.mafia_gating_encoder_type = (

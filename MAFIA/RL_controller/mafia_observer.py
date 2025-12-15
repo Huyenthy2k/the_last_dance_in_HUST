@@ -712,6 +712,7 @@ class MAFIAObserver:
                 force_topk_indices=force_topk_indices,
                 router_context_buffer=router_context_buffer,
                 explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
+                prev_holdings=kwargs.get("prev_holdings", None),  # Memory Injection
             )
         else:
             self.mafia_model.eval()
@@ -731,6 +732,7 @@ class MAFIAObserver:
                     force_topk_indices=force_topk_indices,
                     router_context_buffer=router_context_buffer,
                     explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
+                    prev_holdings=kwargs.get("prev_holdings", None),  # Memory Injection
                 )
 
         # Update context buffer with new market_context (Spec 3.6)
