@@ -168,19 +168,21 @@ class MAFIAFeatureProcessor:
 
         # Compute technical indicators for each asset
         for n in range(N):
-            # SMA(20) on Close
+            # SMA(20) -> (Close - SMA) / Close (Scale invariant distance)
             sma_20 = self._compute_sma(close_prices[n, :], window=20)
-            P_Tech[n, :, 5] = sma_20
+            # Avoid div by zero
+            safe_close = np.where(close_prices[n, :] == 0, 1.0, close_prices[n, :])
+            P_Tech[n, :, 5] = (close_prices[n, :] - sma_20) / safe_close
 
-            # RSI(14) on Close
+            # RSI(14) -> Scale to [0, 1]
             rsi_14 = self._compute_rsi(close_prices[n, :], period=14)
-            P_Tech[n, :, 6] = rsi_14
+            P_Tech[n, :, 6] = rsi_14 / 100.0
 
-            # ATR(14) on High, Low, Close
+            # ATR(14) -> Scale by Close (Volatility %)
             atr_14 = self._compute_atr(
                 high_prices[n, :], low_prices[n, :], close_prices[n, :], period=14
             )
-            P_Tech[n, :, 7] = atr_14
+            P_Tech[n, :, 7] = atr_14 / safe_close
 
         return P_Tech.astype(np.float32)
 
@@ -228,7 +230,8 @@ class MAFIAFeatureProcessor:
 
             P_DC[n, :, 0] = state  # State
             P_DC[n, :, 1] = magnitude  # Magnitude
-            P_DC[n, :, 2] = duration  # Duration
+            # Duration -> Scale by Window Size T_w
+            P_DC[n, :, 2] = duration / float(self.T_w)  # Duration (0.0 to 1.0+)
 
             # Volume_Ratio: Volume[t] / Mean(Volume[0...T_w-1])
             volume_mean = np.mean(volumes[n, :])
@@ -441,25 +444,29 @@ class MAFIAFeatureProcessor:
             P_Mkt[0, :, feat_idx] = change.astype(np.float32)
 
         # Basic technical indicators (same as Technical Agent)
+        # SMA(20) -> (Close - SMA) / Close
         sma_20 = self._compute_sma(close_prices, window=20)
-        P_Mkt[0, :, 5] = sma_20
+        safe_close = np.where(close_prices == 0, 1.0, close_prices)
+        P_Mkt[0, :, 5] = (close_prices - sma_20) / safe_close
 
+        # RSI(14) -> Scale to [0, 1]
         rsi_14 = self._compute_rsi(close_prices, period=14)
-        P_Mkt[0, :, 6] = rsi_14
+        P_Mkt[0, :, 6] = rsi_14 / 100.0
 
+        # ATR(14) -> Scale by Close
         atr_14 = self._compute_atr(high_prices, low_prices, close_prices, period=14)
-        P_Mkt[0, :, 7] = atr_14
+        P_Mkt[0, :, 7] = atr_14 / safe_close
 
         # Extended indicators
-        # MACD(12,26,9) histogram
+        # MACD(12,26,9) histogram -> Scale by Close
         ema12 = pd.Series(close_prices).ewm(span=12, adjust=False).mean().values
         ema26 = pd.Series(close_prices).ewm(span=26, adjust=False).mean().values
         macd_line = ema12 - ema26
         macd_signal = pd.Series(macd_line).ewm(span=9, adjust=False).mean().values
         macd_hist = macd_line - macd_signal
-        P_Mkt[0, :, 8] = macd_hist
+        P_Mkt[0, :, 8] = macd_hist / safe_close
 
-        # Bollinger Band Width(20,2)
+        # Bollinger Band Width(20,2) (Already Ratio, kept as is)
         bb_mid = pd.Series(close_prices).rolling(window=20, min_periods=1).mean()
         bb_std = pd.Series(close_prices).rolling(window=20, min_periods=1).std(ddof=0)
         bb_up = bb_mid + 2 * bb_std
@@ -467,7 +474,7 @@ class MAFIAFeatureProcessor:
         bb_width = (bb_up - bb_low) / (bb_mid.replace(0, np.nan)).replace(np.nan, 1.0)
         P_Mkt[0, :, 9] = np.nan_to_num(bb_width.values, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Stochastic %K/%D(14,3)
+        # Stochastic %K/%D(14,3) -> Scale to [0, 1]
         rolling_high14 = (
             pd.Series(high_prices).rolling(window=14, min_periods=1).max().values
         )
@@ -484,10 +491,10 @@ class MAFIAFeatureProcessor:
             * 100.0
         )
         stoch_d = pd.Series(stoch_k).rolling(window=3, min_periods=1).mean().values
-        P_Mkt[0, :, 10] = stoch_k
-        P_Mkt[0, :, 11] = stoch_d
+        P_Mkt[0, :, 10] = stoch_k / 100.0
+        P_Mkt[0, :, 11] = stoch_d / 100.0
 
-        # ADX(14)
+        # ADX(14) -> Scale to [0, 1]
         plus_dm = np.zeros(len(close_prices))
         minus_dm = np.zeros(len(close_prices))
         for i in range(1, len(close_prices)):
@@ -516,15 +523,22 @@ class MAFIAFeatureProcessor:
             abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
         ).replace(np.nan, 0.0)
         adx14 = dx.ewm(alpha=1.0 / 14, adjust=False).mean().values
-        P_Mkt[0, :, 12] = adx14
+        P_Mkt[0, :, 12] = adx14 / 100.0
 
-        # OBV
+        # OBV -> Rolling Z-Score (Window 20)
+        # Prevents unbounded drift, captures relative volume pressure
         price_diff = np.diff(close_prices, prepend=close_prices[0])
         vol_sign = np.where(price_diff > 0, 1, np.where(price_diff < 0, -1, 0))
-        obv = np.cumsum(vol_sign * volumes)
-        P_Mkt[0, :, 13] = obv
+        raw_obv = np.cumsum(vol_sign * volumes)
+        obv_series = pd.Series(raw_obv)
+        obv_mean = obv_series.rolling(window=20, min_periods=1).mean()
+        obv_std = obv_series.rolling(window=20, min_periods=1).std(ddof=0)
+        obv_z = (obv_series - obv_mean) / (obv_std.replace(0, np.nan)).replace(
+            np.nan, 1.0
+        )
+        P_Mkt[0, :, 13] = np.nan_to_num(obv_z.values, nan=0.0)
 
-        # MFI(14)
+        # MFI(14) -> Scale to [0, 1]
         typical_price = (high_prices + low_prices + close_prices) / 3.0
         tp_diff = np.diff(typical_price, prepend=typical_price[0])
         raw_mf = typical_price * volumes
@@ -534,9 +548,9 @@ class MAFIAFeatureProcessor:
         neg_mf14 = pd.Series(neg_mf).rolling(window=14, min_periods=1).sum()
         mfr = np.divide(pos_mf14, neg_mf14.replace(0, np.nan)).replace(np.nan, 1.0)
         mfi14 = 100 - (100 / (1 + mfr))
-        P_Mkt[0, :, 14] = mfi14.values
+        P_Mkt[0, :, 14] = mfi14.values / 100.0
 
-        # CCI(20)
+        # CCI(20) -> Scale by 100 (approx range -2 to 2)
         sma_tp20 = pd.Series(typical_price).rolling(window=20, min_periods=1).mean()
         md20 = (
             pd.Series(typical_price)
@@ -546,14 +560,16 @@ class MAFIAFeatureProcessor:
         cci20 = (typical_price - sma_tp20) / (0.015 * md20.replace(0, np.nan)).replace(
             np.nan, 1.0
         )
-        P_Mkt[0, :, 15] = np.nan_to_num(cci20.values, nan=0.0, posinf=0.0, neginf=0.0)
+        P_Mkt[0, :, 15] = (
+            np.nan_to_num(cci20.values, nan=0.0, posinf=0.0, neginf=0.0) / 100.0
+        )
 
-        # Volatility std of returns (20)
+        # Volatility std of returns (20) (Already %, kept as is)
         returns = pd.Series(close_prices).pct_change(fill_method=None).fillna(0.0)
         vol_std20 = returns.rolling(window=20, min_periods=1).std(ddof=0).values
         P_Mkt[0, :, 16] = vol_std20
 
-        # Drawdown (relative to rolling 60-day peak)
+        # Drawdown (relative to rolling 60-day peak) (Already %, kept as is)
         rolling_peak60 = (
             pd.Series(close_prices).rolling(window=60, min_periods=1).max().values
         )
@@ -565,9 +581,9 @@ class MAFIAFeatureProcessor:
         )
         P_Mkt[0, :, 17] = drawdown60
 
-        # Regime proxy: SMA20 - SMA60 (raw difference)
+        # Regime proxy: (SMA20 - SMA60) / Close
         sma60 = pd.Series(close_prices).rolling(window=60, min_periods=1).mean().values
-        regime = sma_20 - sma60
+        regime = (sma_20 - sma60) / safe_close
         P_Mkt[0, :, 18] = regime
 
         return P_Mkt.astype(np.float32)

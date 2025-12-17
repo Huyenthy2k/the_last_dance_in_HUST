@@ -470,7 +470,19 @@ def train_observer_offline_iteration(
             except Exception as e:
                 smart_print(f"[WARN] Failed to save train metrics: {e}")
 
-            # 2. Validate (returns ObserverValidationResult)
+            # 2. Save checkpoint IMMEDIATELY after training (before validation to prevent loss)
+            # Always save latest checkpoint for resume (overwrites previous)
+            latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
+            trainer.observer.save_checkpoint(latest_ckpt_path, epoch=epoch)
+
+            # Always save epoch checkpoint (Full History)
+            epoch_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
+            trainer.observer.save_checkpoint(epoch_ckpt_path, epoch=epoch)
+
+            if verbose:
+                smart_print(f"      [CHECKPOINT] Saved epoch {epoch} checkpoint before validation")
+
+            # 3. Validate (returns ObserverValidationResult)
             val_result = trainer.validate_epoch(
                 data_tensors=valid_tensors,
                 steps=max(1, batches_per_epoch // 4),
@@ -511,16 +523,7 @@ def train_observer_offline_iteration(
                 best_epoch=tracker.best_epoch if tracker.best_epoch is not None else epoch,
             )
 
-            # 6. Save checkpoints
-            # Always save latest checkpoint for resume (overwrites previous)
-            latest_ckpt_path = os.path.join(temp_ckpt_dir, "latest_checkpoint.pth")
-            trainer.observer.save_checkpoint(latest_ckpt_path, epoch=epoch)
-
-            # Always save epoch checkpoint (Full History)
-            epoch_ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{epoch}.pth")
-            trainer.observer.save_checkpoint(epoch_ckpt_path, epoch=epoch)
-
-            # Save best checkpoint separately (overwrite with current best)
+            # 6. Save best checkpoint (after validation determines is_best)
             if is_best:
                 best_ckpt_path = os.path.join(temp_ckpt_dir, "best_checkpoint.pth")
                 trainer.observer.save_checkpoint(best_ckpt_path, epoch=epoch)
@@ -641,6 +644,7 @@ def run_offline_observer_training(
     rebalance_interval: Optional[int] = None,
     verbose: bool = True,
     max_iterations: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> List[Dict]:
     """
     Run full walk-forward offline observer training.
@@ -706,6 +710,10 @@ def run_offline_observer_training(
         config.mafia_trajectory_length = traj_len
     if rebalance_interval is None:
         rebalance_interval = getattr(config, "mafia_topk_rebalance_interval", 14)
+    if batch_size is not None:
+        config.mafia_batch_size = batch_size
+        if verbose:
+            smart_print(f"[CONFIG] Overriding batch size: {batch_size}")
     
     # Enable trajectory logging if requested
     if log_details:
@@ -1082,6 +1090,12 @@ def main():
         default=None,
         help="Limit number of iterations (for testing)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override batch size (default: use config)",
+    )
 
     args = parser.parse_args()
 
@@ -1097,6 +1111,7 @@ def main():
         log_details=args.log_details,  # NEW
         verbose=not args.quiet,
         max_iterations=args.max_iterations,
+        batch_size=args.batch_size,
     )
 
     # Exit with error if any iteration failed

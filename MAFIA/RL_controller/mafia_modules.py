@@ -778,6 +778,15 @@ class DenseMoEGatingRouter(nn.Module):
             nn.Linear(self.D * 2, num_experts),
             nn.Softmax(dim=-1),  # Normalize weights to sum to 1
         )
+        
+        # Smart Init: Bias towards Technical Agent (Expert 0)
+        # Experts: 0=Tech, 1=DC(Slow), 2=DC(Med), 3=DC(Fast)
+        # Set bias of final linear layer to give slight preference to Tech
+        with th.no_grad():
+             # gate_network[-2] is the Linear layer before Softmax
+             # Bias init: [1.0, 0.0, 0.0, 0.0] -> Softmax -> [~0.47, ~0.17, ~0.17, ~0.17]
+             self.gate_network[-2].bias.zero_()
+             self.gate_network[-2].bias[0] = 1.0
 
         # Signal Decoupling Adapters (Task-Specific Views)
         # Selection Adapter: Projects raw context for Gating (Selection Task)
@@ -893,8 +902,18 @@ class DenseMoEGatingRouter(nn.Module):
             # Augmentation disabled
             gate_input = context_selection
 
+        # Sanitize gate_input to prevent NaN propagation (defensive)
+        # NaN can occur from edge-case data or numerical instability
+        if th.isnan(gate_input).any() or th.isinf(gate_input).any():
+            gate_input = th.nan_to_num(gate_input, nan=0.0, posinf=1.0, neginf=-1.0)
+            gate_input = th.clamp(gate_input, min=-10.0, max=10.0)
+
         # Generate gate weights from (augmented) selection context
         gate_weights = self.gate_network(gate_input)  # (batch, num_experts)
+
+        # Sanitize raw_context for downstream use
+        if th.isnan(raw_context).any() or th.isinf(raw_context).any():
+            raw_context = th.nan_to_num(raw_context, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return gate_weights, raw_context
 
@@ -929,7 +948,7 @@ class DirectionHead(nn.Module):
         # 6. Drawdown60: Rolling drawdown (Pain)
         self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
 
-        # Deep Path: Input Projection for LATENT only (2D → D)
+        # Deep Path: Input Projection for LATENT only (2D -> D)
         self.latent_dim = self.D * 2  # C_mkt(D) + Delta_C(D)
         self.input_proj = nn.Linear(self.latent_dim, self.D)
 
@@ -941,7 +960,7 @@ class DirectionHead(nn.Module):
 
         # Wide Path: No transformation (explicit signals bypass to fusion)
 
-        # Classification Head: Late Fusion (D + 4 → 3)
+        # Classification Head: Late Fusion (D + 4 -> 3)
         self.classifier = nn.Linear(self.D + self.explicit_dim, self.num_classes)
 
         # Initialize bias to log-priors matching data distribution
@@ -971,8 +990,8 @@ class DirectionHead(nn.Module):
         1: DC_Event_Flag
         2: Breadth_Gap
         3: Div_Signal
-        4: Signed_VPI_Zscore
-        5: Drawdown60
+        4: Signed_VPI_Zscore (only if D+4 exists)
+        5: Drawdown60 (only if D+5 exists)
 
         Convention: -1 (Bearish), +1 (Bullish)
 
@@ -989,58 +1008,28 @@ class DirectionHead(nn.Module):
             self.classifier.weight[2, self.D + 0] = -0.2  # High Vol decreases Bull prob
 
             # 1. DC Event Flag (Index D+1) - Strongest Signal (Trend Break)
-            # Val: 0 (No Event), 1 (Event) -> Wait, DC flag is binary 1.0.
-            # But is it directional?
-            # Trainer: `dc_flag_full` is 1.0 if Upward OR Downward break.
-            # It's an "Alert" signal, not strictly directional on its own?
-            # Let's check Trainer logic: dc_flag is just `1.0` if threshold broken.
-            # MAFIA Spec implication: DC Agents handle directionality internally.
-            # But here `explicit_signals` is just the flag.
-            # If so, DC Flag = 1.0 implies "Big Move Imminent/Happening".
-            # Usually implies Higher Volatility/Risk, fits "Vol" logic.
-            # But DirectionHead needs Direction.
-            # If the flag is non-directional, we shouldn't bias Direction with it heavily?
-            # Or does DC Agent output handle the direction?
-            # Reviewer Note: DC Flag in Wide Path might be less useful for Direction if it lacks sign.
-            # However, let's keep it neutral or slightly emphasis on 'Side' (volatility)?
-            # Actually, let's leave DC Flag weight small/zero if direction is ambiguous.
-            # Update: Re-reading Trainer: `dc_flag_full[i] = 1.0` regardless of Up/Down mode.
-            # So it's non-directional.
-            # Smart Init: Keep it 0.0 for Direction Head (let model learn if it correlates with Bear/Bull).
             self.classifier.weight[:, self.D + 1] = 0.0
 
             # 2. Breadth_Gap (Index D+2) - "Xanh vỏ đỏ lòng"
-            # High Positive (Stocks > Index) -> Healthy Bull?
-            # High Negative (Stocks < Index) -> Weakness/Distribution (Bearish)
-            # Range: [-1, 1]
             self.classifier.weight[0, self.D + 2] = -0.3 # Neg Gap -> Bear
             self.classifier.weight[2, self.D + 2] = 0.3  # Pos Gap -> Bull
 
             # 3. Div_Signal (Index D+3) - Reversal
-            # Val: -1 (Bear reversal), 1 (Bull reversal)
             self.classifier.weight[0, self.D + 3] = -0.5
             self.classifier.weight[2, self.D + 3] = 0.5
 
             # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
-            # Pos -> Bull efficient, Neg -> Bear efficient
-            self.classifier.weight[0, self.D + 4] = -0.3
-            self.classifier.weight[2, self.D + 4] = 0.3
+            if self.explicit_dim > 4:
+                self.classifier.weight[0, self.D + 4] = -0.3
+                self.classifier.weight[2, self.D + 4] = 0.3
 
-            # 5. Drawdown60 (Index D+5) - Mean Reversion Logic
-            # High Drawdown (Positive value? Trainer: (Price-Peak)/Peak -> Negative value!)
-            # Trainer: drawdowns_full = (market_closes - rolling_peak) / rolling_peak
-            # So range is [-0.5, 0.0]. It is NEGATIVE.
-            # "High Drawdown" means closer to -0.5 (More Negative).
-            # "Low Drawdown" means closer to 0.0.
-            # Logic:
-            # - Very Negative (Deep DD) -> Oversold -> Potential Bull Rebound?
-            # -  OR Deep Bear Trend.
-            # Let's assume Mean Reversion: More Negative -> Bullish Rebound.
-            # Input is Negative (e.g. -0.2).
-            # We want: -0.2 * Weight = Positive Logit for Bull.
-            # So Weight should be NEGATIVE. (-0.2 * -1.0 = +0.2)
-            self.classifier.weight[0, self.D + 5] = 0.2   # DD neg -> Bear Logit decreases (Oversold -> Less likely to continue crash?)
-            self.classifier.weight[2, self.D + 5] = -0.2  # DD neg -> Bull Logit increases (Oversold -> Bounce)
+            # 5. Drawdown60 (Index D+5) - Trend Following Logic (UPDATED)
+            if self.explicit_dim > 5:
+                # Drawdown is negative value (e.g. -0.2).
+                # Bear Impact: Weight(-0.2) * Value(-0.2) = +0.04 -> Increases Bear score (Correct: Deep DD -> Bearish)
+                self.classifier.weight[0, self.D + 5] = -0.2
+                # Bull Impact: Weight(0.2) * Value(-0.2) = -0.04 -> Decreases Bull score (Correct: Deep DD -> Less Bullish)
+                self.classifier.weight[2, self.D + 5] = 0.2
 
             # Ensure Side Class (1) remains neutral to these signals initially
             self.classifier.weight[1, self.D : self.D + self.explicit_dim] = 0.0
@@ -1057,14 +1046,37 @@ class DirectionHead(nn.Module):
         Args:
             c_mkt: (B, D) - Current market context from Temporal Encoder
             delta_c_mkt: (B, D) - Momentum/Velocity from Shared Buffer (Spec 3.6)
-            explicit_signals: (B, 4) - Wide path signals:
-                [DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore]
+            explicit_signals: (B, 6) - Wide path signals:
+                [Vol_Std20, DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore, Drawdown60]
 
         Returns:
             logits: (B, 3) - Bear/Side/Bull classification logits
         """
+        # === 0. Signal Scaling (Robustness) ===
+        # Volatility ~ 0.015, Gap ~ 10.0. huge discrepancy.
+        # Scale to ~ [-1, 1] or [0, 1] range.
+        c_vol = 100.0   # 0.01 -> 1.0
+        c_gap = 0.1     # 10.0 -> 1.0
+        c_vpi = 0.5     # 2.0 -> 1.0
+
+        # Create scaled copy to avoid modifying original tensor inplace (safety)
+        signals_scaled = explicit_signals.clone()
+        
+        # Vol_Std20 (idx 0)
+        signals_scaled[:, 0] = signals_scaled[:, 0] * c_vol
+        # Breadth_Gap (idx 2)
+        signals_scaled[:, 2] = signals_scaled[:, 2] * c_gap
+        # Signed_VPI (idx 4)
+        if signals_scaled.shape[1] > 4:
+            signals_scaled[:, 4] = signals_scaled[:, 4] * c_vpi
+
         # === 1. Deep Path: Process latent context ===
         x_latent = th.cat([c_mkt, delta_c_mkt], dim=-1)  # (B, 2D)
+        
+        # [ROBUSTNESS] Sanitize latent input
+        if th.isnan(x_latent).any() or th.isinf(x_latent).any():
+             x_latent = th.nan_to_num(x_latent, nan=0.0, posinf=1.0, neginf=-1.0)
+
         h = self.input_proj(x_latent)  # (B, D)
 
         # Residual Block with Skip Connection
@@ -1075,13 +1087,22 @@ class DirectionHead(nn.Module):
         h_deep = h + h_res  # (B, D)
 
         # === 2. Wide Path: Direct bypass (no transformation) ===
-        x_wide = explicit_signals  # (B, 4)
-
+        x_wide = signals_scaled  # (B, 6)
+        
+        # [ROBUSTNESS] Sanitize wide input
+        if th.isnan(x_wide).any() or th.isinf(x_wide).any():
+             x_wide = th.nan_to_num(x_wide, nan=0.0, posinf=1.0, neginf=-1.0)
+             
         # === 3. Late Fusion ===
-        h_final = th.cat([h_deep, x_wide], dim=-1)  # (B, D+4)
+        h_final = th.cat([h_deep, x_wide], dim=-1)  # (B, D+6)
 
         # === 4. Classification ===
         logits = self.classifier(h_final)  # (B, 3)
+        
+        # [ROBUSTNESS] Final Output Guard
+        # If logits are still NaN (e.g. from weight corruption), zero them out
+        if th.isnan(logits).any():
+             logits = th.nan_to_num(logits, nan=0.0)
 
         return logits
 
@@ -1113,6 +1134,54 @@ class RiskHead(nn.Module):
         # Late Fusion
         self.fusion_net = nn.Linear(self.D + self.explicit_dim, 1)
 
+        # Smart Initalization for Wide Path (Spec 3.5.1 v2.1)
+        self._init_explicit_signal_weights()
+
+    def _init_explicit_signal_weights(self):
+        """
+        Smart-initialize Wide Path weights for Risk Head.
+        Reflects inverse relationship between volatility/risk signals and eta (Risk Tolerance).
+
+        Target: High Risk Signal -> Low Eta (Defensive)
+        Weights should be NEGATIVE for Risk Factors.
+        """
+        with th.no_grad():
+            # Fusion net input: [Deep(D), Wide(6)] -> Output(1)
+            # Wide signals start at index D.
+
+            # 0. Vol_Std20 (Index D+0) - High Vol -> Low Eta
+            self.fusion_net.weight[0, self.D + 0] = -0.5
+
+            # 1. DC_Event_Flag (Index D+1) - Trend Break -> Low Eta
+            self.fusion_net.weight[0, self.D + 1] = -0.3
+
+            # 2. Breadth_Gap (Index D+2) - Negative Gap (Bear Trap) -> Low Eta
+            # Gap is usually negative in bad times?
+            # Metric: avg(RSI_stocks) - RSI_index.
+            # If Indx high but stocks low -> Gap < 0. This is Bear Trap.
+            # So Gap < 0 -> Low Eta. Gap > 0 -> High Eta.
+            # Positive weight propagates sign correctly.
+            self.fusion_net.weight[0, self.D + 2] = 0.3
+
+            # 3. Div_Signal (Index D+3) - Reversal
+            # -1 (Bearish Div) -> Low Eta. +1 (Bullish Div) -> High Eta.
+            self.fusion_net.weight[0, self.D + 3] = 0.3
+
+            # 4. Signed_VPI_Zscore (Index D+4)
+            if self.explicit_dim > 4:
+                 self.fusion_net.weight[0, self.D + 4] = 0.3
+
+            # 5. Drawdown60 (Index D+5) - Pain
+            # Drawdown is negative (e.g. -0.15). Deep drawback -> Low Eta.
+            # Weight > 0 means (-0.15 * 0.5) -> negative impact. Correct.
+            if self.explicit_dim > 5:
+                 self.fusion_net.weight[0, self.D + 5] = 0.5
+
+            # Initialize bias to 0.0 (Neutral start) or slight positive (1.0 base)
+            # But output is passed to tanh... eta = base + amp * tanh(raw).
+            # So 0.0 -> tanh(0)=0 -> eta=base. Correct.
+            self.fusion_net.bias.fill_(0.0)
+
     def forward(
         self,
         c_mkt_macro: th.Tensor,
@@ -1125,12 +1194,34 @@ class RiskHead(nn.Module):
             delta_c_mkt: (B, D) - Momentum
             explicit_signals: (B, 6) - [Vol20, DC, Breadth, Div, VPI, DD60]
         """
+        # === 0. Signal Scaling (Robustness) ===
+        c_vol = 100.0
+        c_gap = 0.1
+        c_vpi = 0.5
+        
+        signals_scaled = explicit_signals.clone()
+        signals_scaled[:, 0] = signals_scaled[:, 0] * c_vol
+        signals_scaled[:, 2] = signals_scaled[:, 2] * c_gap
+        if signals_scaled.shape[1] > 4:
+            signals_scaled[:, 4] = signals_scaled[:, 4] * c_vpi
+
         # Deep Path
         x_deep = th.cat([c_mkt_macro, delta_c_mkt], dim=-1)
+        
+        # [ROBUSTNESS] Sanitize deep input
+        if th.isnan(x_deep).any() or th.isinf(x_deep).any():
+             x_deep = th.nan_to_num(x_deep, nan=0.0, posinf=1.0, neginf=-1.0)
+             
         h_deep = self.deep_net(x_deep)
 
+
         # Wide Path & Fusion
-        h_final = th.cat([h_deep, explicit_signals], dim=-1)
+        x_wide = signals_scaled
+        # [ROBUSTNESS] Sanitize wide input
+        if th.isnan(x_wide).any() or th.isinf(x_wide).any():
+             x_wide = th.nan_to_num(x_wide, nan=0.0, posinf=1.0, neginf=-1.0)
+             
+        h_final = th.cat([h_deep, x_wide], dim=-1)
         eta_raw = self.fusion_net(h_final)
 
         return eta_raw.squeeze(-1)
@@ -1179,8 +1270,8 @@ class DenseMoESignalGenerator(nn.Module):
 
         # Holding Bias (Learnable Inertia) - Spec "Memory Injection"
         # Bias added to logits of currently held stocks to encourage retention
-        # Initialize to 0.0 (neutral), let model learn positive value if beneficial
-        self.holding_bias = nn.Parameter(th.zeros(1))
+        # Initialize to 0.01 (Smart Init) to encourage holding from start (helps convergence vs turnover penalty)
+        self.holding_bias = nn.Parameter(th.tensor([0.01]))
 
     def reset_router_state(self):
         """Reset stateful components inside the gating router (LSTM hidden/cache)."""
@@ -1225,7 +1316,9 @@ class DenseMoESignalGenerator(nn.Module):
         th.Tensor,
         Optional[th.Tensor],
         th.Tensor,
+        th.Tensor,
     ]:
+
         """
         Dense MoE forward pass.
 
@@ -1244,6 +1337,7 @@ class DenseMoESignalGenerator(nn.Module):
             topk_indices: (batch, K) - Indices of selected assets
             topk_embeddings: Optional (batch, K, D) - Embeddings of selected assets (for RL state)
             topk_scores: (batch, K) - Market weights on selected assets
+            market_logits: (batch, N) - Raw logits before softmax (for stable Loss calc)
             force_topk_indices: Optional tensor to override Top-K membership (keeps weights sorted by logits)
         """
         # Input validation
@@ -1325,6 +1419,9 @@ class DenseMoESignalGenerator(nn.Module):
         # market_scores_full: Full softmax WITHOUT temperature (pure model distribution)
         # Per spec 3.3: "market_scores_full = softmax toàn bộ (không mask)"
         # Temperature τ is ONLY for Gumbel-TopK selection, NOT for full scores
+        # Sanitize market_logits before softmax to prevent NaN
+        if th.isnan(market_logits).any() or th.isinf(market_logits).any():
+            market_logits = th.nan_to_num(market_logits, nan=0.0, posinf=10.0, neginf=-10.0)
         market_scores_full = F.softmax(market_logits, dim=-1)  # (batch, N)
 
         if training_mode or not hard_inference:
@@ -1371,6 +1468,10 @@ class DenseMoESignalGenerator(nn.Module):
         masked_logits = logits_for_topk.masked_fill(~mask, float("-inf"))
         market_vector = F.softmax(masked_logits, dim=-1)
 
+        # Sanitize NaN from softmax (can occur with all -inf inputs)
+        if th.isnan(market_vector).any():
+            market_vector = th.nan_to_num(market_vector, nan=0.0)
+
         # Enforce hard support at inference
         if not training_mode and hard_inference:
             market_vector = market_vector.masked_fill(~mask, 0.0)
@@ -1408,6 +1509,23 @@ class DenseMoESignalGenerator(nn.Module):
                 c_oldest_raw = router_context_buffer[:, 0, :]  # (B, D)
             
             # Project oldest raw -> oldest macro
+            # Spec 3.6 requires Delta = C_curr - C_(t-W+1).
+            # Buffer contains [C_(t-W), C_(t-W+1), ... C_(t-1)]
+            # Index 0 is C_(t-W). Index 1 is C_(t-W+1).
+            # We use index 1 to align with Gating Router and Spec.
+            if router_context_buffer.size(1) > 1:
+                # Use C_(t-W+1) if window is large enough
+                if router_context_buffer.dim() == 2:  # (W, D)
+                    c_oldest_raw = router_context_buffer[1:2].expand(batch_size, -1)
+                else:  # (batch, W, D)
+                    c_oldest_raw = router_context_buffer[:, 1, :]
+            else:
+                # Fallback for short windows (W=1)
+                if router_context_buffer.dim() == 2:
+                    c_oldest_raw = router_context_buffer[0:1].expand(batch_size, -1)
+                else:
+                    c_oldest_raw = router_context_buffer[:, 0, :]
+            
             c_oldest_macro = self.macro_adapter(c_oldest_raw)
             delta_c_mkt = context_macro - c_oldest_macro  # Macro momentum
 
@@ -1440,6 +1558,7 @@ class DenseMoESignalGenerator(nn.Module):
             topk_indices,  # (batch, K)
             topk_embeddings,  # (batch, K, D) or None
             topk_scores,  # (batch, K)
+            market_logits,  # (batch, N) - RAW LOGITS
         )
 
 
@@ -1539,6 +1658,7 @@ class MAFIAModel(nn.Module):
         th.Tensor,
         Optional[th.Tensor],
         th.Tensor,
+        th.Tensor,
     ]:
         """
         Forward pass through MAFIA model with Dense MoE.
@@ -1551,9 +1671,8 @@ class MAFIAModel(nn.Module):
             market_vector: (batch, N) - Market trend vector (Top-K weights, zero elsewhere)
             eta: (batch,) - Risk tolerance factor
             market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
-            market_scores_full: (batch, N) - Full market scores (softmax on all N assets, no Top-K mask)
+            market_logits: (batch, N) - Raw logits before softmax (for stable Loss calc)
             market_context: (batch, D) - Raw market latent state (shared source)
-            sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
             sigma_logits: (batch, 3) - Market direction logits (up/hold/down)
             topk_indices: (batch, K) - Indices of selected assets
             topk_embeddings: (batch, K, D) or None - Embeddings of selected assets
@@ -1694,6 +1813,7 @@ class MAFIAModel(nn.Module):
             topk_indices,
             topk_embeddings,
             topk_scores,
+            market_logits,
         ) = self.signal_generator(
             stock_expert_outputs,
             stock_expert_ta_outputs,
@@ -1714,4 +1834,5 @@ class MAFIAModel(nn.Module):
             topk_indices,
             topk_embeddings,
             topk_scores,
+            market_logits,
         )

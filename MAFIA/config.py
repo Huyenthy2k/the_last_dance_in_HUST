@@ -176,7 +176,9 @@ class Config:
         # Penalty coefficients (stronger to stand against reward scaling=100)
         self.mafia_pg_alpha_turnover = 1.25  # Turnover penalty coefficient
         self.mafia_pg_alpha_change = 1.5  # Membership change penalty coefficient
-        self.mafia_reward_alpha_hold = 1.5  # Trend Holding Bonus (Reward for holding profitable stocks)
+        self.mafia_reward_alpha_hold = (
+            2.0  # Trend Holding Bonus (Reward for holding profitable stocks)
+        )
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
         self.direction_label_delta = (
@@ -460,7 +462,7 @@ class Config:
         #   - stock_data_top143.csv or stock_data_dynamic143.csv (143 stocks, ADV > 5B, needs 32GB+ RAM)
         #   - stock_prices_all_20251108_234851.csv (235 stocks, full dataset, needs 64GB+ RAM)
         self.stock_data_file = (
-            "stock_data_dynamic143.csv"  # Use top 23 stocks for Mac 16GB
+            "stock_data_top143_cleaned.csv"  # Cleaned: 122 stocks, no NaN/Inf
         )
         # Data quality guards
         self.mafia_price_floor = 1e-6  # Replace zero/negative prices with ffill/bfill
@@ -503,7 +505,7 @@ class Config:
         self.mafia_log_realtime = (
             True  # [ENV-STATUS] all-in-one realtime status on 1 line
         )
-        
+
         # Trajectory Logging: Default to logging only representative sample (idx=0)
         # Set to True (via config or CLI --log-details) to log ALL trajectories in batch.
         self.log_trajectory_details = False
@@ -724,9 +726,9 @@ class Config:
             "MA-{}".format(self.otherRef_indicator_ma_window),
             "DAILYRETURNS-{}".format(self.dailyRetun_lookback),
         ]
-
+        # Market Risk-Free Rate (Annual %) - Vietnam 10Y Bond Yield proxy (2025)
         self.mkt_rf = {
-            "VNINDEX": 3.0,  # Risk-free rate for Vietnam market (based on 10-year government bond yield, ~3.0% as of 2022). Adjust based on your data period.
+            "VNINDEX": 4.2,  # Risk-free rate for Vietnam market (based on 10-year government bond yield, ~4.2% as of 2025). Adjust based on your data period.
         }
 
         self.market_close_time = {
@@ -873,7 +875,7 @@ class Config:
 
         # Risk/Direction Head Config
         self.mafia_explicit_dim = 6  # [Vol20, DC, Breadth, Div, VPI, DD60]
-        self.direction_head_dropout = 0.2
+        self.direction_head_dropout = 0.3
         self.mafia_direction_threshold = (
             0.02  # δ: threshold for bull/bear classification
         )
@@ -886,13 +888,13 @@ class Config:
         # With γ=2.0, easy (majority) samples get ~0.1x gradient vs hard samples
         # Direction Loss (Focal Loss) Class Weights: [Bear, Side, Bull]
         # Based on VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
-        self.mafia_focal_alpha = [1.7, 0.70, 1.0]
+        self.mafia_focal_alpha = [1.5, 0.70, 1.0]
         self.mafia_focal_gamma = (
-            2.0  # Focusing parameter γ: reduces loss for confident (easy) predictions
+            1.25  # Focusing parameter γ: reduces loss for confident (easy) predictions
         )
         # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
         # Helps model converge stably, avoids overconfidence on noisy labels
-        self.mafia_direction_label_smoothing = 0.05  # ε: smoothing factor (reduced)
+        self.mafia_direction_label_smoothing = 0.08  # ε: smoothing factor (reduced)
         # Temperature scaling for direction logits (T<1 sharpens, T>1 flattens)
         self.mafia_direction_temperature = 1
 

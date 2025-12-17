@@ -592,6 +592,7 @@ class MAFIAObserver:
                 - topk_indices: (batch, K) numpy array - Indices selected by Gumbel/Top-K
                 - topk_embeddings: (batch, K, D) numpy array - Embeddings of selected assets
                 - topk_scores: (batch, K) numpy array - Market weights on selected assets
+                - market_logits: (batch, N) numpy array - Raw logits (optional)
         """
         mode = kwargs.get("mode", "train")
         pg_active_flag = bool(pg_active)
@@ -706,6 +707,7 @@ class MAFIAObserver:
                 topk_indices,
                 topk_embeddings,
                 topk_scores,
+                market_logits,  # (batch, N) - Raw Logits
             ) = self.mafia_model(
                 ochlv_tensor,
                 market_index_ochlv_data=market_index_ochlv_tensor,
@@ -726,6 +728,7 @@ class MAFIAObserver:
                     topk_indices,
                     topk_embeddings,
                     topk_scores,
+                    market_logits,  # (batch, N)
                 ) = self.mafia_model(
                     ochlv_tensor,
                     market_index_ochlv_data=market_index_ochlv_tensor,
@@ -1002,6 +1005,7 @@ class MAFIAObserver:
             topk_indices_np,
             topk_embeddings_np,
             topk_scores_np,
+            market_logits.detach().cpu().numpy(),
         )
 
     def _prepare_ochlv_tensor(self, raw_ochlv_data):
@@ -1009,13 +1013,17 @@ class MAFIAObserver:
         Prepare raw OCHLV data as tensor.
 
         Args:
-            raw_ochlv_data: (N, M, T_w) numpy array
+            raw_ochlv_data: (N, M, T_w) or (B, N, M, T_w) numpy array
 
         Returns:
-            torch.Tensor: (1, N, M, T_w) tensor on device
+            torch.Tensor: (B, N, M, T_w) tensor on device
         """
         ochlv_tensor = th.from_numpy(raw_ochlv_data).to(th.float32)
-        ochlv_tensor = ochlv_tensor.unsqueeze(0)  # Add batch dim: (1, N, M, T_w)
+        
+        # Add batch dim only if missing (single sample input)
+        if ochlv_tensor.dim() == 3:
+            ochlv_tensor = ochlv_tensor.unsqueeze(0)  # (1, N, M, T_w)
+            
         ochlv_tensor = ochlv_tensor.to(self.device)
         return ochlv_tensor
 

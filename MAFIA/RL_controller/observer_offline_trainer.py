@@ -99,6 +99,11 @@ class TrajectoryBatch:
     # High Vol + flat Price = Distribution warning
     signed_vpi_zscore: Optional[th.Tensor] = None
 
+    # 5. Drawdown60: (B, T_m) - 60-day Max Drawdown (Sign inverted or magnitude)
+    # Measures how far current price is from 60-day high.
+    # DD = (Close - MaxHigh60) / MaxHigh60 (Negative value)
+    drawdown60: Optional[th.Tensor] = None
+
     # 5. Drawdown60: (B, T_m) - Rolling Max Drawdown (Pain Index)
     # Drawdown = (Price - Rolling_Peak_60) / Rolling_Peak_60
     # Measures market stress and "Pain".
@@ -160,29 +165,82 @@ class FocalLoss(th.nn.Module):
         if self.alpha is not None and self.alpha.device != input.device:
             self.alpha = self.alpha.to(input.device)
 
-        # CrossEntropyLoss computes log_softmax internally
-        # Label smoothing (Spec 5.1.3): [0,1,0] → [ε/C, 1-ε+ε/C, ε/C]
-        ce_loss = th.nn.functional.cross_entropy(
-            input, target, reduction="none", label_smoothing=self.label_smoothing
-        )
-        pt = th.exp(-ce_loss)  # probability of correct class
+        # Stable Log-Space Calculation
+        # log_softmax is more stable than explicit softmax + log
+        log_pt = th.nn.functional.log_softmax(input, dim=-1)
+        
+        # Gather log_prob for the target class
+        # Target shape adjust if needed
+        if target.dim() == input.dim() - 1:
+             target = target.unsqueeze(-1)
+             
+        log_pt_target = log_pt.gather(-1, target)
+        log_pt_target = log_pt_target.view(-1) # Flatten
+        pt = log_pt_target.exp()
+        
+        # Stability fix: Clamp pt for focal term
+        # Avoid exactly 0 or 1 for power calc, though (1-pt) is generally safe for pt in [0,1]
+        pt_clamped = pt.clamp(min=1e-8, max=1.0 - 1e-8)
+        
+        # Focal Term: (1 - pt)^gamma
+        focal_term = (1.0 - pt_clamped).pow(self.gamma)
 
-        # Focal component: (1-pt)^gamma
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        # Loss = -alpha * focal_term * log_pt
+        loss = -1 * focal_term * log_pt_target
 
-        # Apply alpha weighting
         if self.alpha is not None:
-            # Gather alpha for target classes
-            # Support multi-dimensional target (flatten first)
-            if target.dim() > 1:
-                target_flat = target.view(-1)
-                losses_flat = focal_loss.view(-1)
-                alpha_t = self.alpha[target_flat]
-                focal_loss = losses_flat * alpha_t
-                focal_loss = focal_loss.view_as(target)
+             target_flat = target.view(-1)
+             alpha_t = self.alpha[target_flat]
+             loss = loss * alpha_t
+             
+        # Label Smoothing Adjustment (Approximate or skip if strict focal is needed)
+        # Standard Focal Loss doesn't always mix identically with LS.
+        # But user tuning explicitly requested LS = 0.08.
+        # If LS is ON, we should perhaps fall back to the CE implementation 
+        # OR add the smoothing term: loss = (1-eps)*Focal + eps*UniformFocal
+        # For Robustness now, let's keep it simple. If LS>0, the simple CE-based impl was actually cleaner...
+        # Wait, the PREVIOUS implementation handled LS correctly via F.cross_entropy.
+        # The crash was `(1-pt)**gamma`.
+        # Let's revert to wrapping F.cross_entropy BUT perform the math safely.
+        
+        # REVISED PLAN: Wrapper around CE is cleaner for Label Smoothing support.
+        # We just need to safeguard the `pt` tensor before power.
+        
+        # 1. Compute CE (with LS support) -> This gives -log(pt_smoothed)
+        ce_loss = th.nn.functional.cross_entropy(
+            input, target.view_as(target_flat) if target.dim()!=input.dim()-1 else target, 
+            reduction="none", 
+            label_smoothing=self.label_smoothing
+        )
+        
+        # 2. Extract pt safely
+        # pt = exp(-ce)
+        pt = th.exp(-ce_loss)
+        
+        # 3. CRITICAL STABILITY: Stop gradients on `pt` for the focal term?
+        # Usually we want gradients through focal term.
+        # The issue is `pow` derivative at base=0 (if gamma < 1) or huge base.
+        # Clamp pt to [0.0001, 0.9999] just for the focal term calculation base.
+        pt_safe = pt.clamp(min=1e-6, max=1.0-1e-6)
+        
+        # 4. Focal term
+        focal_term = (1.0 - pt_safe).pow(self.gamma)
+        
+        # 5. Combine
+        focal_loss = focal_term * ce_loss
+        
+        # 6. Alpha
+        if self.alpha is not None:
+            if target.dim() > 1: # If input was [N, C] target [N], it's handled. If target [N, ...], flatten
+                 alpha_t = self.alpha[target.view(-1)]
             else:
-                alpha_t = self.alpha[target]
-                focal_loss = focal_loss * alpha_t
+                 alpha_t = self.alpha[target]
+            
+            # Ensure shape match
+            if alpha_t.shape != focal_loss.shape:
+                 alpha_t = alpha_t.view_as(focal_loss)
+                 
+            focal_loss = focal_loss * alpha_t
 
         if self.reduction == "mean":
             return focal_loss.mean()
@@ -348,6 +406,11 @@ class ObserverOfflineBatchTrainer:
 
         # Memory Optimization: Mixed Precision Training
         self.use_mixed_precision = getattr(config, "use_mixed_precision", True)
+        self.scaler = th.amp.GradScaler(enabled=self.use_mixed_precision)
+
+        # Hook for Consistency Check (Non-intrusive weight inspection)
+        self._latest_gate_weights = None
+        self._register_gate_hook()
         self.scaler = None
         if self.use_mixed_precision:
             # Only create scaler if CUDA is available (AMP requires CUDA)
@@ -553,6 +616,14 @@ class ObserverOfflineBatchTrainer:
         # 2. Iterate stock-by-stock to fill array (Low Peak Memory)
         # Group by stock first to avoid repeated filtering
         grouped = filtered.groupby("stock")
+    
+    # [NAN-FIX] Ensure no Infs exist before filling
+    # Since we fill stock-by-stock, we handle it inside loop or pre-check filtered?
+    # Filtered is DataFrame.
+    # ochlv_array is initialized with NaN.
+    # We copy values from DF to Array.
+    # So we should valid_mask &= ~np.isinf(...) inside the loop?
+    # Or just replace Inf with NaN in the array slice.
 
         for n, stock_ticker in enumerate(stock_list):
             if n % 50 == 0:
@@ -583,6 +654,11 @@ class ObserverOfflineBatchTrainer:
             ochlv_array[indices, n, 3] = stock_df.loc[valid_mask, "low"].values
             ochlv_array[indices, n, 4] = stock_df.loc[valid_mask, "volume"].values
 
+            # [NAN-FIX] Replace Inf with NaN ensuring fill logic works for them too
+            slice_view = ochlv_array[:, n, :]
+            if np.isinf(slice_view).any():
+                 slice_view[np.isinf(slice_view)] = np.nan
+
             # Handle NaN for this stock immediately (Forward/Backward Fill)
             for f in range(5):
                 col = ochlv_array[:, n, f]
@@ -605,6 +681,20 @@ class ObserverOfflineBatchTrainer:
         del filtered
         del grouped
         gc.collect()
+
+        # [NAN-FIX] Final pass for stocks with NO data (skipped in loop)
+        # Fill Prices (0-3) with 1.0
+        for f in range(4):
+             col_view = ochlv_array[:, :, f]
+             if np.isnan(col_view).any():
+                 col_view[np.isnan(col_view)] = 1.0
+                 
+        # Fill Volume (4) with 0.0
+        col_vol = ochlv_array[:, :, 4]
+        if np.isnan(col_vol).any():
+            col_vol[np.isnan(col_vol)] = 0.0
+
+        smart_print(f"[OFFLINE] Fixed missing stocks. NaNs remaining: {np.isnan(ochlv_array).sum()}")
 
         smart_print("[OFFLINE] Computing returns...")
         # Compute returns: (T_total, N)
@@ -719,6 +809,23 @@ class ObserverOfflineBatchTrainer:
         gc.collect()
 
         return result
+
+    def _register_gate_hook(self):
+        """
+        Register forward hook on Gating Router to inspect expert weights
+        without modifying model architecture.
+        """
+        if hasattr(self.observer.mafia_model, "signal_generator"):
+            router = self.observer.mafia_model.signal_generator.gating_router
+            router.register_forward_hook(self._capture_gate_weights_hook)
+            
+    def _capture_gate_weights_hook(self, module, input, output):
+        """
+        Hook callback to capture gate weights from Router output.
+        Router returns: (gate_weights, raw_context)
+        """
+        # Detach to ensure no graph retention issues
+        self._latest_gate_weights = output[0].detach()
 
     def _build_class_indices(
         self,
@@ -1283,6 +1390,7 @@ class ObserverOfflineBatchTrainer:
             breadth_gap_traj = np.zeros(T_actual, dtype=np.float32)
             div_signal_traj = np.zeros(T_actual, dtype=np.float32)
             signed_vpi_zscore_traj = np.zeros(T_actual, dtype=np.float32)
+            drawdown60_traj = np.zeros(T_actual, dtype=np.float32)
 
             # === 0. Vol_Std20: 20-day rolling volatility (for rebalancing, NOT Direction Head) ===
             # Compute returns from market closes
@@ -1374,6 +1482,18 @@ class ObserverOfflineBatchTrainer:
             vpi_zscore_full = (vpi_full - vpi_mean) / vpi_std
             vpi_zscore_full = np.clip(vpi_zscore_full, -3, 3)
 
+            # === 5. Drawdown60: (P_t - Max_P_{t-60..t}) / Max_P ===
+            # Calculates "depth" from recent 60-day peak.
+            dd60_full = np.zeros(len(market_closes), dtype=np.float32)
+            for i in range(1, len(market_closes)):
+                start_win = max(0, i - 60)
+                # Max High in window (using closes as proxy or Highs if available)
+                # Using Closes for simplicity and consistency with index data shape
+                window_max = np.max(market_closes[start_win : i+1])
+                curr_price = market_closes[i]
+                dd = (curr_price - window_max) / (window_max + 1e-8)
+                dd60_full[i] = dd
+
             # Fill trajectory arrays
             for t in range(T_actual):
                 idx = traj_offset + t
@@ -1405,7 +1525,7 @@ class ObserverOfflineBatchTrainer:
             for t in range(T_actual):
                 idx = traj_offset + t
                 if idx < len(drawdowns_full):
-                    dd60_traj[t] = drawdowns_full[idx]
+                    drawdown60_traj[t] = drawdowns_full[idx]
 
             batch_vol_std20.append(th.from_numpy(vol_std20_traj).to(self.device))
             batch_dc_event_flag.append(th.from_numpy(dc_event_flag_traj).to(self.device))
@@ -1413,7 +1533,7 @@ class ObserverOfflineBatchTrainer:
             batch_div_signal.append(th.from_numpy(div_signal_traj).to(self.device))
             batch_signed_vpi_zscore.append(th.from_numpy(signed_vpi_zscore_traj).to(self.device))
             # New field
-            batch_drawdown60.append(th.from_numpy(dd60_traj).to(self.device))
+            batch_drawdown60.append(th.from_numpy(drawdown60_traj).to(self.device))
 
         # Stack into batch tensors and move to device
         batch = TrajectoryBatch(
@@ -1475,6 +1595,12 @@ class ObserverOfflineBatchTrainer:
         Returns:
             Dict of loss values and metrics
         """
+        # Step-wise Gumbel Annealing (Smoother Decay)
+        # Update temp every step based on fractional epoch progress
+        if hasattr(self, "steps_per_epoch") and self.steps_per_epoch > 0:
+            fractional_epoch = epoch_idx + (batch_idx / float(self.steps_per_epoch))
+            self._current_temp = self.observer.update_temperature(fractional_epoch)
+
         B = batch.stock_ochlv.size(0)
         T_m = batch.stock_ochlv.size(1)
         _N = batch.stock_ochlv.size(
@@ -1507,6 +1633,9 @@ class ObserverOfflineBatchTrainer:
         collected_topk_indices = []  # List of (B, K) int tensors
         collected_risk_eta = []  # List of (B,) tensors with grad
         collected_direction_logits = []  # List of (B, 3) tensors
+
+        # [METRIC FIX] Collect unscaled returns for financial metrics
+        collected_unscaled_returns = []
 
         # Initialize 'prev_indices' for turnover calculation (held portfolio)
         # At t=0, previous portfolio is empty set.
@@ -1637,6 +1766,15 @@ class ObserverOfflineBatchTrainer:
                 market_ochlv_batch = th.stack(batch_windows_mkt, dim=0).to(
                     self.device
                 )  # (B, 1, 5, T_w)
+            
+            # [DEBUG] Check for NaNs in inputs (Critical input validation)
+            if th.isnan(ochlv_batch).any() or th.isinf(ochlv_batch).any():
+                smart_print(f"     ⚠️  [CRITICAL] NaN/Inf detected in ochlv_batch at t={t}")
+                raise ValueError(f"NaN in ochlv_batch at t={t}")
+            
+            if market_ochlv_batch is not None and (th.isnan(market_ochlv_batch).any() or th.isinf(market_ochlv_batch).any()):
+                smart_print(f"     ⚠️  [CRITICAL] NaN/Inf detected in market_ochlv_batch at t={t}")
+                raise ValueError(f"NaN in market_ochlv_batch at t={t}")
 
             # --- Check Regular Schedule Mask (Dynamic) ---
             # sched_mask = batch.rebalance_mask[:, t]  # OLD: Static mask
@@ -1761,6 +1899,7 @@ class ObserverOfflineBatchTrainer:
                     topk_indices,  # (B, K) - These are FRESH candidates
                     topk_embeddings,  # (B, K, D)
                     topk_scores,  # (B, K)
+                    market_logits,  # (B, N) - RAW LOGITS
                 ) = outputs
 
                 # Temperature scaling for direction head (sharpen/flatten)
@@ -1878,6 +2017,8 @@ class ObserverOfflineBatchTrainer:
 
             # Store in transient buffer
             risk_eta = th.nan_to_num(risk_eta, nan=1.0, posinf=1.0, neginf=1.0)
+            # Sanitize topk_scores to prevent NaN propagation in turnover calculation
+            topk_scores = th.nan_to_num(topk_scores, nan=0.0, posinf=10.0, neginf=-10.0)
             collected_topk_scores.append(topk_scores)
             collected_topk_indices.append(topk_indices)
             collected_risk_eta.append(risk_eta)
@@ -1929,13 +2070,15 @@ class ObserverOfflineBatchTrainer:
                 R_net = th.zeros(B, device=self.device)
                 baseline = th.zeros(B, device=self.device)
                 R_raw = th.zeros(B, device=self.device)
+                R_unscaled = th.zeros(B, device=self.device)
             else:
                 topk_idx = topk_indices  # (B, K)
                 gather_idx = topk_idx.unsqueeze(1).expand(-1, h_len, -1)
                 selected_returns = th.gather(future_returns_slice, 2, gather_idx)
                 compounded_stock_returns = th.prod(1 + selected_returns, dim=1) - 1
                 # Apply S_reward scaling (Spec §5.1.1) to amplify gradient signal
-                R_raw = self.scale_factor_reward * compounded_stock_returns.mean(dim=1)
+                R_unscaled = compounded_stock_returns.mean(dim=1)
+                R_raw = self.scale_factor_reward * R_unscaled
                 baseline = self.scale_factor_reward * (
                     th.prod(1 + market_returns_slice, dim=1) - 1
                 )
@@ -1945,16 +2088,54 @@ class ObserverOfflineBatchTrainer:
             symdiff = th.zeros(B, device=self.device)
 
             if t > 0:
-                # Compute Turnover & SymDiff
+                # Compute Penalties
+                # 1. SymDiff (Membership Change Cost) - Set Based
+                # SymDiff = 2 * (K - Intersection) / K
                 for b_i in range(B):
                     curr_set = set(topk_indices[b_i].cpu().tolist())
                     prev_set = set(prev_indices[b_i].cpu().tolist())
 
                     held_count = len(curr_set.intersection(prev_set))
-                    t_val = (self.K - held_count) / self.K
-                    turnover[b_i] = t_val
                     s_val = (2 * (self.K - held_count)) / self.K
                     symdiff[b_i] = s_val
+                
+                # 2. Turnover (Re-weighting Cost) - Weight Based (L1 Distance)
+                # Turnover = 0.5 * sum(|w_t - w_{t-1}|)
+                # Reconstruct full weight vectors (B, N)
+                # Weights are derived from scores (normalized). Assuming Softmax was applied to raw logits.
+                # However, topk_scores are typically log_probs or logits.
+                # For fairness, we should use the implied portfolio weights.
+                # If we assume equal weight on Top-K, Turnover == SymDiff/2.
+                # But here we use `topk_scores` (softmax probs).
+                
+                # Normalizing scores to sum to 1 (Portfolio Weights)
+                # curr_weights (B, K) -> Scatter to (B, N)
+                # prev_weights (B, K) -> Scatter to (B, N)
+                
+                N_stocks = batch.stock_ochlv.shape[2]
+                
+                curr_w_vector = th.zeros(B, N_stocks, device=self.device)
+                curr_local_w = F.softmax(topk_scores, dim=1) # Normalize selected scores to legitimate weights
+                curr_w_vector.scatter_(1, topk_indices, curr_local_w)
+                
+                prev_w_vector = th.zeros(B, N_stocks, device=self.device)
+                
+                # BUGFIX: We appended current scores to `collected_topk_scores` at line 1980.
+                # So `collected[-1]` is CURRENT step. `collected[-2]` is PREVIOUS.
+                if len(collected_topk_scores) >= 2:
+                     p_scores = collected_topk_scores[-2]
+                     p_idx = collected_topk_indices[-2]
+                     prev_local_w = F.softmax(p_scores, dim=1)
+                     prev_w_vector.scatter_(1, p_idx, prev_local_w)
+                
+                # L1 Distance
+                weight_diff = (curr_w_vector - prev_w_vector).abs().sum(dim=1) # (B,)
+                if th.isnan(weight_diff).any():
+                     smart_print(f"     ⚠️  [WARN] NaN in turnover weight_diff at t={t}. (Should not happen with stable logits).")
+                     # weight_diff = th.nan_to_num(weight_diff, nan=0.0) # Removed mask
+                turnover = 0.5 * weight_diff
+                turnover = th.clamp(turnover, 0.0, 1.0) # Ensure range [0, 1]
+
 
             # Trend Holding Reward (R_hold)
             # Bonus for holding profitable stocks (Trend Following)
@@ -1964,22 +2145,36 @@ class ObserverOfflineBatchTrainer:
             
             r_hold = th.zeros(B, device=self.device)
             if self.r_hold_alpha > 0 and h_len > 0:
-                next_day_ret = future_returns_slice[:, 0, :]  # (B, N)
-                # Alpha Hold Bonus: Require return > 0 AND return > market_return
-                market_ret_b = market_returns_slice[:, 0] # (B,)
-                prof_mask = ((next_day_ret > 0) & (next_day_ret > market_ret_b.unsqueeze(1))).float()
+                # OPTIMIZED HOLD REWARD: "Adaptive Duration Winner"
+                # Instead of 1-day check, we check consistency over the full horizon (h_len).
+                # Score = (Count of Days where R_stock > R_mkt AND R_stock > 0) / h_len
                 
-                # Construct Binary Mask of Current Portfolio
+                # 1. Identify winning days (B, h, N)
+                # Expand market returns for broadcast: (B, h) -> (B, h, 1)
+                mkt_ret_expanded = market_returns_slice.unsqueeze(-1)
+                
+                # Check condition: Stock > Market AND Stock > 0
+                win_day_mask = (future_returns_slice > mkt_ret_expanded) & (future_returns_slice > 0)
+                
+                # 2. Compute Consistency Score per Stock (B, N) -> range [0.0, 1.0]
+                stock_win_consistency = win_day_mask.float().sum(dim=1) / float(h_len)
+                
+                # 3. Construct Binary Mask of Currently Held Portfolio (B, N)
                 curr_holdings = th.zeros(B, N_action, device=self.device)
                 curr_holdings.scatter_(1, topk_indices, 1.0)
                 
-                # Intersection: Held Yesterday AND Held Today AND Profitable
-                # rewarding "Gồng Lời" (Holding Winners)
-                gong_loi_mask = prev_holdings * curr_holdings * prof_mask
+                # 4. Filter only Held Stocks (Intersection: Prev & Curr)
+                held_mask = prev_holdings * curr_holdings # (B, N)
                 
-                hold_prof_count = gong_loi_mask.sum(dim=1)  # (B,)
-                # Normalize
-                r_hold = self.r_hold_alpha * (hold_prof_count / self.K)
+                # 5. Sum Scores for Held Stocks
+                # If we hold a stock that wins 100% of days, we get full points.
+                # If we hold a stock that wins 0% of days, we get 0 points.
+                portfolio_win_score = (stock_win_consistency * held_mask).sum(dim=1) # (B,)
+                
+                # 6. Apply Reward Scale
+                # r_hold = alpha * (Sum_Scores / K)
+                # Max potential r_hold = alpha (if we hold K stocks that win every day)
+                r_hold = self.r_hold_alpha * (portfolio_win_score / self.K)
 
             # Penalties
 
@@ -2000,7 +2195,7 @@ class ObserverOfflineBatchTrainer:
 
             # Normalize Advantage (Batch statistics)
             A_mean = A_t_raw.mean()
-            eps = 1e-8
+            eps = 1e-5  # Increased from 1e-8 for small batch stability
             if B > 1:
                 A_std = A_t_raw.std() + eps
             else:
@@ -2009,6 +2204,7 @@ class ObserverOfflineBatchTrainer:
 
             # Store for Post-Loop Loss Calc (still needed for backprop)
             collected_raw_returns.append(R_raw)
+            collected_unscaled_returns.append(R_unscaled) # [METRIC FIX]
             collected_turnovers.append(turnover)
             collected_symdiffs.append(symdiff)
             collected_rewards.append(R_net)
@@ -2107,9 +2303,14 @@ class ObserverOfflineBatchTrainer:
             eta_val = risk_eta[b].item()
 
             # PG Loss Estimate (Pend)
-            log_probs = th.log(
-                th.gather(market_scores_full, 1, topk_indices) + eps
-            )  # (B, K)
+            # Sanitize market_logits to prevent NaN propagation
+            if th.isnan(market_logits).any() or th.isinf(market_logits).any():
+                market_logits = th.nan_to_num(market_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            # Use stable log_softmax on logits
+            log_market_probs = F.log_softmax(market_logits, dim=-1)  # (B, N)
+            
+            log_probs = th.gather(log_market_probs, 1, topk_indices) # (B, K)
+
             imp_weights = th.ones_like(log_probs)
             # Spec §5.1.1: Advantage must be detached to prevent gradient flow through it
             # This ensures model learns to change π(a|s), not "hack" the reward
@@ -2118,8 +2319,10 @@ class ObserverOfflineBatchTrainer:
             )  # (B,)
 
             # Entropy bonus on full distribution (spec 5.1.1)
-            # H(π) = -Σ p_i × log(p_i) - encourages exploration over N stocks
-            entropy = -(market_scores_full * th.log(market_scores_full + eps)).sum(
+            # H(π) = -Σ p_i × log(p_i)
+            # Use probs * log_probs for stability (0 * -inf handled by torch usually? No, but probs will be 0)
+            # Actually, log_softmax output is safe. 
+            entropy = -(market_scores_full * log_market_probs).sum(
                 dim=1
             )  # (B,)
 
@@ -2132,19 +2335,32 @@ class ObserverOfflineBatchTrainer:
                 self.risk_criterion(risk_eta, risk_target) * self.risk_scaling_factor
             )
 
+            # [NAN-FIX] Input Guard for Direction Loss
             dir_target = batch.direction_labels[:, t]
-            dir_loss = self.dir_criterion(direction_logits, dir_target)
+            
+            if th.isnan(direction_logits).any():
+                smart_print(f"     ⚠️  [WARN] NaN detected in direction_logits at t={t}. Skipping DirLoss.")
+                dir_loss = th.tensor(0.0, device=self.device, requires_grad=True)
+                # Sample loss also undefined
+                dir_loss_sample = th.zeros(1, device=self.device)
+            else:
+                dir_loss = self.dir_criterion(direction_logits, dir_target)
+                
+                # Sample-specific Losses (for logging only)
+                # Compute sample loss here to match logic
+                dir_loss_sample = self.dir_criterion(
+                    direction_logits[b : b + 1], dir_target[b : b + 1]
+                )
 
-            # Sample-specific Losses (for logging only)
+            # Sample-specific Losses (Risk is fine usually unless eta is NaN)
             risk_loss_sample = (
                 self.risk_criterion(
                     risk_eta[b : b + 1], risk_target[b : b + 1]
                 )
                 * self.risk_scaling_factor
             )
-            dir_loss_sample = self.dir_criterion(
-                direction_logits[b : b + 1], dir_target[b : b + 1]
-            )
+            # dir_loss_sample is computed above or dummy
+
 
             pg_val = step_loss_val[b].item() if is_rebalance_b0 else 0.0
 
@@ -2195,19 +2411,31 @@ class ObserverOfflineBatchTrainer:
 
             # 3. Net & Advantage
             r_net_val = R_net[b].item()
-            net_str = f"NetReward={r_net_val:+.4f}"
+            net_str = f"R_total={r_net_val:+.4f}"
             
             # Hold Bonus Logging
             hold_val = r_hold[b].item()
-            # Check if this step is masked (not rebalancing)
-            is_rebal_b = effective_mask[b].item() > 0.5
-            mask_suffix = "" if is_rebal_b else " (Masked)"
+            # User request: Don't show (Masked) if reward is active
+            # The reward is always added to R_net, so it's always "active" for evaluation
+            mask_suffix = "" 
             
             # Always display HoldBonus, even if 0.0, to keep log format consistent
-            hold_str = f"HoldBonus={hold_val:+.4f}{mask_suffix}"
+            # [LOGGING] Add Consistency/WinRate details if available
+            if "portfolio_win_score" in locals():
+                score_val = portfolio_win_score[b].item()
+                # Score is sum of consistency scores. Avg Consistency = Score / Held_Count
+                if held > 0:
+                    avg_consistency = score_val / held
+                else:
+                    avg_consistency = 0.0
+                consist_str = f" | Consistency={avg_consistency:.2f}(Sum={score_val:.1f})"
+            else:
+                consist_str = ""
+
+            hold_str = f"R_hold={hold_val:+.4f}{mask_suffix}{consist_str}"
 
             adv_str = (
-                f"Baseline={baseline[b].item():+.4f} | "
+                f"R_baseline={baseline[b].item():+.4f} | "
                 f"Advantage={A_t_raw[b].item():+.4f}"
             )
 
@@ -2233,6 +2461,29 @@ class ObserverOfflineBatchTrainer:
             smart_print(
                 f"     🔮 Forecast:  Risk(η)={eta_val:.2f}(Tg={risk_target[b].item():.2f}) | Dir={dir_pred_str}{correct_dir} [{logits_str}]"
             )
+
+            # --- Consistency Check Logging (Hook Data) ---
+            if self._latest_gate_weights is not None:
+                # Get weights for this batch item (take last captured if multiple passes, usually fine for step-by-step)
+                # Ensure shape match: (B, 4)
+                if self._latest_gate_weights.size(0) > b:
+                    w_tech = self._latest_gate_weights[b, 0].item() * 100
+                    w_dc1 = self._latest_gate_weights[b, 1].item() * 100
+                    w_dc2 = self._latest_gate_weights[b, 2].item() * 100
+                    w_dc3 = self._latest_gate_weights[b, 3].item() * 100
+                    
+                    gate_str = f"Tech={w_tech:.1f}%, DC1={w_dc1:.1f}%, DC2={w_dc2:.1f}%, DC3={w_dc3:.1f}%"
+                    smart_print(f"     🧩 Gate:      {gate_str}")
+                    
+                    # Detection Logic
+                    # Inconsistency 1: Bear Forecast but High Tech Allocation
+                    if pred_state_b == 0 and w_tech > 50.0: # Bear
+                        smart_print(f"     ⚠️  [DETECT] Inconsistency: Bearish forecast but relying heavily on Tech Expert ({w_tech:.1f}%)")
+                    
+                    # Inconsistency 2: Bull Forecast but Low Tech Allocation (Avoiding Trend)
+                    if pred_state_b == 2 and w_tech < 20.0: # Bull
+                        smart_print(f"     ⚠️  [DETECT] Inconsistency: Bullish forecast but avoiding Tech Expert ({w_tech:.1f}%)")
+
 
             if t == T_m - 1:
                 # End of trajectory - show batch-wide statistics
@@ -2421,8 +2672,8 @@ class ObserverOfflineBatchTrainer:
                         "c_mkt_norm": market_context[b_log].norm().item(),
                         "c_mkt_diff": c_mkt_diff_b,
                         "raw_return": R_raw[b_log].item(),
-                        "turnover_penalty": turnover[b_log].item() * self.alpha_turnover,
-                        "symdiff_penalty": symdiff[b_log].item() * self.alpha_change,
+                        "turnover_penalty": turnover[b_log].item() * self.alpha_turnover * lambda_epoch, # Log EFFECTIVE penalty
+                        "symdiff_penalty": symdiff[b_log].item() * self.alpha_change * lambda_epoch, # Log EFFECTIVE penalty
                         "net_reward": R_net[b_log].item(),
                         "baseline": baseline[b_log].item(),
                         "advantage": A_t_raw[b_log].item(),
@@ -2521,6 +2772,7 @@ class ObserverOfflineBatchTrainer:
 
         # Compute returns, advantages, and penalties for epoch summary
         if collected_raw_returns and collected_baselines and collected_rewards:
+            all_return_ratios = th.stack(collected_unscaled_returns, dim=1) # [METRIC FIX] (B, T_m)
             all_returns = th.stack(collected_raw_returns, dim=1)  # (B, T_m)
             all_rewards = th.stack(collected_rewards, dim=1)  # (B, T_m)
             all_baselines = th.stack(collected_baselines, dim=1)  # (B, T_m)
@@ -2530,11 +2782,11 @@ class ObserverOfflineBatchTrainer:
             all_hold_rewards = th.stack(collected_hold_rewards, dim=1) if collected_hold_rewards else None
 
             # Mean across time for each trajectory
-            batch_returns = all_returns.mean(dim=1).cpu().numpy()  # (B,)
-            batch_advantages = all_raw_advantages.mean(dim=1).cpu().numpy()  # (B,)
-            batch_net_rewards = all_rewards.mean(dim=1).cpu().numpy()  # (B,)
-            batch_turn_pens = (all_turnovers * self.alpha_turnover).mean(dim=1).cpu().numpy()  # (B,)
-            batch_symdiff_pens = (all_symdiffs * self.alpha_change).mean(dim=1).cpu().numpy()  # (B,)
+            batch_returns = all_returns.detach().mean(dim=1).cpu().numpy()  # (B,)
+            batch_advantages = all_raw_advantages.detach().mean(dim=1).cpu().numpy()  # (B,)
+            batch_net_rewards = all_rewards.detach().mean(dim=1).cpu().numpy()  # (B,)
+            batch_turn_pens = (all_turnovers.detach() * self.alpha_turnover).mean(dim=1).cpu().numpy()  # (B,)
+            batch_symdiff_pens = (all_symdiffs.detach() * self.alpha_change).mean(dim=1).cpu().numpy()  # (B,)
         else:
             batch_returns = np.array([])
             batch_advantages = np.array([])
@@ -2552,10 +2804,10 @@ class ObserverOfflineBatchTrainer:
             # batch_topk_indices = th.stack(collected_topk_indices, dim=1)  # Unused for current metric calc
             
             selection_metrics = self.compute_selection_metrics(
-                returns=all_returns,
-                turnover=all_turnovers,
-                advantages=all_raw_advantages,
-                hold_rewards=all_hold_rewards
+                returns=all_return_ratios.detach(), # [METRIC FIX] Use unscaled return ratios
+                turnover=all_turnovers.detach(),
+                advantages=all_raw_advantages.detach(),
+                hold_rewards=all_hold_rewards.detach() if all_hold_rewards is not None else None
             )
         else:
             selection_metrics = {
@@ -2574,7 +2826,7 @@ class ObserverOfflineBatchTrainer:
             batch_dir_labels = batch.direction_labels[:, :T_m]
             
             direction_metrics = self.compute_direction_metrics(
-                direction_logits=batch_dir_logits,
+                direction_logits=batch_dir_logits.detach(),
                 direction_labels=batch_dir_labels
             )
         else:
@@ -2598,7 +2850,7 @@ class ObserverOfflineBatchTrainer:
              batch_risk_target = batch.risk_targets[:, :T_m]
              
              risk_metrics_val = self.compute_risk_metrics(
-                 risk_pred=batch_risk_pred,
+                 risk_pred=batch_risk_pred.detach(),
                  risk_target=batch_risk_target
              )
         else:
@@ -2733,10 +2985,17 @@ class ObserverOfflineBatchTrainer:
             available_starts = T_total - self.T_m - self.horizon - self.T_w
             # Use ceiling division to ensure full data coverage
             steps_per_epoch = max(1, int(np.ceil(available_starts / self.batch_size)))
+        
+        # Store for step-wise annealing
+        self.steps_per_epoch = steps_per_epoch
 
         self._epoch += 1
         # Update curriculum penalty weight based on current epoch (Spec §7.1)
         self._current_lambda_epoch = self._compute_lambda_epoch(self._epoch)
+
+        # Removed epoch-wise update in favor of step-wise in collect_and_train_step
+        # self._current_temp = self.observer.update_temperature(self._epoch)
+        # smart_print(f"🔥 Epoch {self._epoch} | Lambda: {self._current_lambda_epoch:.2f}") - We will log temp in step or just rely on existing logs
 
         epoch_metrics = {
             "loss_total": 0.0,
@@ -2781,6 +3040,14 @@ class ObserverOfflineBatchTrainer:
         acc_reward_net = 0.0
         acc_turnover_pen = 0.0
         acc_symdiff_pen = 0.0
+        
+        # [DEBUG] Check Weights
+        dir_head = self.observer.mafia_model.signal_generator.direction_head
+        if th.isnan(dir_head.classifier.weight).any() or th.isnan(dir_head.classifier.bias).any():
+             smart_print("     🔥 [CRITICAL] DirectionHead weights/bias contain NaN at START of epoch!")
+        else:
+             smart_print("     ✅ DirectionHead weights legitimate at START.")
+
 
         # Tracking for epoch-level direction summary
         epoch_dir_preds = []  # List of prediction arrays
@@ -3195,17 +3462,35 @@ class ObserverOfflineBatchTrainer:
         mean_return = returns.mean().item()
         std_return = returns.std().item()
 
-        # Sharpe Ratio (Ann.) = Mean / Std * sqrt(252/h)
+        # Get Risk-Free Rate (Annual %)
+        # Default to 4.2% (Vietnam 10Y Bond Yield) if not specified
+        rf_annual_percent = self.config.mkt_rf.get(self.config.market_name, 4.2)
+        rf_annual = rf_annual_percent / 100.0
+        
+        # Convert to period (horizon) Rf using Geometric Formula
+        # R_daily = (1 + R_annual)^(1/252) - 1
+        # R_period = (1 + R_annual)^(horizon/252) - 1
+        horizon = max(getattr(self, "pg_reward_horizon", 14), 1)
+        rf_period = (1 + rf_annual) ** (horizon / 252.0) - 1
+        
+        # Excess Return for Sharpe Calculation
+        # [METRIC FIX] returns are Raw Ratios (e.g. 0.015), not Percent
+        # So rf_period must also remain Raw Ratio.
+        rf_period_percent = rf_period  # No x100 scaling
+        
+        excess_mean_return = mean_return - rf_period_percent
+        
+        # Sharpe Ratio (Ann.) = (Mean - Rf) / Std * sqrt(252/h)
         if std_return > 1e-6:
-            # Note: This is simplified Sharpe (assuming Rf=0)
-            sharpe = (mean_return / std_return) * (annual_factor**0.5)
+            sharpe = (excess_mean_return / std_return) * (annual_factor**0.5)
         else:
             sharpe = 0.0
 
         # Review confirmed: Turnover, Advantage, HoldReward, Direction, Risk are OK.
         # Fix: Annualize Return and Volatility for consistency with Sharpe Ratio
-        metrics["mean_return"] = mean_return * annual_factor
-        metrics["volatility"] = std_return * (annual_factor**0.5)
+        # Output as Percent for readability (0.27 -> 27.0)
+        metrics["mean_return"] = mean_return * annual_factor * 100.0
+        metrics["volatility"] = std_return * (annual_factor**0.5) * 100.0
         metrics["sharpe_ratio"] = sharpe
         metrics["turnover"] = turnover.mean().item()
         metrics["topk_advantage"] = advantages.mean().item() if advantages is not None else 0.0
@@ -3358,6 +3643,7 @@ class ObserverOfflineBatchTrainer:
         total_net_reward = 0.0
         total_turnover_penalty = 0.0
         total_symdiff_penalty = 0.0
+        total_hold_reward = 0.0  # [NEW] Accumulator
 
         # Accumulators for metric computation
         # Tensors for metric computation (for compute_selection_metrics)
@@ -3433,9 +3719,15 @@ class ObserverOfflineBatchTrainer:
                 curr_batch_rewards = []
                 curr_batch_net = []
                 curr_batch_turnover = []
+                # Reward collections
+                curr_batch_rewards = []
+                curr_batch_net = []
+                curr_batch_hold_rewards = []  # [NEW]
+                curr_batch_turnover = []
                 curr_batch_symdiff = []
 
                 prev_indices_tensor = None
+                prev_scores_tensor = None
 
                 for t in range(T_m):
                     # Build windows
@@ -3487,9 +3779,8 @@ class ObserverOfflineBatchTrainer:
                     dc_flag_value = batch.dc_event_flag[:, t : t + 1]  # (B, 1) - already binary [0, 1]
                     breadth_gap_value = batch.breadth_gap[:, t : t + 1]  # (B, 1) - already normalized [-1, 1]
                     div_signal_value = batch.div_signal[:, t : t + 1]  # (B, 1) - already {-1, 0, 1}
-                    vpi_zscore_value = batch.signed_vpi_zscore[:, t : t + 1]  # (B, 1) - already z-scored [-3, 3]
+                    vpi_zscore_value = batch.signed_vpi_zscore[:, t : t + 1] # (B, 1)
                     drawdown60_value = batch.drawdown60[:, t : t + 1] # (B, 1)
-
                     # Signals are already normalized during computation, concat directly
                     explicit_signals = th.cat(
                         [
@@ -3501,6 +3792,12 @@ class ObserverOfflineBatchTrainer:
                             drawdown60_value,
                         ], dim=-1
                     )  # (B, 6)
+                    
+                    # [NAN-FIX] Sanitize Explicit Signals
+                    # Force sanitization to prevent Inf/NaN from crashing DirectionHead/RiskHead
+                    # (Conditional check proved unreliable on MPS)
+                    explicit_signals = th.nan_to_num(explicit_signals, nan=0.0, posinf=5.0, neginf=-5.0)
+                    explicit_signals = th.clamp(explicit_signals, min=-10.0, max=10.0)
 
                     outputs = self.observer.mafia_model(
                         ochlv_data=ochlv_batch,
@@ -3509,6 +3806,8 @@ class ObserverOfflineBatchTrainer:
                         router_context_buffer=batch_context_buffer,
                         explicit_signals=explicit_signals,
                     )
+
+
 
                     (
                         market_vector,
@@ -3519,7 +3818,14 @@ class ObserverOfflineBatchTrainer:
                         topk_indices,
                         topk_embeddings,
                         topk_scores,
+                        market_logits,
                     ) = outputs
+                    
+                    # [DEBUG] Check Backbone Output
+                    if th.isnan(market_context).any() or th.isinf(market_context).any():
+                         smart_print(f"     [DEBUG] NaN/Inf in market_context (Backbone) at t={t}")
+                    if th.isnan(direction_logits).any() or th.isinf(direction_logits).any():
+                         smart_print(f"     [DEBUG] NaN/Inf in direction_logits (Head) at t={t}")
 
                     # Temperature scaling for direction head (sharpen/flatten)
                     if self.direction_temperature != 1.0:
@@ -3580,6 +3886,7 @@ class ObserverOfflineBatchTrainer:
                     if h_len == 0:
                         R_raw = th.zeros(B, device=self.device)
                         baseline = th.zeros(B, device=self.device)
+                        R_unscaled = th.zeros(B, device=self.device) # [METRIC FIX]
                     else:
                         gather_idx = final_indices.unsqueeze(1).expand(-1, h_len, -1)
                         selected_returns = th.gather(
@@ -3595,6 +3902,12 @@ class ObserverOfflineBatchTrainer:
                         baseline = self.scale_factor_reward * (
                             th.prod(1 + market_returns_slice, dim=1) - 1
                         )
+                        # [METRIC FIX] Store UN-SCALED return for metrics
+                        R_unscaled = compounded_stock_returns.mean(dim=1)
+
+                    collected_raw_returns.append(R_raw)
+                    collected_baselines.append(baseline)
+                    collected_unscaled_returns.append(R_unscaled) # [METRIC FIX]
 
                     turnover = th.zeros(B, device=self.device)
                     symdiff = th.zeros(B, device=self.device)
@@ -3603,10 +3916,24 @@ class ObserverOfflineBatchTrainer:
                             curr_set = set(final_indices[b_i].cpu().tolist())
                             prev_set = set(prev_indices_tensor[b_i].cpu().tolist())
                             held_count = len(curr_set.intersection(prev_set))
-                            t_val = (self.K - held_count) / self.K
-                            turnover[b_i] = t_val
                             s_val = (2 * (self.K - held_count)) / self.K
                             symdiff[b_i] = s_val
+                            
+                        # Turnover (Weight Based)
+                        N_stocks = batch.stock_ochlv.shape[2]
+                        
+                        curr_w_vector = th.zeros(B, N_stocks, device=self.device)
+                        curr_local_w = F.softmax(final_scores, dim=1)
+                        curr_w_vector.scatter_(1, final_indices, curr_local_w)
+                        
+                        prev_w_vector = th.zeros(B, N_stocks, device=self.device)
+                        if prev_scores_tensor is not None:
+                             prev_local_w = F.softmax(prev_scores_tensor, dim=1)
+                             prev_w_vector.scatter_(1, prev_indices_tensor, prev_local_w)
+                        
+                        
+                        turnover = 0.5 * (curr_w_vector - prev_w_vector).abs().sum(dim=1)
+                        turnover = th.clamp(turnover, 0.0, 1.0) # Ensure range [0, 1]
 
                     # VALIDATION MODE: Always use full penalty (no curriculum learning)
                     lambda_epoch = 1.0
@@ -3615,7 +3942,40 @@ class ObserverOfflineBatchTrainer:
                     )
                     penalty = lambda_epoch * penalty_sum
                     
-                    R_net = R_raw - penalty
+                    # [NEW] R_hold Calculation (Validation)
+                    # Consistency Score = (Count of Days where R_stock > R_mkt AND R_stock > 0) / h_len
+                    if h_len > 0:
+                        # Expand market returns for broadcast: (B, h) -> (B, h, 1)
+                        mkt_ret_expanded = market_returns_slice.unsqueeze(-1)
+                        # Check condition: Stock > Market AND Stock > 0
+                        win_day_mask = (future_returns_slice > mkt_ret_expanded) & (future_returns_slice > 0)
+                        # Score per Stock (B, N)
+                        stock_consistency = win_day_mask.float().sum(dim=1) / float(h_len)
+                        
+                        # Current Holdings Mask (B, N)
+                        curr_holdings = th.zeros(B, self.observer.action_dim, device=self.device)
+                        curr_holdings.scatter_(1, final_indices, 1.0)
+                        
+                        # Previous Holdings Mask (for continuity check - optional, but logical given intent)
+                        # However, for R_hold, do we require holding from t-1? The spec says "Held Stocks".
+                        # In training, we use `prev_holdings * curr_holdings`.
+                        # Here, `prev_indices_tensor` is available.
+                        if prev_indices_tensor is not None:
+                            prev_h = th.zeros(B, self.observer.action_dim, device=self.device)
+                            prev_h.scatter_(1, prev_indices_tensor, 1.0)
+                            held_mask = prev_h * curr_holdings
+                        else:
+                            held_mask = curr_holdings # First step, treat current as held? Or 0? Usually 0 if no prev.
+                        
+                        # Sum Scores
+                        portfolio_win_score = (stock_consistency * held_mask).sum(dim=1)
+                        
+                        # Scale
+                        r_hold = self.r_hold_alpha * (portfolio_win_score / self.K)
+                    else:
+                        r_hold = th.zeros(B, device=self.device)
+
+                    R_net = R_raw + r_hold - penalty
                     A_t_raw = R_net - baseline
                     A_mean = A_t_raw.mean()
                     A_std = A_t_raw.std() + eps if B > 1 else 1.0
@@ -3662,6 +4022,7 @@ class ObserverOfflineBatchTrainer:
                     
                     curr_batch_rewards.append(R_raw.mean().item()) # Mean across batch
                     curr_batch_net.append(R_net.mean().item())
+                    curr_batch_hold_rewards.append(r_hold.mean().item()) # [NEW]
                     
                     # For penalties, meaningful only if rebalance occurred? 
                     # If we hold, turnover=0. So summing 0s works fine for average.
@@ -3669,11 +4030,15 @@ class ObserverOfflineBatchTrainer:
                     curr_batch_symdiff.append((symdiff * lambda_epoch * self.alpha_change).mean().item())
 
                     # Collect tensors for compute_selection_metrics
-                    all_return_tensors.append(R_raw)
+                    # [METRIC FIX] Use UN-SCALED returns for financial metrics
+                    # R_raw is scaled by scale_factor_reward (100.0) for RL stability
+                    all_return_tensors.append(compounded_stock_returns.mean(dim=1)) 
                     all_turnover_tensors.append(turnover)
                     all_advantage_tensors.append(A_t_raw)
 
-                    # Collect outputs
+                    # Collect outputs (sanitize to prevent NaN propagation)
+                    final_scores = th.nan_to_num(final_scores, nan=0.0, posinf=10.0, neginf=-10.0)
+                    risk_eta = th.nan_to_num(risk_eta, nan=1.0, posinf=1.0, neginf=1.0)
                     collected_topk_scores.append(final_scores)
                     collected_topk_indices.append(final_indices)
                     collected_risk_eta.append(risk_eta)
@@ -3685,6 +4050,7 @@ class ObserverOfflineBatchTrainer:
                     batch_context_buffer = th.cat([history_part, new_part], dim=1)
 
                     prev_indices_tensor = final_indices
+                    prev_scores_tensor = final_scores
 
             # Stack collected outputs
             topk_scores_stack = th.stack(collected_topk_scores, dim=1)
@@ -3709,16 +4075,22 @@ class ObserverOfflineBatchTrainer:
             total_loss_risk += avg_risk
             total_loss_dir += avg_dir
             
-            # Aggregate Rewards
+            # Rewards and Hold Bonus
             avg_rew = sum(curr_batch_rewards) / len(curr_batch_rewards) if curr_batch_rewards else 0.0
             avg_net = sum(curr_batch_net) / len(curr_batch_net) if curr_batch_net else 0.0
             avg_turn = sum(curr_batch_turnover) / len(curr_batch_turnover) if curr_batch_turnover else 0.0
             avg_sym = sum(curr_batch_symdiff) / len(curr_batch_symdiff) if curr_batch_symdiff else 0.0
             
+            # [NEW] Average Hold Reward
+            # Note: collected_hold_rewards might be empty if horizon=0 or other edge cases
+            # We need to collect it in the loop first!
+            avg_hold_reward = sum(curr_batch_hold_rewards) / len(curr_batch_hold_rewards) if curr_batch_hold_rewards else 0.0
+            
             total_reward += avg_rew
             total_net_reward += avg_net
             total_turnover_penalty += avg_turn
             total_symdiff_penalty += avg_sym
+            total_hold_reward += avg_hold_reward # Need this accumulator initialized
 
             # Store for metric computation
             all_topk_indices.append(topk_indices_stack)
@@ -3741,6 +4113,7 @@ class ObserverOfflineBatchTrainer:
         avg_net_reward = total_net_reward / steps
         avg_turnover_penalty = total_turnover_penalty / steps
         avg_symdiff_penalty = total_symdiff_penalty / steps
+        avg_hold_reward = total_hold_reward / steps # [NEW]
 
         # Concatenate all batches for metric computation
         all_topk_indices_cat = th.cat(all_topk_indices, dim=0)
@@ -3796,6 +4169,7 @@ class ObserverOfflineBatchTrainer:
             risk_correlation=risk_metrics["correlation"],
             # NEW fields
             topk_advantage=selection_metrics.get("topk_advantage", 0.0),
+            topk_hold_reward=avg_hold_reward, # [NEW]
             reward=avg_reward,
             net_reward=avg_net_reward,
             turnover_penalty=avg_turnover_penalty,
