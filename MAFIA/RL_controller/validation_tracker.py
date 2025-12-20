@@ -7,7 +7,7 @@ This module implements rank-based normalization for CES (Composite Efficiency Sc
 computation per Spec §7.1164-1178.
 
 CES Formula:
-    CES = 1.0 × S_sharpe + 0.5 × S_dir_f1 + 0.5 × (1 - S_risk_mse)
+    CES = 0.5 × S_sharpe + 0.3 × S_dir_f1 + 0.2 × (1 - S_risk_mse)
     
 Where S_* are rank-normalized scores:
     1. Rank all checkpoints from worst (1) to best (N)

@@ -779,14 +779,11 @@ class DenseMoEGatingRouter(nn.Module):
             nn.Softmax(dim=-1),  # Normalize weights to sum to 1
         )
         
-        # Smart Init: Bias towards Technical Agent (Expert 0)
+        # Balanced Init: Equal weight for all experts
         # Experts: 0=Tech, 1=DC(Slow), 2=DC(Med), 3=DC(Fast)
-        # Set bias of final linear layer to give slight preference to Tech
+        # Set bias to zero -> Softmax -> [0.25, 0.25, 0.25, 0.25]
         with th.no_grad():
-             # gate_network[-2] is the Linear layer before Softmax
-             # Bias init: [1.0, 0.0, 0.0, 0.0] -> Softmax -> [~0.47, ~0.17, ~0.17, ~0.17]
              self.gate_network[-2].bias.zero_()
-             self.gate_network[-2].bias[0] = 1.0
 
         # Signal Decoupling Adapters (Task-Specific Views)
         # Selection Adapter: Projects raw context for Gating (Selection Task)
@@ -958,7 +955,8 @@ class DirectionHead(nn.Module):
         self.res_fc2 = nn.Linear(self.D, self.D)
         self.res_dropout = nn.Dropout(self.dropout_rate)
 
-        # Wide Path: No transformation (explicit signals bypass to fusion)
+        # Wide Path: Explicit Norm (Robustness)
+        self.explicit_norm = nn.LayerNorm(self.explicit_dim)
 
         # Classification Head: Late Fusion (D + 4 -> 3)
         self.classifier = nn.Linear(self.D + self.explicit_dim, self.num_classes)
@@ -1008,7 +1006,8 @@ class DirectionHead(nn.Module):
             self.classifier.weight[2, self.D + 0] = -0.2  # High Vol decreases Bull prob
 
             # 1. DC Event Flag (Index D+1) - Strongest Signal (Trend Break)
-            self.classifier.weight[:, self.D + 1] = 0.0
+            # Was 0.0 (blocked gradient), now 0.05 to allow learning start
+            self.classifier.weight[:, self.D + 1] = 0.05
 
             # 2. Breadth_Gap (Index D+2) - "Xanh vỏ đỏ lòng"
             self.classifier.weight[0, self.D + 2] = -0.3 # Neg Gap -> Bear
@@ -1053,22 +1052,9 @@ class DirectionHead(nn.Module):
             logits: (B, 3) - Bear/Side/Bull classification logits
         """
         # === 0. Signal Scaling (Robustness) ===
-        # Volatility ~ 0.015, Gap ~ 10.0. huge discrepancy.
-        # Scale to ~ [-1, 1] or [0, 1] range.
-        c_vol = 100.0   # 0.01 -> 1.0
-        c_gap = 0.1     # 10.0 -> 1.0
-        c_vpi = 0.5     # 2.0 -> 1.0
-
-        # Create scaled copy to avoid modifying original tensor inplace (safety)
-        signals_scaled = explicit_signals.clone()
-        
-        # Vol_Std20 (idx 0)
-        signals_scaled[:, 0] = signals_scaled[:, 0] * c_vol
-        # Breadth_Gap (idx 2)
-        signals_scaled[:, 2] = signals_scaled[:, 2] * c_gap
-        # Signed_VPI (idx 4)
-        if signals_scaled.shape[1] > 4:
-            signals_scaled[:, 4] = signals_scaled[:, 4] * c_vpi
+        # Use trainable LayerNorm instead of hardcoded constants
+        # explicit_signals: (B, 6)
+        signals_scaled = self.explicit_norm(explicit_signals)
 
         # === 1. Deep Path: Process latent context ===
         x_latent = th.cat([c_mkt, delta_c_mkt], dim=-1)  # (B, 2D)

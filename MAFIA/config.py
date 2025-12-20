@@ -140,6 +140,10 @@ class Config:
         self.risk_bound_is_annualized = False  # Set True if observer outputs annualized sigma; will be scaled to daily
         self.risk_bound_minvar_eps = 0.0  # Safety margin when kẹp bound to min_var_K (risk_bound = max(bound, min_var_K*(1+eps)))
 
+        # Load Balancing Loss: Penalty for Expert Collapse (Spec 3.6.4)
+        # Weight for auxiliary loss: L_balance = lambda * CV(avg_gate_weights)
+        self.mafia_lambda_balance = 0.1
+
         # Solver boost behavior (only active in 'full-score' mode when RL has selected Top-K)
         # In 'full-score' mode: Solver can boost stocks already selected by RL, or keep original logic
         self.mafia_solver_boost_enabled = False  # If True, Solver boosts stocks selected by RL (only in 'full-score' mode)
@@ -174,10 +178,10 @@ class Config:
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
         # Penalty coefficients (stronger to stand against reward scaling=100)
-        self.mafia_pg_alpha_turnover = 1.25  # Turnover penalty coefficient
-        self.mafia_pg_alpha_change = 1.5  # Membership change penalty coefficient
+        self.mafia_pg_alpha_turnover = 3.0  # Turnover penalty coefficient
+        self.mafia_pg_alpha_change = 3.0  # Membership change penalty coefficient
         self.mafia_reward_alpha_hold = (
-            2.0  # Trend Holding Bonus (Reward for holding profitable stocks)
+            5.0  # Trend Holding Bonus (Reward for holding profitable stocks)
         )
         # Direction label generation (future-based)
         self.direction_label_lookahead = 14  # k days ahead for R_fut
@@ -452,7 +456,14 @@ class Config:
             self.trained_best_model_type,
         )
         # Allow overriding data root for container/host mounts
-        self.dataDir = os.path.abspath(os.environ.get("MAFIA_DATA_DIR", "./data"))
+        # Robust Data Directory Resolution
+        # Falls back to agents/MAFIA/data relative to config.py if env var not set
+        _default_data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data"
+        )
+        self.dataDir = os.path.abspath(
+            os.environ.get("MAFIA_DATA_DIR", _default_data_dir)
+        )
 
         # Data file configuration - can specify custom file names or use None for auto-detection
         # If None, will use pattern: {market_name}_{topK}_{freq}.csv
@@ -851,7 +862,7 @@ class Config:
         # Loss Weights (Spec §6)
         self.mafia_lambda_pg = 1.0  # Weight for L_PG (policy gradient loss)
         self.mafia_lambda_risk = 0.3  # Weight for L_Risk (risk calibration loss)
-        self.mafia_lambda_dir = 0.5  # Weight for L_Dir (direction classification loss)
+        self.mafia_lambda_dir = 1.0  # Weight for L_Dir (direction classification loss) - Increased to 1.0
 
         # Entropy Bonus for L_PG (spec 5.1.1)
         self.mafia_beta_entropy = 0.01  # β_ent: entropy bonus coefficient
@@ -865,13 +876,12 @@ class Config:
         # Stronger portfolio churn penalties (penalty ~25–30% reward at λ=1 with typical turnover/symdiff)
         # Old override removed to respect lines 177-178
 
-        # SOFT LANDING for Resume at Epoch 7:
-        # Start ramp-up from Epoch 6 (Index 6), so Warmup = 5.
-        # Epoch 7: (7 - 5)/5 = 0.4 (40% penalty).
-        # Turnover: 0.6 | Change: 0.8 (Higher than old 0.4/0.5)
-        self.curriculum_warmup_epochs = 0  # Start ramp-up immediately (Epoch 0)
-
-        self.curriculum_penalty_rampup = 5  # Rampup over 5 epochs
+        # SOFT LANDING for Resume:
+        # Warmup = 18 means Epoch 0-17 are purely old penalty.
+        # Epoch 18 (Index 18): Gap is 0 -> Penalty = Base (1.25).
+        # Epoch 19 (Index 19): Gap is 1 -> Penalty = 1.38 (Higher than 1.25).
+        self.curriculum_warmup_epochs = 18
+        self.curriculum_penalty_rampup = 10  # Rampup over 10 epochs (Smooth transition)
 
         # Risk/Direction Head Config
         self.mafia_explicit_dim = 6  # [Vol20, DC, Breadth, Div, VPI, DD60]
@@ -888,13 +898,14 @@ class Config:
         # With γ=2.0, easy (majority) samples get ~0.1x gradient vs hard samples
         # Direction Loss (Focal Loss) Class Weights: [Bear, Side, Bull]
         # Based on VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
-        self.mafia_focal_alpha = [1.5, 0.70, 1.0]
+        # Tuned (v2): Increase Bull (1.15) to fix zero-recall, Side (0.75) to keep balance
+        self.mafia_focal_alpha = [1.7, 0.85, 1.15]
         self.mafia_focal_gamma = (
-            1.25  # Focusing parameter γ: reduces loss for confident (easy) predictions
+            3.0  # Focusing parameter γ: reduces loss for confident (easy) predictions
         )
         # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
         # Helps model converge stably, avoids overconfidence on noisy labels
-        self.mafia_direction_label_smoothing = 0.08  # ε: smoothing factor (reduced)
+        self.mafia_direction_label_smoothing = 0.05  # ε: smoothing factor (reduced)
         # Temperature scaling for direction logits (T<1 sharpens, T>1 flattens)
         self.mafia_direction_temperature = 1
 

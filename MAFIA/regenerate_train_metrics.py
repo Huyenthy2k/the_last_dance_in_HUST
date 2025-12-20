@@ -13,7 +13,7 @@ sys.path.append(os.getcwd())
 from config import Config
 from RL_controller.mafia_modules import MAFIAModel
 from RL_controller.mafia_observer import MAFIAObserver
-from RL_controller.observer_offline_trainer import create_offline_trainer
+from RL_controller.observer_offline_trainer import create_offline_trainer, ObserverOfflineBatchTrainer
 from RL_controller.validation_tracker import ValidationMetricsTracker
 from scripts.train_observer_offline import load_mafia_data, build_expanding_schedule
 
@@ -23,6 +23,7 @@ def regenerate_train_metrics():
     parser.add_argument("--first-infer-year", type=int, default=2018, help="First inference year")
     parser.add_argument("--last-infer-year", type=int, default=2022, help="Last inference year")
     parser.add_argument("--iter", type=int, default=0, help="Iteration index to regenerate (0-indexed)")
+    parser.add_argument("--target-epoch", type=int, default=None, help="Specific epoch to regenerate (e.g. 16)")
     parser.add_argument("--output-dir", type=str, default="observer_offline", help="Base output directory")
     args = parser.parse_args()
 
@@ -30,6 +31,8 @@ def regenerate_train_metrics():
     
     # 1. Setup Config & Data
     config = Config(create_dirs=False)
+    # [FIX] dataDir is now handled robustly in Config.__init__
+    # config.dataDir = os.path.join(os.getcwd(), "agents", "MAFIA", "data")
     config.seed = 2025
     
     # 2. Build Schedule to target specific iteration
@@ -55,16 +58,17 @@ def regenerate_train_metrics():
         market_data = None
         
     # Setup Device
-    if th.cuda.is_available():
-        device = th.device("cuda")
-    elif th.backends.mps.is_available():
-        device = th.device("mps")
-    else:
-        device = th.device("cpu")
+    # Force CPU for regeneration stability/debug
+    config.device = th.device("cpu")
         
     action_dim = len(stock_list)
     observer = MAFIAObserver(config=config, action_dim=action_dim)
-    trainer = create_offline_trainer(config, observer)
+    # trainer = create_offline_trainer(config, observer)
+    trainer = ObserverOfflineBatchTrainer(
+        config=config,
+        observer=observer,
+        device=config.device
+    )
     
     # Prepare Tensors (Full Range)
     full_start = pd.Timestamp(f"{args.start_year}-01-01")
@@ -110,22 +114,14 @@ def regenerate_train_metrics():
     print(f"[REGEN-TRAIN] Searching for checkpoints in: {ckpt_dir}")
     ckpts = glob.glob(os.path.join(ckpt_dir, "epoch_*.pth"))
     
-    # If no epochs found, try latest? But usually we want time-series.
-    # If standard training saves epoch_X.pth for best only, we might miss intermediate epochs.
-    # However, for metric regeneration we can only work with what we have.
-    # If the user has "epoch_*.pth", we use them.
-    
+    # Always try to include latest if it exists
+    latest_pth = os.path.join(ckpt_dir, "latest_checkpoint.pth")
+    if os.path.exists(latest_pth) and latest_pth not in ckpts:
+        ckpts.append(latest_pth)
+
     if not ckpts:
-        print(f"[REGEN-TRAIN] No epoch_*.pth checkpoints found at {ckpt_dir}.")
-        print("              Standard training typically only saves 'best' and 'latest'.")
-        print("              If you only have 'latest_checkpoint.pth', we can only regenerate the last state.")
-        latest = os.path.join(ckpt_dir, "latest_checkpoint.pth")
-        if os.path.exists(latest):
-            print(f"              Found latest: {latest}")
-            ckpts = [latest]
-        else:
-             print("              Exiting.")
-             return
+        print(f"[REGEN-TRAIN] No checkpoints found at {ckpt_dir}.")
+        return
 
     # Sort checks
     def extract_epoch(p):
@@ -138,12 +134,39 @@ def regenerate_train_metrics():
     
     ckpts.sort(key=extract_epoch)
 
+    # Filter by target epoch if requested
+    if args.target_epoch is not None:
+         target_file = f"epoch_{args.target_epoch}.pth"
+         # Check strict match
+         matches = [c for c in ckpts if os.path.basename(c) == target_file or os.path.basename(c) == f"epoch_{args.target_epoch}_balanced.pth"]
+         if matches:
+             print(f"[REGEN-TRAIN] Targeting specific checkpoint(s) for Epoch {args.target_epoch}: {[os.path.basename(x) for x in matches]}")
+             ckpts = matches
+         else:
+             # Fallback to latest
+             latest_match = [c for c in ckpts if "latest" in os.path.basename(c)]
+             if latest_match:
+                 print(f"[REGEN-TRAIN] Epoch {args.target_epoch} file not found. Using latest checkpoint hoping it matches.")
+                 ckpts = latest_match
+             else:
+                 print(f"[REGEN-TRAIN] Epoch {args.target_epoch} not found and no latest checkpoint.")
+                 ckpts = []
+
     # Output CSV
     out_dir = os.path.join(args.output_dir, f"iter_{args.iter}_valid_{sched['valid_year']}")
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, "train_metrics.csv")
     
-    # We will accumulate records and overwrite the file
+    # Load existing metrics if available to preserve history
+    existing_df = None
+    if os.path.exists(csv_path):
+        try:
+             existing_df = pd.read_csv(csv_path)
+             print(f"[REGEN-TRAIN] Loaded existing metrics from {csv_path} ({len(existing_df)} epochs)")
+        except Exception as e:
+             print(f"[REGEN-TRAIN] Could not load existing metrics: {e}")
+
+    # We will accumulate records
     all_train_records = []
 
     # 6. Process Checkpoints
@@ -151,6 +174,8 @@ def regenerate_train_metrics():
         try:
             print(f"[REGEN-TRAIN] processing {ckpt}...")
             loaded_epoch = trainer.observer.load_checkpoint(ckpt)
+            # Force model to device (CPU) strictly to avoid MPS contaminants from checkpoint
+            observer.mafia_model.to(config.device)
             trainer._epoch = loaded_epoch
             
             # Use 'validate_epoch' on TRAIN tensors to compute full metrics efficiently
@@ -169,15 +194,17 @@ def regenerate_train_metrics():
             available = train_tensors["T_total"] - trainer.T_m - trainer.horizon - trainer.T_w
             steps_full = max(1, int(np.ceil(available / trainer.batch_size)))
             
-            # To speed up, maybe use 20% of data or 50 steps?
-            # Performance optimized with Numba, using 20 steps for better metrics
-            steps_to_run = 20
+            # Performance optimized with Numba, using 5 steps for faster metrics (approximate but sufficient)
+            steps_to_run = 5
             
-            result = trainer.validate_epoch(train_tensors, steps=steps_to_run)
+            result = trainer.validate_epoch(train_tensors, steps=steps_to_run, compute_loss=True)
             
             # Result is ObserverValidationResult. Convert to dict.
             rec = asdict(result)
             
+            # [FIX] Format direction_accuracy as percentage to match legacy
+            rec["direction_accuracy"] = round(rec["direction_accuracy"] * 100.0, 5)
+
             # FIX: Map rl_advantage and rl_reward
             # rl_advantage is roughly topk_advantage
             rec["rl_advantage"] = rec.get("topk_advantage", 0.0)
@@ -198,12 +225,31 @@ def regenerate_train_metrics():
 
     # 7. Save
     if all_train_records:
-        df = pd.DataFrame(all_train_records)
+        new_df = pd.DataFrame(all_train_records)
+        
+        if existing_df is not None:
+             # UPSERT LOGIC: Update existing rows, append new ones
+             # Set index to epoch for easy update
+             existing_df.set_index("epoch", inplace=True)
+             new_df.set_index("epoch", inplace=True)
+             
+             # Update with new data
+             existing_df.update(new_df)
+             
+             # Now add rows that were not in existing
+             new_epochs = new_df.index.difference(existing_df.index)
+             if not new_epochs.empty:
+                 existing_df = pd.concat([existing_df, new_df.loc[new_epochs]])
+             
+             final_df = existing_df.reset_index()
+        else:
+             final_df = new_df
+
         # Sort by epoch just in case
-        df = df.sort_values("epoch")
-        df.to_csv(csv_path, index=False)
+        final_df = final_df.sort_values("epoch")
+        final_df.to_csv(csv_path, index=False)
         print(f"[REGEN-TRAIN] ✅ Regenerated train_metrics.csv at: {csv_path}")
-        print(df[["epoch", "rl_advantage", "direction_f1_macro", "risk_mae"]].to_string(index=False))
+        print(final_df[["epoch", "rl_advantage", "direction_f1_macro", "risk_mae"]].to_string(index=False))
     else:
         print("[REGEN-TRAIN] No records generated.")
 

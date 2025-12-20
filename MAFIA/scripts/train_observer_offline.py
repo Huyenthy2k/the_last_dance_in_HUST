@@ -351,10 +351,146 @@ def train_observer_offline_iteration(
                     if new_len < original_len:
                         smart_print(f"[RESUME] Truncated validation history from {original_len} to {new_len} records (removed future epochs).")
                         # [RESUME-FIX] Save truncated history back to disk immediately
-                        tracker.save_validation_history(valid_csv_path)
+                        tracker.save_validation_history()
                         smart_print(f"[RESUME] Saved truncated valid_metrics.csv to disk.")
                     
                     tracker._recompute_ces_scores()
+                
+                # [RESUME-FIX] Full History Recovery
+                # Iterate from 0 to loaded_epoch. If ANY checkpoint exists but is missing from metrics, recover it.
+                # This handles:
+                # 1. Crash before validation (last epoch missing)
+                # 2. Corrupted/Deleted CSV (all epochs missing)
+                # 3. Resume from middle of training with partial CSV
+                
+                smart_print("[RESUME] Checking for missing validation history...")
+                
+                # Identify missing epochs that HAVE checkpoints
+                epochs_to_recover = []
+                for ep in range(loaded_epoch + 1):
+                    # Check if in tracker
+                    in_tracker = any(h.epoch == ep for h in tracker.history)
+                    if in_tracker:
+                        continue
+                        
+                    # Check if checkpoint exists
+                    ckpt_name = f"epoch_{ep}.pth"
+                    # We have `temp_ckpt_dir` variable in scope from earlier in script
+                    # Correct variable name for checkpoint dir is `temp_ckpt_dir` (checked in earlier view)
+                    ckpt_path = os.path.join(temp_ckpt_dir, ckpt_name)
+                    
+                    if os.path.exists(ckpt_path):
+                        epochs_to_recover.append(ep)
+                
+                if epochs_to_recover:
+                    smart_print(f"[RESUME-RECOVERY] Found {len(epochs_to_recover)} missing epochs with checkpoints: {epochs_to_recover}")
+                    smart_print(f"                  Starting Batch Recovery...")
+                    
+                    for recover_ep in epochs_to_recover:
+                        smart_print(f"\n[RECOVERY] ♻️ Recovering Epoch {recover_ep}...")
+                        
+                        try:
+                            # 1. Load Checkpoint
+                            ckpt_path = os.path.join(temp_ckpt_dir, f"epoch_{recover_ep}.pth")
+                            trainer.observer.load_checkpoint(ckpt_path)
+
+                            # [DEBUG] Check model weight sum to verify it actually changes
+                            p_sum = sum(p.sum().item() for p in trainer.observer.mafia_model.parameters())
+                            smart_print(f"           [DEBUG] Epoch {recover_ep} Model Param Sum: {p_sum:.6f}")
+                            
+                            # 2. Set Trainer Epoch
+                            trainer._epoch = recover_ep
+                            
+                            # 3. Run Validation
+                            val_result = trainer.validate_epoch(
+                                data_tensors=valid_tensors,
+                                compute_loss=True,  # Ensure losses are computed for best selection
+                                steps=max(1, batches_per_epoch // 4),
+                            )
+                            
+                            # 4. Add to Tracker
+                            min_full = trainer.curriculum_warmup_epochs + trainer.curriculum_penalty_rampup
+                            is_full_penalty = (recover_ep >= min_full)
+                            is_best = tracker.add_epoch(val_result, allow_best_update=is_full_penalty)
+                            smart_print(f"           ✅ Recovered Epoch {recover_ep} (CES: {val_result.ces_score:.5f})")
+                            
+                            # 5. Save incrementally
+                            tracker.save_validation_history()
+                            
+                            # 6. Plots
+                            min_best_for_plot = trainer.curriculum_warmup_epochs + trainer.curriculum_penalty_rampup
+                            generate_epoch_report(tracker.output_dir, recover_ep, min_best_epoch=min_best_for_plot)
+
+                            # 7. Update Best Checkpoint if needed
+                            if is_best:
+                                best_ckpt_path = os.path.join(temp_ckpt_dir, "best_checkpoint.pth")
+                                trainer.observer.save_checkpoint(best_ckpt_path, epoch=recover_ep)
+                                smart_print(f"           🏆 Updated best_checkpoint.pth (CES={val_result.ces_score:.4f})")
+                            
+                        except Exception as e:
+                            smart_print(f"           ❌ Failed to recover Epoch {recover_ep}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # Restore state to `loaded_epoch` before continuing
+                    if epochs_to_recover[-1] != loaded_epoch:
+                        smart_print(f"[RECOVERY] 🔄 Restoring observer state to Loaded Epoch {loaded_epoch}...")
+                        ckpt_path_final = os.path.join(temp_ckpt_dir, f"epoch_{loaded_epoch}.pth")
+                        trainer.observer.load_checkpoint(ckpt_path_final)
+                        trainer._epoch = loaded_epoch
+                        
+                    smart_print("[RESUME-RECOVERY] ✅ All missing history recovered.")
+                else:
+                    smart_print("[RESUME] History is consistent with checkpoints.")
+
+
+                # [RESUME-FIX] Train Metrics Recovery
+                # Check if train metrics exist for this epoch.
+                # If missing, we evaluate on TRAINING set to populate it.
+                train_csv_path = os.path.join(iter_output_dir, "train_metrics.csv")
+                train_metrics_exist = False
+                if os.path.exists(train_csv_path):
+                    try:
+                        df_t = pd.read_csv(train_csv_path)
+                        if "epoch" in df_t.columns and loaded_epoch in df_t["epoch"].values:
+                            train_metrics_exist = True
+                    except:
+                        pass
+                
+                if not train_metrics_exist:
+                    smart_print(f"\n[RESUME-RECOVERY] 🚨 Checkpoint at Epoch {loaded_epoch} exists, but TRAIN metrics missing.")
+                    smart_print(f"                  Executing IMMEDIATE metrics recovery on TRAINING SET for Epoch {loaded_epoch}...")
+                    
+                    # Run evaluation on TRAIN set
+                    # Note: This gives 'inference' loss, not 'training' loss (with dropout/grad), 
+                    # but it's the best proxy we have for a lost log.
+                    # We use a subset of training data if it's too huge? Or full? 
+                    # train_epoch iterates all. validate_epoch can take full train_tensors.
+                    # Let's use full train_tensors.
+                    train_eval_res = trainer.validate_epoch(
+                         data_tensors=train_tensors,
+                         steps=batches_per_epoch, # Use same steps as training? Or just full? validate_epoch default iterates all if steps large?
+                         # Actually validate_epoch implementation:
+                         # It samples `steps` batches.
+                         # So yes, passing batches_per_epoch is correct to cover rough size of data or more.
+                         compute_loss=True  # Log training losses
+                    )
+                    
+                    # Convert to dict and save
+                    t_dict = asdict(train_eval_res)
+                    # Remove CES stuff
+                    keys_to_remove = [k for k in t_dict.keys() if "ces_score" in k or "ces_rank" in k]
+                    for k in keys_to_remove:
+                        del t_dict[k]
+                    
+                    df_t_new = pd.DataFrame([t_dict])
+                    if "epoch" in df_t_new.columns:
+                        df_t_new["epoch"] = df_t_new["epoch"].astype(int)
+                        
+                    header = not os.path.exists(train_csv_path)
+                    df_t_new.to_csv(train_csv_path, mode='a', header=header, index=False, float_format='%.5f')
+                    smart_print(f"[RESUME-RECOVERY] ✅ Recovered train_metrics.csv for Epoch {loaded_epoch}.")
+
 
                 # [RESUME-FIX] Truncate train_metrics.csv if exists
                 train_csv_path = os.path.join(iter_output_dir, "train_metrics.csv")
@@ -485,6 +621,7 @@ def train_observer_offline_iteration(
             # 3. Validate (returns ObserverValidationResult)
             val_result = trainer.validate_epoch(
                 data_tensors=valid_tensors,
+                compute_loss=True,
                 steps=max(1, batches_per_epoch // 4),
             )
 
@@ -739,17 +876,17 @@ def run_offline_observer_training(
         # Load Market Data (VNINDEX)
         index_file_name = getattr(config, "index_data_file", "vnindex_data.csv")
         market_file = os.path.join(getattr(config, "dataDir", "./data"), index_file_name)
-        if not os.path.exists(market_file):
-             # Fallback to hardcoded name if config name not found
-             market_file = os.path.join(getattr(config, "dataDir", "./data"), "VNINDEX_1d_index.csv")
         if os.path.exists(market_file):
             market_data = pd.read_csv(market_file, parse_dates=["date"])
             if verbose:
                 smart_print(f"[OFFLINE] Loaded Market Data (VNINDEX): {len(market_data)} rows")
         else:
-            market_data = None
-            if verbose:
-                smart_print(f"[WARN] Market Data (VNINDEX) not found at {market_file}. Using fallback averages.")
+            # SAFETY CRITICAL: Do NOT fallback to synthetic data
+            # Missing market data causes silent labeling failures (all Side)
+            raise FileNotFoundError(
+                f"[CRITICAL] Market Data (VNINDEX) not found at {market_file}. "
+                f"Aborting to prevent training on invalid synthetic labels."
+            )
 
         if verbose:
             smart_print(

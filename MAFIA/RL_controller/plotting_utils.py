@@ -45,7 +45,7 @@ def plot_loss_components(
     """
     df = pd.read_csv(csv_path)
     
-    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(10, 15), sharex=True)
     fig.suptitle(title, fontsize=14, fontweight='bold')
     
     # Total Loss
@@ -67,11 +67,22 @@ def plot_loss_components(
     axes[2].grid(True, alpha=0.3)
     
     # Direction Loss
+    # Direction Loss
     axes[3].plot(df['epoch'], df['loss_dir'], 'o-', color='green', linewidth=2, label='L_Dir (CrossEntropy)')
     axes[3].set_ylabel('L_Dir')
-    axes[3].set_xlabel('Epoch')
     axes[3].legend()
     axes[3].grid(True, alpha=0.3)
+    
+    # Balance Loss
+    if 'loss_bal' in df.columns:
+        axes[4].plot(df['epoch'], df['loss_bal'], 'o-', color='purple', linewidth=2, label='L_Bal (Load Balancing)')
+    else:
+        axes[4].text(0.5, 0.5, "L_Bal Not Available", transform=axes[4].transAxes, ha='center')
+        
+    axes[4].set_ylabel('L_Bal')
+    axes[4].set_xlabel('Epoch')
+    axes[4].legend()
+    axes[4].grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -100,19 +111,27 @@ def plot_validation_metrics_grid(
     df = pd.read_csv(csv_path)
     
     # Filter for valid 'Best' candidates (Curriculum Logic)
-    valid_candidates = df[df['epoch'] >= min_best_epoch]
-    if not valid_candidates.empty:
-        best_idx = valid_candidates['ces_score'].idxmax()
-        best_epoch = df.loc[best_idx, 'epoch']
-        best_ces = df.loc[best_idx, 'ces_score']
-        best_label = f'Best: Epoch {int(best_epoch)}'
+    if 'ces_score' in df.columns:
+        valid_candidates = df[df['epoch'] >= min_best_epoch]
+        if not valid_candidates.empty:
+            best_idx = valid_candidates['ces_score'].idxmax()
+            best_epoch = df.loc[best_idx, 'epoch']
+            best_ces = df.loc[best_idx, 'ces_score']
+            best_label = f'Best: Epoch {int(best_epoch)}'
+        else:
+            # Fallback if no valid candidates yet (early curriculum phase)
+            best_idx = df['ces_score'].idxmax()
+            best_epoch = df.loc[best_idx, 'epoch']
+            best_ces = df.loc[best_idx, 'ces_score']
+            best_label = f'Best (Curriculum): {int(best_epoch)}'
     else:
-        # Fallback if no valid candidates yet (early curriculum phase)
-        # Just pick max CES but label it as "Pending" or similar
-        best_idx = df['ces_score'].idxmax()
+        # Fallback for train_metrics where CES might not exist
+        # Use simple "Last Epoch" or "Min Total Loss"
+        best_idx = df.index[-1]
         best_epoch = df.loc[best_idx, 'epoch']
-        best_ces = df.loc[best_idx, 'ces_score']
-        best_label = f'Best (Curriculum): {int(best_epoch)}'
+        best_ces = 0.0
+        best_label = f'Latest: {int(best_epoch)}'
+        valid_candidates = pd.DataFrame() # Empty to suppress "Best" star unless logic added
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=14, fontweight='bold')
@@ -144,20 +163,28 @@ def plot_validation_metrics_grid(
     axes[1, 0].grid(True, alpha=0.3)
     
     # CES Score (highlighted)
-    axes[1, 1].plot(df['epoch'], df['ces_score'], 'o-', color='purple', linewidth=2.5, markersize=6)
-    
-    # Only show start if it is a VALID best (passed curriculum)
-    if not valid_candidates.empty:
-        axes[1, 1].scatter(best_epoch, best_ces, 
-                           s=300, c='gold', marker='*', edgecolor='black', linewidth=2, zorder=5,
-                           label=best_label)
+    if 'ces_score' in df.columns:
+        axes[1, 1].plot(df['epoch'], df['ces_score'], 'o-', color='purple', linewidth=2.5, markersize=6)
+        
+        # Only show start if it is a VALID best (passed curriculum)
+        if not valid_candidates.empty:
+            axes[1, 1].scatter(best_epoch, best_ces, 
+                               s=300, c='gold', marker='*', edgecolor='black', linewidth=2, zorder=5,
+                               label=best_label)
+        else:
+            # Show "Pending" indicator
+            axes[1, 1].text(0.5, 0.5, "Best Checkpoint: Pending\n(Curriculum Phase)", 
+                           transform=axes[1, 1].transAxes, ha='center', va='center',
+                           bbox=dict(facecolor='white', alpha=0.8))
+        axes[1, 1].set_title('Composite Efficiency Score (CES)')
+        axes[1, 1].set_ylabel('CES Score')
     else:
-        # Show "Pending" indicator
-        axes[1, 1].text(0.5, 0.5, "Best Checkpoint: Pending\n(Curriculum Phase)", 
-                       transform=axes[1, 1].transAxes, ha='center', va='center',
-                       bbox=dict(facecolor='white', alpha=0.8))
-    axes[1, 1].set_title('Composite Efficiency Score (CES)')
-    axes[1, 1].set_ylabel('CES Score')
+        # If CES missing, plot something else or leave blank?
+        # Maybe Total Loss?
+        axes[1, 1].plot(df['epoch'], df.get('loss_total', np.zeros_like(df['epoch'])), 'o-', color='black', linewidth=2, label='Total Loss')
+        axes[1, 1].set_title('Total Loss (CES N/A)')
+        axes[1, 1].set_ylabel('Loss')
+        
     axes[1, 1].set_xlabel('Epoch')
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
@@ -383,12 +410,12 @@ def plot_ces_components_breakdown(
     epochs = df['epoch']
 
     # Calculate weighted contributions
-    sharpe_contrib = 0.6 * df['ces_rank_sharpe']
-    dir_f1_contrib = 0.2 * df['ces_rank_dir_f1']
-    risk_mse_contrib = 0.2 * (1 - df['ces_rank_risk_mse'])  # Inverted for MSE
+    sharpe_contrib = 0.5 * df['ces_rank_sharpe']
+    dir_f1_contrib = 0.3 * df['ces_rank_dir_f1']
+    risk_mse_contrib = 0.2 * df['ces_rank_risk_mse']  # Rank is already Goodness (High=Best)
 
-    ax1.bar(epochs, sharpe_contrib, label='Sharpe (60%)', color='#2196F3', alpha=0.8)
-    ax1.bar(epochs, dir_f1_contrib, bottom=sharpe_contrib, label='Direction F1 (20%)', color='#4CAF50', alpha=0.8)
+    ax1.bar(epochs, sharpe_contrib, label='Sharpe (50%)', color='#2196F3', alpha=0.8)
+    ax1.bar(epochs, dir_f1_contrib, bottom=sharpe_contrib, label='Direction F1 (30%)', color='#4CAF50', alpha=0.8)
     ax1.bar(epochs, risk_mse_contrib, bottom=sharpe_contrib + dir_f1_contrib, label='Risk (20%)', color='#FF9800', alpha=0.8)
     
     if not valid_candidates.empty:
@@ -405,7 +432,7 @@ def plot_ces_components_breakdown(
     ax2 = axes[0, 1]
     ax2.plot(epochs, df['ces_rank_sharpe'], 'o-', color='#2196F3', linewidth=2, label='Sharpe Rank')
     ax2.plot(epochs, df['ces_rank_dir_f1'], 's-', color='#4CAF50', linewidth=2, label='Direction F1 Rank')
-    ax2.plot(epochs, 1 - df['ces_rank_risk_mse'], '^-', color='#FF9800', linewidth=2, label='1 - Risk MSE Rank')
+    ax2.plot(epochs, df['ces_rank_risk_mse'], '^-', color='#FF9800', linewidth=2, label='Risk MSE Rank (High=Good)')
     if not valid_candidates.empty:
         ax2.axvline(best_epoch, color='red', linestyle='--', linewidth=2, alpha=0.7)
     ax2.set_xlabel('Epoch')
@@ -413,17 +440,24 @@ def plot_ces_components_breakdown(
     ax2.set_title('Individual Component Ranks')
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(-0.1, 1.1)
+    # Calculate dynamic y-limit to avoid cutting off high ranks (when epochs > fixed N)
+    max_rank = max(
+        df['ces_rank_sharpe'].max(),
+        df['ces_rank_dir_f1'].max(),
+        df['ces_rank_risk_mse'].max()
+    )
+    upper_limit = max(1.1, max_rank + 0.1)
+    ax2.set_ylim(-0.1, upper_limit)
 
     # Plot 3: Pie chart of best epoch composition
     ax3 = axes[1, 0]
     best_row = df.loc[best_idx]
     contributions = [
-        0.6 * best_row['ces_rank_sharpe'],
-        0.2 * best_row['ces_rank_dir_f1'],
-        0.2 * (1 - best_row['ces_rank_risk_mse'])
+        0.5 * best_row['ces_rank_sharpe'],
+        0.3 * best_row['ces_rank_dir_f1'],
+        0.2 * best_row['ces_rank_risk_mse']
     ]
-    labels = ['Sharpe\n(60% weight)', 'Direction F1\n(20% weight)', 'Risk\n(20% weight)']
+    labels = ['Sharpe\n(50% weight)', 'Direction F1\n(30% weight)', 'Risk\n(20% weight)']
     colors = ['#2196F3', '#4CAF50', '#FF9800']
 
     wedges, texts, autotexts = ax3.pie(
@@ -440,8 +474,18 @@ def plot_ces_components_breakdown(
     ax4.plot(epochs, df['ces_score'], 'o-', color='purple', linewidth=2.5, markersize=8)
     
     if not valid_candidates.empty:
+        # Plot Curriculum Best (Gold Star)
         ax4.scatter(best_epoch, best_row['ces_score'], s=300, c='gold', marker='*',
-                    edgecolor='black', linewidth=2, zorder=5, label=f'Best: {best_row["ces_score"]:.3f}')
+                    edgecolor='black', linewidth=2, zorder=5, label=f'Best (Valid): {best_row["ces_score"]:.3f}')
+        
+        # Check for Global Best (if different from Curriculum Best)
+        global_best_idx = df['ces_score'].idxmax()
+        if global_best_idx != best_idx:
+            g_epoch = df.loc[global_best_idx, 'epoch']
+            g_score = df.loc[global_best_idx, 'ces_score']
+            ax4.scatter(g_epoch, g_score, s=150, c='silver', marker='*', 
+                       edgecolor='gray', linewidth=1, zorder=4, 
+                       label=f'Global Max (Warmup): {g_score:.3f}')
     else:
         ax4.text(0.5, 0.5, "Curriculum Phase", transform=ax4.transAxes, ha='center', bbox=dict(facecolor='white', alpha=0.8))
 
@@ -501,76 +545,104 @@ def plot_direction_breakdown(
     best_idx = df['direction_f1_macro'].idxmax() if 'direction_f1_macro' in df.columns else 0
     best_epoch = df.loc[best_idx, 'epoch'] if best_idx > 0 else epochs.iloc[-1]
 
+    # Detect scale (Ratio vs Percentage)
+    # If accuracy mean > 1.0, it's percentage.
+    is_percentage = df['direction_accuracy'].mean() > 1.0
+    scale_factor = 100.0 if not is_percentage else 1.0 # If input is ratio, scale to %. If input is %, keep.
+    
+    # Actually, user wants % everywhere.
+    # Convert ALL to Percentage (0-100)
+    
+    # Deep copy to avoiding modifying original DF if passed elsewhere (though local read)
+    df_plot = df.copy()
+    
+    # F1 columns are typically 0-1. Convert to %
+    f1_cols = ['direction_f1_bear', 'direction_f1_side', 'direction_f1_bull', 'direction_f1_macro']
+    for col in f1_cols:
+        if col in df_plot.columns and df_plot[col].max() <= 1.0:
+             df_plot[col] = df_plot[col] * 100.0
+             
+    # Accuracy column: if max <= 1.0, convert to %
+    if df_plot['direction_accuracy'].max() <= 1.0:
+        df_plot['direction_accuracy'] = df_plot['direction_accuracy'] * 100.0
+        
+    # Standardize Constants
+    baseline_random = 33.33
+    baseline_majority = 46.0
+    ylim_max = 105
+
     # Plot 1: Per-class F1 over epochs
     ax1 = axes[0, 0]
-    ax1.plot(epochs, df['direction_f1_bear'], 'o-', color='#F44336', linewidth=2, markersize=6, label='Bear F1')
-    ax1.plot(epochs, df['direction_f1_side'], 's-', color='#9E9E9E', linewidth=2, markersize=6, label='Side F1')
-    ax1.plot(epochs, df['direction_f1_bull'], '^-', color='#4CAF50', linewidth=2, markersize=6, label='Bull F1')
+    ax1.plot(epochs, df_plot['direction_f1_bear'], 'o-', color='#F44336', linewidth=2, markersize=6, label='Bear F1')
+    ax1.plot(epochs, df_plot['direction_f1_side'], 's-', color='#9E9E9E', linewidth=2, markersize=6, label='Side F1')
+    ax1.plot(epochs, df_plot['direction_f1_bull'], '^-', color='#4CAF50', linewidth=2, markersize=6, label='Bull F1')
     ax1.axvline(best_epoch, color='purple', linestyle='--', linewidth=2, alpha=0.7, label=f'Best Macro F1')
     ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('F1 Score')
+    ax1.set_ylabel('F1 Score (%)')
     ax1.set_title('Per-Class F1 Over Epochs')
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_ylim(-5, 105)
 
     # Plot 2: Grouped bar chart of final epoch F1 scores
     ax2 = axes[0, 1]
-    final_row = df.iloc[-1]
+    final_row = df_plot.iloc[-1]
     classes = ['Bear', 'Side', 'Bull']
     f1_scores = [final_row['direction_f1_bear'], final_row['direction_f1_side'], final_row['direction_f1_bull']]
     colors = ['#F44336', '#9E9E9E', '#4CAF50']
 
     bars = ax2.bar(classes, f1_scores, color=colors, edgecolor='black', linewidth=1.5)
-    ax2.axhline(y=0.33, color='gray', linestyle='--', alpha=0.5, label='Random baseline (0.33)')
+    ax2.axhline(y=baseline_random, color='gray', linestyle='--', alpha=0.5, label='Random (33%)')
 
     # Annotate bars
     for bar, score in zip(bars, f1_scores):
         height = bar.get_height()
-        ax2.text(bar.get_x() + bar.get_width()/2, height + 0.02, f'{score:.3f}',
-                ha='center', va='bottom', fontsize=11, fontweight='bold')
+        ax2.text(bar.get_x() + bar.get_width()/2, height + 2, f'{score:.5f}%',
+                ha='center', va='bottom', fontsize=9, fontweight='bold')
 
-    ax2.set_ylabel('F1 Score')
+    ax2.set_ylabel('F1 Score (%)')
     ax2.set_title(f'Per-Class F1 (Epoch {int(final_row["epoch"])})')
     ax2.legend(fontsize=9)
     ax2.grid(True, axis='y', alpha=0.3)
-    ax2.set_ylim(0, 1.1)
+    ax2.set_ylim(0, 110)
 
     # Plot 3: Macro F1 vs Accuracy comparison
     ax3 = axes[1, 0]
-    if 'direction_f1_macro' in df.columns:
-        ax3.plot(epochs, df['direction_f1_macro'], 'o-', color='purple', linewidth=2, label='Macro F1')
-    ax3.plot(epochs, df['direction_accuracy'], 's-', color='blue', linewidth=2, alpha=0.7, label='Accuracy')
-    ax3.axhline(y=0.46, color='gray', linestyle='--', alpha=0.5, label='Majority baseline (~46%)')
+    if 'direction_f1_macro' in df_plot.columns:
+        ax3.plot(epochs, df_plot['direction_f1_macro'], 'o-', color='purple', linewidth=2, label='Macro F1')
+    ax3.plot(epochs, df_plot['direction_accuracy'], 's-', color='blue', linewidth=2, alpha=0.7, label='Accuracy')
+    ax3.axhline(y=baseline_majority, color='gray', linestyle='--', alpha=0.5, label='Majority (~46%)')
     ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('Score')
+    ax3.set_ylabel('Score (%)')
     ax3.set_title('Macro F1 vs Accuracy')
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
-    ax3.set_ylim(0, 1.05)
+    ax3.set_ylim(0, 105)
 
     # Plot 4: Class imbalance detection heatmap
     ax4 = axes[1, 1]
 
     # Create heatmap data: rows = epochs, cols = classes
-    heatmap_data = df[['direction_f1_bear', 'direction_f1_side', 'direction_f1_bull']].values
+    # Use normalized 0-1 for heatmap color intensity but label with %
+    heatmap_data_pct = df_plot[['direction_f1_bear', 'direction_f1_side', 'direction_f1_bull']].values
+    heatmap_data_norm = heatmap_data_pct / 100.0
 
-    im = ax4.imshow(heatmap_data.T, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+    im = ax4.imshow(heatmap_data_norm.T, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
     ax4.set_yticks([0, 1, 2])
     ax4.set_yticklabels(['Bear', 'Side', 'Bull'])
     ax4.set_xlabel('Epoch')
     ax4.set_xticks(range(len(epochs)))
     ax4.set_xticklabels([int(e) for e in epochs])
-    ax4.set_title('F1 Score Heatmap (Green=Good, Red=Bad)')
+    ax4.set_title('F1 Score Heatmap (Green=Good)')
 
     # Annotate heatmap
     for i in range(3):
         for j in range(len(epochs)):
-            val = heatmap_data[j, i]
-            color = 'white' if val < 0.5 else 'black'
-            ax4.text(j, i, f'{val:.2f}', ha='center', va='center', color=color, fontsize=8)
+            val = heatmap_data_pct[j, i]
+            color = 'white' if val < 50 else 'black'
+            ax4.text(j, i, f'{val:.5f}', ha='center', va='center', color=color, fontsize=6)
 
-    plt.colorbar(im, ax=ax4, label='F1 Score')
+    plt.colorbar(im, ax=ax4, label='F1 Score (Normalized)')
 
     plt.tight_layout()
 

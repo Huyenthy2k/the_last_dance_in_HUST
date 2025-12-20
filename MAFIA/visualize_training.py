@@ -126,6 +126,7 @@ def plot_metric_group(
     output_path: str,
     show_trend: bool = True,
     trend_window: int = 3,
+    exclude_phases: Optional[List[str]] = None,
 ):
     """Plot a group of related metrics with walk-forward window annotations."""
     # Filter to metrics that exist in dataframe
@@ -150,6 +151,8 @@ def plot_metric_group(
         ax = axes_flat[idx]
 
         for phase in phases:
+            if exclude_phases and phase in exclude_phases:
+                continue
             phase_df = df[df["phase"] == phase].dropna(subset=[metric])
             if phase_df.empty:
                 continue
@@ -265,6 +268,10 @@ def plot_combined_dashboard(df: pd.DataFrame, output_path: str):
         ax = axes_flat[idx]
 
         for phase in phases:
+            # [CUSTOMIZATION] Exclude validation loss from dashboard
+            if metric == "mafia_loss" and phase == "valid":
+                continue
+                
             phase_df = df[df["phase"] == phase].dropna(subset=[metric])
             if phase_df.empty:
                 continue
@@ -607,7 +614,8 @@ def generate_epoch_report(res_dir: str, epoch: int, min_best_epoch: int = 0):
 
             # Core charts (always generate)
             plot_combined_dashboard(df, os.path.join(plots_dir, "dashboard_latest.png"))
-            plot_metric_group(df, LOSS_METRICS, "Loss History", os.path.join(plots_dir, "loss_history.png"))
+            # [CUSTOMIZATION] Exclude 'valid' phase for loss metrics (User Request)
+            plot_metric_group(df, LOSS_METRICS, "Loss History", os.path.join(plots_dir, "loss_history.png"), exclude_phases=["valid"])
             
             # Additional Performance/Risk charts for combined view
             plot_metric_group(df, PERFORMANCE_METRICS, "Performance Metrics", os.path.join(plots_dir, "metrics_performance.png"))
@@ -697,6 +705,7 @@ def main():
         os.path.join(output_dir, "metrics_loss.png"),
         show_trend=not args.no_trend,
         trend_window=args.trend_window,
+        exclude_phases=["valid"],  # [CUSTOMIZATION] User request
     )
 
     # Combined dashboard

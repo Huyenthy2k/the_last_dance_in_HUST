@@ -329,6 +329,9 @@ class ObserverOfflineBatchTrainer:
         self.lambda_dir = float(
             getattr(config, "mafia_lambda_dir", 0.5)
         )  # λ_dir = 0.5 per Spec §5
+        self.lambda_balance = float(
+            getattr(config, "mafia_lambda_balance", 0.1)
+        ) # Load Balancing Loss Weight
 
         # Penalty coefficients for PG
         self.alpha_turnover = float(getattr(config, "mafia_pg_alpha_turnover", 0.50))
@@ -545,14 +548,21 @@ class ObserverOfflineBatchTrainer:
         Returns:
             λ_epoch in [0.0, 1.0]
         """
-        if current_epoch < self.curriculum_warmup_epochs:
-            return 0.0
+        # Updated logic: Ramp up from 40% (approx old_penalty/new_penalty)
+        start_fraction = 0.4  # Start at ~1.2 (0.4 * 3.0)
 
+        if current_epoch < self.curriculum_warmup_epochs:
+            # Return base penalty (start_fraction) instead of 0.0
+            # This ensures pre-ramp epochs (like Epoch 18) are calculated with 1.25, not 0.
+            return start_fraction
+        
         ramp_progress = current_epoch - self.curriculum_warmup_epochs
         if ramp_progress >= self.curriculum_penalty_rampup:
             return 1.0
-
-        return ramp_progress / self.curriculum_penalty_rampup
+            
+        fraction_progress = ramp_progress / self.curriculum_penalty_rampup
+        # Linearly interpolate from start_fraction to 1.0
+        return start_fraction + (1.0 - start_fraction) * fraction_progress
 
     def prepare_data_tensors(
         self,
@@ -824,7 +834,9 @@ class ObserverOfflineBatchTrainer:
         Hook callback to capture gate weights from Router output.
         Router returns: (gate_weights, raw_context)
         """
-        # Detach to ensure no graph retention issues
+        # Capture WITH GRAD for loss calculation
+        self._gate_weights_with_grad = output[0]
+        # Detach for logging/monitoring (keeps legacy behavior safe)
         self._latest_gate_weights = output[0].detach()
 
     def _build_class_indices(
@@ -1711,6 +1723,7 @@ class ObserverOfflineBatchTrainer:
         pg_losses = []
         risk_losses = []
         dir_losses = []
+        balance_losses = [] # [NEW] Track balance loss per step
 
         # Dynamic Schedule Tracking (Resets on ANY trigger)
         # Initialize to 0. At t=0, we force rebalance.
@@ -2405,9 +2418,14 @@ class ObserverOfflineBatchTrainer:
             raw_str = f"RawReturn={R_raw[b].item():+.4f}"
 
             # 2. Costs/Penalties (scaled by curriculum λ_epoch)
-            turn_pen = turnover[b].item() * self.alpha_turnover * lambda_epoch
-            diff_pen = symdiff[b].item() * self.alpha_change * lambda_epoch
-            cost_str = f"TurnPen={turn_pen:.4f} | SymDiffPen={diff_pen:.4f}"
+            # CLARITY FIX: Only show actual penalty values when REBALANCING
+            # During HOLD, penalties are computed but NOT applied to loss (masked out)
+            if is_rebalance_b0:
+                turn_pen = turnover[b].item() * self.alpha_turnover * lambda_epoch
+                diff_pen = symdiff[b].item() * self.alpha_change * lambda_epoch
+                cost_str = f"TurnPen={turn_pen:.4f} | SymDiffPen={diff_pen:.4f}"
+            else:
+                cost_str = f"TurnPen=N/A (HOLD) | SymDiffPen=N/A (HOLD)"
 
             # 3. Net & Advantage
             r_net_val = R_net[b].item()
@@ -2445,7 +2463,8 @@ class ObserverOfflineBatchTrainer:
             smart_print(
                 f"     📉 Losses:    L_PG={pg_val:.4f} | "
                 f"L_risk(B)={risk_loss.item():.4f} | L_risk(S)={risk_loss_sample.item():.4f} | "
-                f"L_dir(B)={dir_loss.item():.4f} | L_dir(S)={dir_loss_sample.item():.4f}"
+                f"L_dir(B)={dir_loss.item():.4f} | L_dir(S)={dir_loss_sample.item():.4f} | "
+                f"L_bal={loss_balance.item() if 'loss_balance' in locals() else 0.0:.4f}"
             )
 
             # Portfolio & State
@@ -2595,6 +2614,27 @@ class ObserverOfflineBatchTrainer:
                 + (risk_loss * norm_risk * self.lambda_risk)
                 + (dir_loss * norm_dir * self.lambda_dir)
             )
+            
+            # [NEW] Load Balancing Loss (Expert Collapse Prevention)
+            loss_balance = th.tensor(0.0, device=self.device)
+            if hasattr(self, "_gate_weights_with_grad") and self._gate_weights_with_grad is not None:
+                # 1. Get Average Gate distribution across batch: (num_experts,)
+                avg_gate = self._gate_weights_with_grad.mean(dim=0)
+                # 2. Compute MSE from Uniform (0.25): sum((w - 0.25)^2)
+                # or CV^2 (Variance / Mean^2)
+                num_experts = avg_gate.size(0)
+                target_uniform = 1.0 / num_experts
+                loss_balance = (avg_gate - target_uniform).pow(2).sum() * 100.0 # Scale up for magnitude
+                
+                # Add to total loss
+                bal_term = (loss_balance * self.lambda_balance)
+                step_total_loss = step_total_loss + bal_term
+                
+                # Add to list for averaging
+                balance_losses.append(loss_balance.item())
+                
+                # Cleanup reference to free graph after backward
+                self._gate_weights_with_grad = None
 
             # Backward Pass (Per-Step)
             # This accumulates gradients in params. Graph is freed immediately after.
@@ -2745,8 +2785,9 @@ class ObserverOfflineBatchTrainer:
         pg_values = [v for v in pg_losses if v != 0.0]
         avg_pg = sum(pg_values) / len(pg_values) if pg_values else 0.0
 
-        avg_risk = sum(risk_losses) / len(risk_losses)
-        avg_dir = sum(dir_losses) / len(dir_losses)
+        avg_risk = sum(risk_losses) / len(risk_losses) if risk_losses else 0.0
+        avg_dir = sum(dir_losses) / len(dir_losses) if dir_losses else 0.0
+        avg_loss_balance = sum(balance_losses) / len(balance_losses) if balance_losses else 0.0 # [NEW]
 
         # Reconstruct approximate total loss for display
         # (This won't exactly match the backwarded loss due to estimator norm, but close enough for logs)
@@ -2754,6 +2795,7 @@ class ObserverOfflineBatchTrainer:
             self.lambda_pg * avg_pg
             + self.lambda_risk * avg_risk
             + self.lambda_dir * avg_dir
+            + self.lambda_balance * avg_loss_balance # [NEW]
         )
 
         # Compute direction stats for epoch accumulation
@@ -2866,6 +2908,7 @@ class ObserverOfflineBatchTrainer:
             "loss_pg": avg_pg,
             "loss_risk": avg_risk,
             "loss_dir": avg_dir,
+            "loss_bal": avg_loss_balance, # [NEW]
             "rebalance_ratio": sum(
                 [m.float().mean().item() for m in effective_rebalance_masks]
             )
@@ -3002,6 +3045,7 @@ class ObserverOfflineBatchTrainer:
             "loss_pg": 0.0,
             "loss_risk": 0.0,
             "loss_dir": 0.0,
+            "loss_bal": 0.0, # [NEW] Accumulator
             "rebalance_ratio": 0.0,
             "mean_risk_eta": 0.0,
             
@@ -3128,6 +3172,7 @@ class ObserverOfflineBatchTrainer:
                     "pg_loss": step_metrics["loss_pg"],
                     "risk_loss": step_metrics["loss_risk"],
                     "dir_loss": step_metrics["loss_dir"],
+                    "bal_loss": step_metrics.get("loss_bal", 0.0), # [NEW]
                     "grad_norm": step_metrics["grad_norm"],
                     "skipped_update": step_metrics["skipped_update"],
                     "risk_eta": step_metrics["mean_risk_eta"],
@@ -3366,7 +3411,8 @@ class ObserverOfflineBatchTrainer:
         smart_print(f"    ├─ Total:     {epoch_metrics['loss_total']:.6f}")
         smart_print(f"    ├─ PG:        {epoch_metrics['loss_pg']:.6f}")
         smart_print(f"    ├─ Risk:      {epoch_metrics['loss_risk']:.6f}")
-        smart_print(f"    └─ Direction: {epoch_metrics['loss_dir']:.6f}")
+        smart_print(f"    ├─ Direction: {epoch_metrics['loss_dir']:.6f}")
+        smart_print(f"    └─ Balance:   {epoch_metrics['loss_bal']:.6f}")
         smart_print("-" * 100)
         smart_print(
             f"  Rebalance Ratio:  {epoch_metrics['rebalance_ratio']:.2%} (of all timesteps)"
@@ -3394,7 +3440,8 @@ class ObserverOfflineBatchTrainer:
             loss_pg=epoch_metrics["loss_pg"],
             loss_risk=epoch_metrics["loss_risk"],
             loss_dir=epoch_metrics["loss_dir"],
-            
+            loss_bal=epoch_metrics.get("loss_bal", 0.0),  # [FIX] Add missing loss_bal
+
             # Selection
             topk_sharpe_ratio=epoch_metrics["topk_sharpe_ratio"],
             topk_mean_return=epoch_metrics["topk_mean_return"],
@@ -3610,19 +3657,18 @@ class ObserverOfflineBatchTrainer:
     @th.no_grad()
     def validate_epoch(
         self,
-        data_tensors: Dict[str, th.Tensor],
+        data_tensors: Dict[str, th.Tensor], # Changed from dataloader to data_tensors to match usage
         steps: Optional[int] = None,
-    ):
+        compute_loss: bool = False,
+    ) -> ObserverValidationResult:
         """
-        Validate model on held-out data and return comprehensive metrics.
-
+        Validate one epoch.
         Args:
             data_tensors: Prepared validation data tensors
-            steps: Number of validation steps (default: 10)
-
         Returns:
             ObserverValidationResult with all validation metrics
         """
+        print(f"[DEBUG] validate_epoch called with compute_loss={compute_loss}", flush=True)
         from RL_controller.observer_validation_metrics import ObserverValidationResult
 
         self.observer.mafia_model.eval()
@@ -3637,6 +3683,7 @@ class ObserverOfflineBatchTrainer:
         total_loss_pg = 0.0
         total_loss_risk = 0.0
         total_loss_dir = 0.0
+        total_loss_balance = 0.0 # [NEW] Accumulator
         
         # Accumulators for rewards & penalties
         total_reward = 0.0
@@ -3714,17 +3761,18 @@ class ObserverOfflineBatchTrainer:
                 pg_losses = []
                 risk_losses = []
                 dir_losses = []
+                balance_losses = [] # [NEW] Track balance loss per step
                 
                 # Reward collections
+                collected_raw_returns = []
+                collected_baselines = []
+                collected_unscaled_returns = []
+                
                 curr_batch_rewards = []
                 curr_batch_net = []
-                curr_batch_turnover = []
-                # Reward collections
-                curr_batch_rewards = []
-                curr_batch_net = []
-                curr_batch_hold_rewards = []  # [NEW]
                 curr_batch_turnover = []
                 curr_batch_symdiff = []
+                curr_batch_hold_rewards = []  # [NEW]
 
                 prev_indices_tensor = None
                 prev_scores_tensor = None
@@ -3833,6 +3881,16 @@ class ObserverOfflineBatchTrainer:
 
                     fresh_topk_indices = topk_indices.clone()
                     fresh_topk_scores = topk_scores.clone()
+
+                    # [NEW] Load Balancing Loss (Validation)
+                    loss_balance_step = 0.0
+                    if self._latest_gate_weights is not None:
+                        # _latest_gate_weights is (B, num_experts) - detached in hook
+                        avg_gate = self._latest_gate_weights.mean(dim=0)
+                        num_experts = avg_gate.size(0)
+                        target_uniform = 1.0 / num_experts
+                        loss_balance_step = (avg_gate - target_uniform).pow(2).sum().item() * 100.0
+                    balance_losses.append(loss_balance_step)
 
                     # Detach temporal state and buffer
                     if hasattr(self.observer.mafia_model, "detach_temporal_state"):
@@ -3981,27 +4039,36 @@ class ObserverOfflineBatchTrainer:
                     A_std = A_t_raw.std() + eps if B > 1 else 1.0
                     A_t = (A_t_raw - A_mean) / A_std
 
-                    log_probs = th.log(
-                        th.gather(market_scores_full, 1, final_indices) + eps
-                    )
-                    pg_term = -(log_probs * A_t.detach().unsqueeze(1)).mean(dim=1)
-                    entropy = -(
-                        market_scores_full * th.log(market_scores_full + eps)
-                    ).sum(dim=1)
-                    step_loss_val = pg_term - self.beta_entropy * entropy
+                    if compute_loss:
+                        # [Restored] Loss calculation for training metrics or if requested
+                        log_probs = th.log(
+                            th.gather(market_scores_full, 1, final_indices) + eps
+                        )
+                        pg_term = -(log_probs * A_t.detach().unsqueeze(1)).mean(dim=1)
+                        entropy = -(
+                            market_scores_full * th.log(market_scores_full + eps)
+                        ).sum(dim=1)
+                        step_loss_val = pg_term - self.beta_entropy * entropy
 
-                    risk_loss = (
-                        self.risk_criterion(risk_eta, batch.risk_targets[:, t])
-                        * self.risk_scaling_factor
-                    )
-                    dir_loss = self.dir_criterion(
-                        direction_logits, batch.direction_labels[:, t]
-                    )
+                        risk_loss = (
+                            self.risk_criterion(risk_eta, batch.risk_targets[:, t])
+                            * self.risk_scaling_factor
+                        )
+                        dir_loss = self.dir_criterion(
+                            direction_logits, batch.direction_labels[:, t]
+                        )
+                    else:
+                        step_loss_val = th.tensor(0.0, device=self.device)
+                        risk_loss = th.tensor(0.0, device=self.device)
+                        dir_loss = th.tensor(0.0, device=self.device)
 
                     step_pg_loss = (step_loss_val * effective_mask_float).sum()
                     pg_losses.append(step_pg_loss.item())
                     risk_losses.append(risk_loss.item())
                     dir_losses.append(dir_loss.item())
+                    
+                    if compute_loss:
+                         print(f"[DEBUG-LOSS] t={t} | PG={step_pg_loss.item():.4f} | Risk={risk_loss.item():.4f} | Dir={dir_loss.item():.4f}", flush=True)
                     
                     # Store rewards ONLY for rebalance events (matching effective_mask)
                     # Or do we want average per step? Spec usually implies rebalance events?
@@ -4063,17 +4130,28 @@ class ObserverOfflineBatchTrainer:
             pg_values = [v for v in pg_losses if v != 0.0]
             avg_pg = (sum(pg_values) / len(pg_values) if pg_values else 0.0) * norm_pg
             avg_risk = sum(risk_losses) / len(risk_losses) if risk_losses else 0.0
+            avg_risk = sum(risk_losses) / len(risk_losses) if risk_losses else 0.0
             avg_dir = sum(dir_losses) / len(dir_losses) if dir_losses else 0.0
+            avg_loss_balance = sum(balance_losses) / len(balance_losses) if balance_losses else 0.0 # [NEW]
             total_disp = (
                 self.lambda_pg * avg_pg
                 + self.lambda_risk * avg_risk
                 + self.lambda_dir * avg_dir
+                + self.lambda_balance * avg_loss_balance # [NEW] Include in reported total
             )
 
             total_loss_total += total_disp
             total_loss_pg += avg_pg
             total_loss_risk += avg_risk
             total_loss_dir += avg_dir
+            total_loss_balance += avg_loss_balance # [FIX] Accumulate balance loss
+            
+            print(f"[DEBUG-ACCUM] Step | Total={total_loss_total:.4f} | Bal={total_loss_balance:.4f} (InnerAvg={avg_loss_balance:.4f}) | Dir={total_loss_dir:.4f}", flush=True)
+            
+            # Note: total_loss_total will be updated with L_bal in the subsequent block where L_bal is computed
+            # actually total_disp calculated above now includes it.
+            
+            # Rewards and Hold Bonus
             
             # Rewards and Hold Bonus
             avg_rew = sum(curr_batch_rewards) / len(curr_batch_rewards) if curr_batch_rewards else 0.0
@@ -4107,6 +4185,7 @@ class ObserverOfflineBatchTrainer:
         avg_loss_pg = total_loss_pg / steps
         avg_loss_risk = total_loss_risk / steps
         avg_loss_dir = total_loss_dir / steps
+        avg_loss_balance = total_loss_balance / steps
         
         # Average rewards
         avg_reward = total_reward / steps
@@ -4154,7 +4233,9 @@ class ObserverOfflineBatchTrainer:
             loss_total=avg_loss_total,
             loss_pg=avg_loss_pg,
             loss_risk=avg_loss_risk,
+
             loss_dir=avg_loss_dir,
+            loss_bal=avg_loss_balance, # [NEW]
             topk_sharpe_ratio=selection_metrics["sharpe_ratio"],
             topk_mean_return=selection_metrics["mean_return"],
             topk_volatility=selection_metrics["volatility"],

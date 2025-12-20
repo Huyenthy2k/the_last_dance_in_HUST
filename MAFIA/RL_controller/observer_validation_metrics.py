@@ -8,7 +8,7 @@ per Spec §7. Observer training is ON-POLICY (Collect → Train → Discard) and
 outputs Observer-specific metrics, NOT TD3 off-policy metrics.
 
 Validation Metrics Categories:
-    1. Loss Components: L_PG, L_Risk, L_Dir
+    1. Loss Components: L_PG, L_Risk, L_Dir, L_Bal
     2. Selection Performance: Top-K Sharpe Ratio, returns, volatility, turnover
     3. Direction Performance: F1-Score for Bull/Side/Bear classification
     4. Risk Performance: MSE/MAE/correlation for eta prediction
@@ -34,7 +34,9 @@ class ObserverValidationResult:
         loss_total: Total weighted loss
         loss_pg: Policy Gradient loss (selection task)
         loss_risk: MSE loss for risk eta prediction
+        loss_risk: MSE loss for risk eta prediction
         loss_dir: Cross-Entropy loss for direction classification
+        loss_bal: Load balancing loss (auxiliary)
         
         # Selection Performance Metrics (Spec §7.1168)
         topk_sharpe_ratio: Sharpe Ratio of equal-weighted Top-K portfolio
@@ -55,7 +57,7 @@ class ObserverValidationResult:
         risk_correlation: Pearson correlation between pred and target eta
         
         # Composite Efficiency Score (Spec §7.1164-1178)
-        ces_score: Final CES = 0.6*Sharpe + 0.2*Dir_F1 + 0.2*(1-Risk_MSE)
+        ces_score: Final CES = 0.5*Sharpe + 0.3*Dir_F1 + 0.2*(1-Risk_MSE)
         ces_rank_sharpe: Rank-normalized Sharpe (0 to 1)
         ces_rank_dir_f1: Rank-normalized Direction F1 (0 to 1)
         ces_rank_risk_mse: Rank-normalized Risk MSE (0 to 1)
@@ -81,6 +83,7 @@ class ObserverValidationResult:
     loss_pg: float = 0.0
     loss_risk: float = 0.0
     loss_dir: float = 0.0
+    loss_bal: float = 0.0
     
     # Selection performance
     topk_sharpe_ratio: float = 0.0

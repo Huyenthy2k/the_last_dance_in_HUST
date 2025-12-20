@@ -2338,7 +2338,14 @@ class MAFIAObserver:
         mafia_state = checkpoint["mafia_model_state_dict"]
         # Ensure dynamically created temp embeddings exist before strict load
         self._ensure_temp_embeddings_from_state(mafia_state)
-        self.mafia_model.load_state_dict(mafia_state)
+        try:
+            self.mafia_model.load_state_dict(mafia_state)
+        except RuntimeError as e:
+            smart_print(
+                f"[MAFIA] Warning: Strict load failed ({e}). Retrying with strict=False to allow partial loading...",
+                flush=True,
+            )
+            self.mafia_model.load_state_dict(mafia_state, strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         try:
             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
