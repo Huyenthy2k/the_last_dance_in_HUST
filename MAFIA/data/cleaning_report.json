@@ -1,0 +1,14 @@
+{
+  "input_file": "data/stock_data_top23.csv",
+  "output_file": "data/stock_data_top23_cleaned.csv",
+  "timestamp": "2025-12-16T23:53:31.082671",
+  "input_stats": {
+    "total_rows": 61539,
+    "total_stocks": 23,
+    "date_range": [
+      "2015-01-05",
+      "2025-11-06"
+    ]
+  },
+  "issues_found": {
+    "zero_price_rows": 

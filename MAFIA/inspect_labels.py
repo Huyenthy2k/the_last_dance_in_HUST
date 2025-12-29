@@ -16,11 +16,11 @@ def inspect_labels():
     
     # 1. Config
     config = Config(create_dirs=False)
-    # Ensure correct params
-    config.direction_label_lookahead = 14
-    config.direction_label_atr_period = 14
-    config.direction_label_atr_multiplier = 2.0
-    config.direction_label_delta_min = 0.02
+    # Ensure correct params (synced with 21-day config)
+    config.direction_label_lookahead = 21
+    config.direction_label_atr_period = 21
+    config.direction_label_atr_multiplier = 1.5
+    config.direction_label_delta_min = 0.015
     
     # 2. Load Data
     data_path = "data/stock_data_dynamic143.csv" 
@@ -98,11 +98,12 @@ def inspect_labels():
     print(f"Validation T_total: {T_total}")
     
     # Simulating the loop logic for labeling
-    atr_period = 14
-    k_atr = 2.0
-    delta_min = 0.02
+    # Synced with config.py (21-day horizon)
+    atr_period = 21
+    k_atr = 1.5
+    delta_min = 0.015
     stop_loss = -0.07
-    lookahead = 14
+    lookahead = 21
     
     labels = []
     

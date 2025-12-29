@@ -96,6 +96,9 @@ class CSAModule(nn.Module):
         # Token Generation: Reshape (N, T_w, M) -> (N, T_w*M)
         # This is done in forward pass
 
+        # Input LayerNorm before embedding (stabilizes early layers)
+        self.input_norm = nn.LayerNorm(self.token_dim)
+
         # Embedding MLP
         self.embedding = nn.Sequential(
             nn.Linear(self.token_dim, self.D_h), nn.GELU(), nn.Linear(self.D_h, self.D)
@@ -109,7 +112,7 @@ class CSAModule(nn.Module):
                     d_model=self.D,
                     nhead=config.mafia_encoder_heads,
                     dim_feedforward=self.D_h * 2,
-                    dropout=0.1,
+                    dropout=getattr(config, "mafia_backbone_dropout", 0.1),
                 )
             )
         self.encoder = nn.Sequential(*encoder_layers)
@@ -129,6 +132,9 @@ class CSAModule(nn.Module):
         # Token Generation: Reshape (N, T_w, M) -> (N, T_w*M)
         # Reshape: (batch, N, T_w, M) -> (batch, N, T_w*M)
         tokens = P_i.reshape(batch_size, N, self.token_dim)
+
+        # Input LayerNorm (stabilizes embedding layer)
+        tokens = self.input_norm(tokens)
 
         # Embedding
         embedded = self.embedding(tokens)  # (batch, N, D)
@@ -185,6 +191,9 @@ class TAModule(nn.Module):
         else:  # dc
             self.M = int(config.mafia_M_dc)  # 5
             self.token_dim = int(actual_N * self.M)  # N * M
+
+        # Input LayerNorm before embedding (stabilizes early layers)
+        self.input_norm = nn.LayerNorm(self.token_dim)
 
         # Embedding MLP
         if shared_mlp is not None and agent_type == "dc":
@@ -246,18 +255,23 @@ class TAModule(nn.Module):
         # If token_dim changed, we need to handle embedding differently
         # For now, use a linear projection if needed
         if actual_token_dim != self.token_dim:
-            # Create a temporary embedding layer if dimensions don't match
+            # Create a temporary embedding layer and input_norm if dimensions don't match
             if (
                 not hasattr(self, "_temp_embedding")
                 or self._temp_embedding[0].in_features != actual_token_dim
             ):
+                self._temp_input_norm = nn.LayerNorm(actual_token_dim).to(tokens.device)
                 self._temp_embedding = nn.Sequential(
                     nn.Linear(actual_token_dim, self.D_h),
                     nn.GELU(),
                     nn.Linear(self.D_h, self.D),
                 ).to(tokens.device)
+            # Apply input LayerNorm before embedding
+            tokens = self._temp_input_norm(tokens)
             embedded = self._temp_embedding(tokens)  # (batch, T_w, D)
         else:
+            # Apply input LayerNorm before embedding (stabilizes embedding layer)
+            tokens = self.input_norm(tokens)
             embedded = self.embedding(tokens)  # (batch, T_w, D)
 
         # Signal Merging: Add positional encoding
@@ -789,6 +803,11 @@ class DenseMoEGatingRouter(nn.Module):
         # Selection Adapter: Projects raw context for Gating (Selection Task)
         self.selection_adapter = nn.Linear(self.D, self.D)
 
+        # Context Buffer Normalization (Spec 3.6 v2.1)
+        # Normalizes C_bar and Delta_C before adapter projection
+        # to ensure consistent scale for all components in C_aug
+        self.context_norm = nn.LayerNorm(self.D)
+
     def reset_temporal_state(self):
         """Reset temporal encoder state (Spec 3.6.2) when encoder is stateful."""
         if self._stateful_encoder:
@@ -881,6 +900,10 @@ class DenseMoEGatingRouter(nn.Module):
                 C_oldest_raw = rolling_raw[:, 0, :]  # (batch, D)
                 Delta_C_raw = raw_context - C_oldest_raw  # (batch, D)
 
+                # Normalize before projection to ensure consistent scale
+                C_bar_raw = self.context_norm(C_bar_raw)
+                Delta_C_raw = self.context_norm(Delta_C_raw)
+
                 # Project statistics to Selection View
                 C_bar_sel = self.selection_adapter(C_bar_raw)
                 Delta_C_sel = self.selection_adapter(Delta_C_raw)
@@ -915,17 +938,51 @@ class DenseMoEGatingRouter(nn.Module):
         return gate_weights, raw_context
 
 
+
+class CrossInteractionLayer(nn.Module):
+    """
+    Lightweight Cross Network Layer (DeepFM/DCN style).
+    Formula: x_out = x_0 * (x_in · w + b) + x_in
+    Captures explicit feature interactions with linear complexity.
+    """
+
+    def __init__(self, in_features):
+        super().__init__()
+        self.w = nn.Parameter(th.randn(in_features))
+        self.b = nn.Parameter(th.zeros(in_features))
+        # Init weights small to start near linear behavior
+        nn.init.normal_(self.w, std=0.01)
+
+    def forward(self, x_0, x_in=None):
+        """
+        Args:
+            x_0: (batch, D) - Initial features (Cross inputs)
+            x_in: (batch, D) - Previous layer output (default=x_0)
+        """
+        if x_in is None:
+            x_in = x_0
+        
+        # Interaction: x_0 * (scalar_score)
+        # score = dot(x_in, w) + b
+        interaction_scalar = th.sum(x_in * self.w, dim=-1, keepdim=True) + self.b
+        
+        # Residual connection: x_0 * interaction + x_in
+        return x_0 * interaction_scalar + x_in
+
+
 class DirectionHead(nn.Module):
     """
-    Wide & Deep Late Fusion Direction Head (Spec 3.5 v2.1)
+    Wide & Deep Late Fusion Direction Head (Spec 3.5 v2.3)
 
     Uses Late Fusion architecture to solve Information Bottleneck problem.
-    Explicit signals bypass ResBlock and fuse directly at classification layer.
+    Explicit signals bypass Deep Path and fuse directly at classification layer.
 
-    Architecture (Spec 3.5.2):
-    - Deep Path: X_latent = [C_mkt, ΔC_mkt] → InputProj(2D→D) → ResBlock → h_deep
-    - Wide Path: X_explicit (4 signals) → bypass (direct anchoring)
-    - Late Fusion: H_final = Concat(h_deep, X_explicit) → Classifier(D+4 → 3)
+    Architecture (Spec 3.5.2 v2.3 - Expand-then-Compress, No ResBlock):
+    - Deep Path: X_latent = [C_mkt, ΔC_mkt] → Expand(2D→3D) → GELU → Compress(3D→D) → h_deep
+      * Expansion learns richer C×Δ interactions (e.g., bullish + negative momentum = reversal)
+      * No ResBlock for simplicity - Expand-Compress provides sufficient expressivity
+    - Wide Path: X_explicit (6 signals) → CrossInteraction → bypass (direct anchoring)
+    - Late Fusion: H_final = Concat(h_deep, X_wide) → Classifier(D+6 → 3)
 
     Output: logits for 3 classes (Bear/Side/Bull)
     """
@@ -934,7 +991,7 @@ class DirectionHead(nn.Module):
         super().__init__()
         self.D = config.mafia_D
         self.num_classes = 3
-        self.dropout_rate = getattr(config, "direction_head_dropout", 0.2)
+        self.dropout_rate = getattr(config, "direction_head_dropout", 0.1)
 
         # Explicit signals (Spec §3.5.1 v2.1): 6 dims (Wide Path)
         # 1. DC_Event_Flag: Structural break signal from Market-DC Agent
@@ -945,40 +1002,48 @@ class DirectionHead(nn.Module):
         # 6. Drawdown60: Rolling drawdown (Pain)
         self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
 
-        # Deep Path: Input Projection for LATENT only (2D -> D)
+        # Deep Path: Expand-then-Compress for richer C×Δ interaction (v2.3 - No ResBlock)
+        # [C_mkt, ΔC_mkt] (2D) → Expand(2D→3D) → GELU → Compress(3D→D)
+        # Expansion allows learning non-linear C×Δ interactions before compressing
+        # Removed ResBlock for simplicity - Expand-Compress already provides sufficient expressivity
         self.latent_dim = self.D * 2  # C_mkt(D) + Delta_C(D)
-        self.input_proj = nn.Linear(self.latent_dim, self.D)
-
-        # Residual Block (Spec 3.5.2)
-        self.res_ln = nn.LayerNorm(self.D)
-        self.res_fc1 = nn.Linear(self.D, self.D)
-        self.res_fc2 = nn.Linear(self.D, self.D)
-        self.res_dropout = nn.Dropout(self.dropout_rate)
+        self.expand_dim = self.D * 3  # Expanded space for richer interaction
+        self.expand_proj = nn.Linear(self.latent_dim, self.expand_dim)
+        self.compress_proj = nn.Linear(self.expand_dim, self.D)
+        self.deep_norm = nn.LayerNorm(self.D)  # [FIX] Normalize Deep Path output to match Wide Path scale
 
         # Wide Path: Explicit Norm (Robustness)
         self.explicit_norm = nn.LayerNorm(self.explicit_dim)
-
+        
+        # Wide Path: Interaction (Cross Network)
+        self.wide_interaction = CrossInteractionLayer(self.explicit_dim)  
+        self.post_interaction_norm = nn.LayerNorm(self.explicit_dim)      
+        
         # Classification Head: Late Fusion (D + 4 -> 3)
         self.classifier = nn.Linear(self.D + self.explicit_dim, self.num_classes)
 
-        # Initialize bias to log-priors matching data distribution
+        # Dropout for regularization (prevent overfitting)
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+        # Initialize bias to log-priors and zero ALL weights
+        # This ensures initial predictions = softmax(bias) = ground truth distribution
         self._init_classifier_bias()
-        # Smart-initialize explicit signal weights (hot-start for Wide Path)
+        # Enable smart-init for Wide Path explicit signals
         self._init_explicit_signal_weights()
 
     def _init_classifier_bias(self):
         """
-        Initialize classifier bias to log-priors matching data distribution.
+        Initialize classifier with ZERO bias - uniform start, no class preference.
 
-        VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
-        log(0.22)=-1.514, log(0.44)=-0.821, log(0.34)=-1.079
-
-        This gives model prior knowledge about class frequencies,
-        helping faster convergence without biasing toward majority class.
+        Strategy:
+        - Bias: All zeros → softmax([0,0,0]) = [33%, 33%, 33%]
+        - Model learns class distribution purely from data + dynamic class weights
+        - Weights: Keep PyTorch default (Kaiming uniform)
         """
         with th.no_grad():
-            # Log-prior initialization (matches data distribution)
-            self.classifier.bias.copy_(th.tensor([-1.514, -0.821, -1.079]))
+            # Zero bias - uniform start, let dynamic weighting guide learning
+            self.classifier.bias.zero_()
+            # Weights: Keep default PyTorch init (Kaiming uniform)
 
     def _init_explicit_signal_weights(self):
         """
@@ -999,36 +1064,33 @@ class DirectionHead(nn.Module):
         """
         with th.no_grad():
             # Indices in the concatenated input (Deep=0..D-1, Wide=D..D+5)
+            # NOTE: Use VERY SMALL weights (0.01-0.05) to provide gentle hints
+            # without overwhelming the learning signal from data
 
-            # 0. Vol_Std20 (Index D+0) - Risk/Fear
-            # High Vol -> Bearish Bias
-            self.classifier.weight[0, self.D + 0] = 0.2   # High Vol increases Bear prob
-            self.classifier.weight[2, self.D + 0] = -0.2  # High Vol decreases Bull prob
+            # 0. Relative_Vol (Index D+0) - High Relative Vol -> Bearish Bias
+            self.classifier.weight[0, self.D + 0] = 0.02   # High Vol increases Bear prob
+            self.classifier.weight[2, self.D + 0] = -0.02  # High Vol decreases Bull prob
 
-            # 1. DC Event Flag (Index D+1) - Strongest Signal (Trend Break)
-            # Was 0.0 (blocked gradient), now 0.05 to allow learning start
-            self.classifier.weight[:, self.D + 1] = 0.05
+            # 1. DC Event Flag (Index D+1) - Trend Break hint
+            self.classifier.weight[:, self.D + 1] = 0.01
 
             # 2. Breadth_Gap (Index D+2) - "Xanh vỏ đỏ lòng"
-            self.classifier.weight[0, self.D + 2] = -0.3 # Neg Gap -> Bear
-            self.classifier.weight[2, self.D + 2] = 0.3  # Pos Gap -> Bull
+            self.classifier.weight[0, self.D + 2] = -0.03  # Neg Gap -> Bear
+            self.classifier.weight[2, self.D + 2] = 0.03   # Pos Gap -> Bull
 
             # 3. Div_Signal (Index D+3) - Reversal
-            self.classifier.weight[0, self.D + 3] = -0.5
-            self.classifier.weight[2, self.D + 3] = 0.5
+            self.classifier.weight[0, self.D + 3] = -0.05
+            self.classifier.weight[2, self.D + 3] = 0.05
 
             # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
             if self.explicit_dim > 4:
-                self.classifier.weight[0, self.D + 4] = -0.3
-                self.classifier.weight[2, self.D + 4] = 0.3
+                self.classifier.weight[0, self.D + 4] = -0.03
+                self.classifier.weight[2, self.D + 4] = 0.03
 
-            # 5. Drawdown60 (Index D+5) - Trend Following Logic (UPDATED)
+            # 5. Drawdown60 (Index D+5) - Trend Following
             if self.explicit_dim > 5:
-                # Drawdown is negative value (e.g. -0.2).
-                # Bear Impact: Weight(-0.2) * Value(-0.2) = +0.04 -> Increases Bear score (Correct: Deep DD -> Bearish)
-                self.classifier.weight[0, self.D + 5] = -0.2
-                # Bull Impact: Weight(0.2) * Value(-0.2) = -0.04 -> Decreases Bull score (Correct: Deep DD -> Less Bullish)
-                self.classifier.weight[2, self.D + 5] = 0.2
+                self.classifier.weight[0, self.D + 5] = -0.02
+                self.classifier.weight[2, self.D + 5] = 0.02
 
             # Ensure Side Class (1) remains neutral to these signals initially
             self.classifier.weight[1, self.D : self.D + self.explicit_dim] = 0.0
@@ -1052,28 +1114,29 @@ class DirectionHead(nn.Module):
             logits: (B, 3) - Bear/Side/Bull classification logits
         """
         # === 0. Signal Scaling (Robustness) ===
-        # Use trainable LayerNorm instead of hardcoded constants
+        # Clamp explicit signals to [-3, 3] (3 sigma rule) to bound outliers
+        explicit_signals = explicit_signals.clamp(-3.0, 3.0)
+        # Use trainable LayerNorm for adaptive scaling
         # explicit_signals: (B, 6)
         signals_scaled = self.explicit_norm(explicit_signals)
 
-        # === 1. Deep Path: Process latent context ===
+        # === 1. Deep Path: Expand-then-Compress (v2.3 - No ResBlock) ===
         x_latent = th.cat([c_mkt, delta_c_mkt], dim=-1)  # (B, 2D)
-        
+
         # [ROBUSTNESS] Sanitize latent input
         if th.isnan(x_latent).any() or th.isinf(x_latent).any():
              x_latent = th.nan_to_num(x_latent, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        h = self.input_proj(x_latent)  # (B, D)
+        # Expand → GELU → Compress: Learn C×Δ interactions in expanded space
+        h_expanded = self.expand_proj(x_latent)  # (B, 3D)
+        h_expanded = F.gelu(h_expanded)
+        h_deep = self.compress_proj(h_expanded)  # (B, D) - Direct output, no ResBlock
+        h_deep = self.deep_norm(h_deep)  # [FIX] Normalize to match Wide Path scale
 
-        # Residual Block with Skip Connection
-        h_res = self.res_ln(h)
-        h_res = F.gelu(self.res_fc1(h_res))
-        h_res = self.res_dropout(h_res)
-        h_res = self.res_fc2(h_res)
-        h_deep = h + h_res  # (B, D)
-
-        # === 2. Wide Path: Direct bypass (no transformation) ===
-        x_wide = signals_scaled  # (B, 6)
+        # === 2. Wide Path: Interaction Bypass ===
+        # Apply Cross Interaction to capture "Vol * RSI" type features
+        x_wide = self.wide_interaction(signals_scaled)  # (B, 6)
+        x_wide = self.post_interaction_norm(x_wide)     # Normalize after interaction (distribution shift fix)
         
         # [ROBUSTNESS] Sanitize wide input
         if th.isnan(x_wide).any() or th.isinf(x_wide).any():
@@ -1083,6 +1146,7 @@ class DirectionHead(nn.Module):
         h_final = th.cat([h_deep, x_wide], dim=-1)  # (B, D+6)
 
         # === 4. Classification ===
+        h_final = self.dropout(h_final)  # Dropout before classifier
         logits = self.classifier(h_final)  # (B, 3)
         
         # [ROBUSTNESS] Final Output Guard
@@ -1095,30 +1159,42 @@ class DirectionHead(nn.Module):
 
 class RiskHead(nn.Module):
     """
-    Wide & Deep Risk Head (Spec v2.1)
+    Wide & Deep Risk Head (Spec v2.3 - Expand-then-Compress, No MLP)
 
     Architecture:
-    - Deep Path: [C_mkt_macro, Delta_C_mkt] -> MLP -> h_deep
-    - Wide Path: Explicit Signals (6 dims) -> Concat -> Output
+    - Deep Path: [C_mkt_macro, ΔC_mkt] → Expand(2D→3D) → GELU → Compress(3D→D) → h_deep
+      * Expansion learns richer C×Δ interactions (e.g., high vol + negative momentum = defensive)
+      * No extra MLP for simplicity - Expand-Compress provides sufficient expressivity
+    - Wide Path: Explicit Signals (6 dims) → CrossInteraction → Concat → Output
     """
 
     def __init__(self, config):
         super().__init__()
         self.D = config.mafia_D
         self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
+        self.dropout_rate = getattr(config, "risk_head_dropout", 0.1)
 
-        # Deep Path
+        # Deep Path: Expand-then-Compress for richer C×Δ interaction (v2.3 - No MLP)
+        # [C_mkt, ΔC_mkt] (2D) → Expand(2D→3D) → GELU → Compress(3D→D)
+        # Removed extra MLP for simplicity - aligned with DirectionHead
         self.input_dim = self.D * 2  # C_mkt + Delta_C
-        self.deep_net = nn.Sequential(
-            nn.Linear(self.input_dim, self.D),
-            nn.LayerNorm(self.D),
-            nn.GELU(),
-            nn.Linear(self.D, self.D),
-            nn.GELU(),
-        )
+        self.expand_dim = self.D * 3  # Expanded space for richer interaction
+        self.expand_proj = nn.Linear(self.input_dim, self.expand_dim)  # Expand: 2D → 3D
+        self.compress_proj = nn.Linear(self.expand_dim, self.D)  # Compress: 3D → D
+        self.deep_norm = nn.LayerNorm(self.D)  # [FIX] Normalize Deep Path output to match Wide Path scale
 
         # Late Fusion
         self.fusion_net = nn.Linear(self.D + self.explicit_dim, 1)
+
+        # Dropout for regularization (prevent overfitting)
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+        # Wide Path: Explicit Norm (Robustness - Aligned with DirectionHead)
+        self.explicit_norm = nn.LayerNorm(self.explicit_dim)
+        
+        # Wide Path: Interaction (Cross Network)
+        self.wide_interaction = CrossInteractionLayer(self.explicit_dim)
+        self.post_interaction_norm = nn.LayerNorm(self.explicit_dim)
 
         # Smart Initalization for Wide Path (Spec 3.5.1 v2.1)
         self._init_explicit_signal_weights()
@@ -1134,39 +1210,33 @@ class RiskHead(nn.Module):
         with th.no_grad():
             # Fusion net input: [Deep(D), Wide(6)] -> Output(1)
             # Wide signals start at index D.
+            # NOTE: Use VERY SMALL weights (0.02-0.05) to provide gentle hints
+            # without overwhelming the learning signal from data
 
-            # 0. Vol_Std20 (Index D+0) - High Vol -> Low Eta
-            self.fusion_net.weight[0, self.D + 0] = -0.5
+            # 0. Relative_Vol (Index D+0) - High Relative Vol -> Low Eta
+            self.fusion_net.weight[0, self.D + 0] = -0.05
 
             # 1. DC_Event_Flag (Index D+1) - Trend Break -> Low Eta
-            self.fusion_net.weight[0, self.D + 1] = -0.3
+            self.fusion_net.weight[0, self.D + 1] = -0.03
 
-            # 2. Breadth_Gap (Index D+2) - Negative Gap (Bear Trap) -> Low Eta
-            # Gap is usually negative in bad times?
-            # Metric: avg(RSI_stocks) - RSI_index.
-            # If Indx high but stocks low -> Gap < 0. This is Bear Trap.
-            # So Gap < 0 -> Low Eta. Gap > 0 -> High Eta.
-            # Positive weight propagates sign correctly.
-            self.fusion_net.weight[0, self.D + 2] = 0.3
+            # 2. Breadth_Gap (Index D+2) - Positive Gap -> High Eta
+            self.fusion_net.weight[0, self.D + 2] = 0.03
 
-            # 3. Div_Signal (Index D+3) - Reversal
-            # -1 (Bearish Div) -> Low Eta. +1 (Bullish Div) -> High Eta.
-            self.fusion_net.weight[0, self.D + 3] = 0.3
+            # 3. Div_Signal (Index D+3) - Bullish Div -> High Eta
+            self.fusion_net.weight[0, self.D + 3] = 0.03
 
-            # 4. Signed_VPI_Zscore (Index D+4)
+            # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
             if self.explicit_dim > 4:
-                 self.fusion_net.weight[0, self.D + 4] = 0.3
+                 self.fusion_net.weight[0, self.D + 4] = 0.03
 
-            # 5. Drawdown60 (Index D+5) - Pain
-            # Drawdown is negative (e.g. -0.15). Deep drawback -> Low Eta.
-            # Weight > 0 means (-0.15 * 0.5) -> negative impact. Correct.
+            # 5. Drawdown60 (Index D+5) - Deep DD -> Low Eta
             if self.explicit_dim > 5:
-                 self.fusion_net.weight[0, self.D + 5] = 0.5
+                 self.fusion_net.weight[0, self.D + 5] = 0.05
 
-            # Initialize bias to 0.0 (Neutral start) or slight positive (1.0 base)
-            # But output is passed to tanh... eta = base + amp * tanh(raw).
-            # So 0.0 -> tanh(0)=0 -> eta=base. Correct.
+            # Initialize bias to 0.0 (Neutral start)
             self.fusion_net.bias.fill_(0.0)
+
+            # Deep Path weights: Keep PyTorch default (Kaiming uniform)
 
     def forward(
         self,
@@ -1181,33 +1251,38 @@ class RiskHead(nn.Module):
             explicit_signals: (B, 6) - [Vol20, DC, Breadth, Div, VPI, DD60]
         """
         # === 0. Signal Scaling (Robustness) ===
-        c_vol = 100.0
-        c_gap = 0.1
-        c_vpi = 0.5
-        
-        signals_scaled = explicit_signals.clone()
-        signals_scaled[:, 0] = signals_scaled[:, 0] * c_vol
-        signals_scaled[:, 2] = signals_scaled[:, 2] * c_gap
-        if signals_scaled.shape[1] > 4:
-            signals_scaled[:, 4] = signals_scaled[:, 4] * c_vpi
+        # Clamp explicit signals to [-3, 3] (3 sigma rule) to bound outliers
+        explicit_signals = explicit_signals.clamp(-3.0, 3.0)
+        # Use trainable LayerNorm for adaptive scaling (Aligned with DirectionHead)
+        # explicit_signals: (B, 6)
+        signals_scaled = self.explicit_norm(explicit_signals)
 
-        # Deep Path
-        x_deep = th.cat([c_mkt_macro, delta_c_mkt], dim=-1)
-        
-        # [ROBUSTNESS] Sanitize deep input
-        if th.isnan(x_deep).any() or th.isinf(x_deep).any():
-             x_deep = th.nan_to_num(x_deep, nan=0.0, posinf=1.0, neginf=-1.0)
-             
-        h_deep = self.deep_net(x_deep)
+        # === 1. Deep Path: Expand-then-Compress (v2.3 - No MLP) ===
+        x_latent = th.cat([c_mkt_macro, delta_c_mkt], dim=-1)  # (B, 2D)
+
+        # [ROBUSTNESS] Sanitize latent input
+        if th.isnan(x_latent).any() or th.isinf(x_latent).any():
+             x_latent = th.nan_to_num(x_latent, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Expand → GELU → Compress: Learn C×Δ interactions in expanded space
+        h_expanded = self.expand_proj(x_latent)  # (B, 3D)
+        h_expanded = F.gelu(h_expanded)
+        h_deep = self.compress_proj(h_expanded)  # (B, D) - Direct output, no MLP
+        h_deep = self.deep_norm(h_deep)  # [FIX] Normalize to match Wide Path scale
+
 
 
         # Wide Path & Fusion
-        x_wide = signals_scaled
+        # Apply Cross Interaction (Vol * RSI)
+        x_wide = self.wide_interaction(signals_scaled)
+        x_wide = self.post_interaction_norm(x_wide) # Normalize distribution shift from interaction
+        
         # [ROBUSTNESS] Sanitize wide input
         if th.isnan(x_wide).any() or th.isinf(x_wide).any():
              x_wide = th.nan_to_num(x_wide, nan=0.0, posinf=1.0, neginf=-1.0)
              
         h_final = th.cat([h_deep, x_wide], dim=-1)
+        h_final = self.dropout(h_final)  # Dropout before fusion
         eta_raw = self.fusion_net(h_final)
 
         return eta_raw.squeeze(-1)
@@ -1254,10 +1329,100 @@ class DenseMoESignalGenerator(nn.Module):
         # Macro Adapter: Projects raw context for Direction/Risk (Macro Task)
         self.macro_adapter = nn.Linear(self.D, self.D)
 
+        # Delta normalization for momentum signal (Spec 3.6 v2.1)
+        # Normalizes delta_c_mkt before passing to Direction/Risk Heads
+        self.delta_norm = nn.LayerNorm(self.D)
+
         # Holding Bias (Learnable Inertia) - Spec "Memory Injection"
         # Bias added to logits of currently held stocks to encourage retention
         # Initialize to 0.01 (Smart Init) to encourage holding from start (helps convergence vs turnover penalty)
         self.holding_bias = nn.Parameter(th.tensor([0.01]))
+
+    def set_train_mode(self, mode: str):
+        """
+        Configure trainable parameters based on training mode (Separated Training).
+
+        Args:
+            mode: "FULL", "MACRO_ONLY", or "SELECTION_ONLY"
+                - MACRO_ONLY: Freeze Selection (Gate Network), Train Backbone + Macro Heads
+                - SELECTION_ONLY: Freeze Backbone (incl. Temporal Encoder) + Macro Heads, Train Selection
+        """
+        # 1. Default: Unfreeze everything
+        for p in self.parameters():
+            p.requires_grad = True
+
+        if mode == "MACRO_ONLY":
+            # Freeze Selection Head (Gate Network)
+            for p in self.gating_router.gate_network.parameters():
+                p.requires_grad = False
+            if hasattr(self.gating_router, "selection_adapter"):
+                for p in self.gating_router.selection_adapter.parameters():
+                    p.requires_grad = False
+
+            # [FIX] Freeze Selection-related learnable parameters in MACRO_ONLY mode
+            # These parameters only affect stock selection (PG Loss), not Macro direction
+            # - topk_temperature: Gumbel-TopK sampling sharpness for selection
+            # - holding_bias: Memory injection bias to encourage holding stocks
+            # They should only be trained via PG Loss in SELECTION_ONLY phase
+            self.topk_temperature.requires_grad = False
+            self.holding_bias.requires_grad = False
+
+            # Ensure Backbone (Temporal Encoder) is TRAINABLE
+            # (Already True by default loop, but explicit check good for safety)
+
+        elif mode == "SELECTION_ONLY":
+            # Freeze Backbone (Temporal Encoder) - CRITICAL: This is the Macro Stream
+            if hasattr(self.gating_router, "temporal_encoder"):
+                 for p in self.gating_router.temporal_encoder.parameters():
+                     p.requires_grad = False
+            if hasattr(self.gating_router, "mkt_proj"):
+                 for p in self.gating_router.mkt_proj.parameters():
+                     p.requires_grad = False
+            # Freeze context_norm (part of Macro path in router)
+            if hasattr(self.gating_router, "context_norm"):
+                 for p in self.gating_router.context_norm.parameters():
+                     p.requires_grad = False
+
+            # Freeze Direction & Risk Heads (Macro Outputs)
+            for p in self.direction_head.parameters():
+                p.requires_grad = False
+            for p in self.risk_head.parameters():
+                p.requires_grad = False
+            if hasattr(self, "macro_adapter"):
+                 for p in self.macro_adapter.parameters():
+                     p.requires_grad = False
+            # Freeze delta_norm (part of Macro path)
+            if hasattr(self, "delta_norm"):
+                 for p in self.delta_norm.parameters():
+                     p.requires_grad = False
+
+        # === GRADIENT VERIFICATION LOGGING ===
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        total_params = trainable_params + frozen_params
+
+        print(f"[set_train_mode] Mode: {mode}")
+        print(f"  - Trainable: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"  - Frozen:    {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+
+        # Verify critical components are frozen/trainable as expected
+        if mode == "MACRO_ONLY":
+            # Verify Gate Network is frozen
+            gate_frozen = all(not p.requires_grad for p in self.gating_router.gate_network.parameters())
+            dir_trainable = all(p.requires_grad for p in self.direction_head.parameters())
+            assert gate_frozen, "[ASSERT FAILED] Gate Network should be frozen in MACRO_ONLY!"
+            assert dir_trainable, "[ASSERT FAILED] Direction Head should be trainable in MACRO_ONLY!"
+            print(f"  ✓ Verified: Gate Network frozen, Direction Head trainable")
+
+        elif mode == "SELECTION_ONLY":
+            # Verify Direction/Risk Heads are frozen
+            dir_frozen = all(not p.requires_grad for p in self.direction_head.parameters())
+            risk_frozen = all(not p.requires_grad for p in self.risk_head.parameters())
+            gate_trainable = all(p.requires_grad for p in self.gating_router.gate_network.parameters())
+            assert dir_frozen, "[ASSERT FAILED] Direction Head should be frozen in SELECTION_ONLY!"
+            assert risk_frozen, "[ASSERT FAILED] Risk Head should be frozen in SELECTION_ONLY!"
+            assert gate_trainable, "[ASSERT FAILED] Gate Network should be trainable in SELECTION_ONLY!"
+            print(f"  ✓ Verified: Direction/Risk Heads frozen, Gate Network trainable")
 
     def reset_router_state(self):
         """Reset stateful components inside the gating router (LSTM hidden/cache)."""
@@ -1514,6 +1679,8 @@ class DenseMoESignalGenerator(nn.Module):
             
             c_oldest_macro = self.macro_adapter(c_oldest_raw)
             delta_c_mkt = context_macro - c_oldest_macro  # Macro momentum
+            # Normalize momentum for consistent scale with context
+            delta_c_mkt = self.delta_norm(delta_c_mkt)
 
         # Require explicit signals - Spec §3.5.1 Updated (6 signals)
         if explicit_signals is None:
@@ -1575,13 +1742,13 @@ class MAFIAModel(nn.Module):
         self.dc_csa_list = nn.ModuleList(
             [
                 CSAModule(config, agent_type="dc")
-                for _ in range(len(self.config.mafia_DC_thresholds))
+                for _ in range(len(self.config.mafia_DC_multipliers))
             ]
         )
         self.dc_ta_list = nn.ModuleList(
             [
                 TAModule(config, agent_type="dc", shared_mlp=None, N=self.N)
-                for _ in range(len(self.config.mafia_DC_thresholds))
+                for _ in range(len(self.config.mafia_DC_multipliers))
             ]
         )
         self.dc_st_fusion_list = nn.ModuleList(
@@ -1598,7 +1765,7 @@ class MAFIAModel(nn.Module):
             self.mkt_dc_ta_list = nn.ModuleList(
                 [
                     TAModule(config, agent_type="dc", N=1)
-                    for _ in range(len(self.config.mafia_DC_thresholds))
+                    for _ in range(len(self.config.mafia_DC_multipliers))
                 ]
             )
         else:
@@ -1607,6 +1774,71 @@ class MAFIAModel(nn.Module):
 
         # Dense MoE Signal Generator
         self.signal_generator = DenseMoESignalGenerator(config)
+
+    def set_train_mode(self, mode: str):
+        """Propagate train mode to sub-modules."""
+        # 1. Default: Unfreeze feature processors/experts
+        for p in self.parameters():
+            p.requires_grad = True
+
+        # Propagate to Signal Generator (handles Heads & Router)
+        self.signal_generator.set_train_mode(mode)
+
+        # 2. Expert/Processor Freezing Logic
+        if mode == "MACRO_ONLY":
+            # [FIX] Freeze Tech/DC Stock Experts in MACRO_ONLY mode
+            # These experts create stock-level embeddings for Selection (market_logits)
+            # but have NO gradient path to Macro losses (Direction/Risk heads)
+            # Freezing saves memory and computation without affecting training
+            for p in self.tech_csa.parameters(): p.requires_grad = False
+            for p in self.tech_ta.parameters(): p.requires_grad = False
+            for p in self.tech_st_fusion.parameters(): p.requires_grad = False
+
+            for mod in self.dc_csa_list:
+                for p in mod.parameters(): p.requires_grad = False
+            for mod in self.dc_ta_list:
+                for p in mod.parameters(): p.requires_grad = False
+            for mod in self.dc_st_fusion_list:
+                for p in mod.parameters(): p.requires_grad = False
+            # Note: Market Agents (mkt_ta, mkt_dc_ta_list) remain TRAINABLE
+            # as they feed into Temporal Encoder → Direction/Risk heads
+
+        elif mode == "SELECTION_ONLY":
+            # [FIX] Tech/DC Stock Experts MUST be TRAINABLE in SELECTION_ONLY
+            # Gradient flow: PG Loss → market_logits → expert_outputs → Experts
+            # They learn to produce better features for selection task
+            #
+            # Only freeze Market Agents (mkt_ta, mkt_dc_ta_list) as they feed
+            # into Temporal Encoder → Macro path (already trained in MACRO_ONLY phase)
+            if self.mkt_ta is not None:
+                for p in self.mkt_ta.parameters(): p.requires_grad = False
+            if self.mkt_dc_ta_list is not None:
+                for mod in self.mkt_dc_ta_list:
+                    for p in mod.parameters(): p.requires_grad = False
+
+        # === MAFIAModel GRADIENT VERIFICATION ===
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        total_params = trainable_params + frozen_params
+
+        print(f"[MAFIAModel.set_train_mode] Mode: {mode}")
+        print(f"  - Total Trainable: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"  - Total Frozen:    {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+
+        if mode == "MACRO_ONLY":
+            # Verify Stock Experts are frozen
+            tech_frozen = all(not p.requires_grad for p in self.tech_csa.parameters())
+            mkt_trainable = self.mkt_ta is None or all(p.requires_grad for p in self.mkt_ta.parameters())
+            assert tech_frozen, "[ASSERT FAILED] Tech CSA should be frozen in MACRO_ONLY!"
+            print(f"  ✓ Verified: Stock Experts frozen, Market Agents trainable")
+
+        elif mode == "SELECTION_ONLY":
+            # Verify Stock Experts are trainable, Market Agents frozen
+            tech_trainable = all(p.requires_grad for p in self.tech_csa.parameters())
+            mkt_frozen = self.mkt_ta is None or all(not p.requires_grad for p in self.mkt_ta.parameters())
+            assert tech_trainable, "[ASSERT FAILED] Tech CSA should be trainable in SELECTION_ONLY!"
+            assert mkt_frozen, "[ASSERT FAILED] Market Agents should be frozen in SELECTION_ONLY!"
+            print(f"  ✓ Verified: Stock Experts trainable, Market Agents frozen")
 
     def reset_temporal_state(self):
         """
@@ -1622,6 +1854,23 @@ class MAFIAModel(nn.Module):
         """
         if hasattr(self.signal_generator, "detach_router_state"):
             self.signal_generator.detach_router_state()
+
+    def enable_feature_caching(self, rawdata, stock_list):
+        """
+        Enable feature caching by pre-computing technical indicators.
+
+        Call this once during initialization with the full rawdata to avoid
+        recomputing SMA, RSI, ATR on every forward pass.
+
+        Args:
+            rawdata: DataFrame with columns [stock, date, open, high, low, close, volume]
+            stock_list: List of stock symbols to pre-compute for
+        """
+        if hasattr(self, 'feature_processor') and self.feature_processor is not None:
+            self.feature_processor.precompute_technical_indicators(rawdata, stock_list)
+            print(f"[MAFIAModel] Feature caching enabled for {len(stock_list)} stocks")
+        else:
+            print("[MAFIAModel] Warning: feature_processor not found, caching not enabled")
 
     def forward(
         self,
@@ -1673,7 +1922,9 @@ class MAFIAModel(nn.Module):
 
         # Process each batch item
         tech_batches = []
-        dc_batches = [[] for _ in range(len(self.config.mafia_DC_thresholds))]
+        # Process each batch item
+        tech_batches = []
+        dc_batches = [[] for _ in range(len(self.config.mafia_DC_multipliers))]
 
         for b in range(batch_size):
             sample_np = ochlv_data[b].detach().cpu().numpy()  # (N, 5, T_w)
@@ -1685,20 +1936,20 @@ class MAFIAModel(nn.Module):
             )  # (N, T_w, 8)
             tech_batches.append(P_tech_np)
 
-            for idx, threshold in enumerate(self.config.mafia_DC_thresholds):
+            for idx, multiplier in enumerate(self.config.mafia_DC_multipliers):
                 P_dc_np = self.feature_processor.process_dc_features(
-                    sample_np, threshold
+                    sample_np, multiplier
                 )  # (N, T_w, 5)
                 dc_batches[idx].append(P_dc_np)
 
         P_tech = th.from_numpy(np.stack(tech_batches, axis=0)).to(
-            dtype=dtype, device=device
+            dtype=dtype, device=device, non_blocking=True
         )  # (batch, N, T_w, 8)
         P_dc_list = [
             th.from_numpy(np.stack(dc_batches[idx], axis=0)).to(
-                dtype=dtype, device=device
+                dtype=dtype, device=device, non_blocking=True
             )
-            for idx in range(len(self.config.mafia_DC_thresholds))
+            for idx in range(len(self.config.mafia_DC_multipliers))
         ]  # Each: (batch, N, T_w, 5)
         dc_features_list = P_dc_list
 
@@ -1713,7 +1964,7 @@ class MAFIAModel(nn.Module):
         O_dc_list = []
         O_dc_TA_list = []
         O_dc_ST_list = []
-        for i in range(len(self.config.mafia_DC_thresholds)):
+        for i in range(len(self.config.mafia_DC_multipliers)):
             O_dc_CSA = self.dc_csa_list[i](P_dc_list[i])  # (batch, N, D)
             O_dc_TA = self.dc_ta_list[i](
                 P_dc_list[i], dc_features=P_dc_list[i]
@@ -1740,7 +1991,7 @@ class MAFIAModel(nn.Module):
         if use_market_index and market_index_ochlv_data is not None:
             # Process market-index features
             mkt_batches = []
-            mkt_dc_batches = [[] for _ in range(len(self.config.mafia_DC_thresholds))]
+            mkt_dc_batches = [[] for _ in range(len(self.config.mafia_DC_multipliers))]
             for b in range(batch_size):
                 mkt_sample_np = (
                     market_index_ochlv_data[b].detach().cpu().numpy()
@@ -1751,21 +2002,21 @@ class MAFIAModel(nn.Module):
                     mkt_sample_np,
                 )  # (1, T_w, M_mkt)
                 mkt_batches.append(P_mkt_np)
-                for idx, threshold in enumerate(self.config.mafia_DC_thresholds):
+                for idx, multiplier in enumerate(self.config.mafia_DC_multipliers):
                     P_dc_mkt_np = self.feature_processor.process_dc_features(
-                        mkt_sample_np, threshold
+                        mkt_sample_np, multiplier
                     )  # (1, T_w, 5)
                     mkt_dc_batches[idx].append(P_dc_mkt_np)
 
             P_mkt = th.from_numpy(np.stack(mkt_batches, axis=0)).to(
-                dtype=dtype, device=device
+                dtype=dtype, device=device, non_blocking=True
             )  # (batch, 1, T_w, M_mkt)
             # DC features for market index per threshold
             P_dc_mkt_list = [
                 th.from_numpy(np.stack(mkt_dc_batches[idx], axis=0)).to(
-                    dtype=dtype, device=device
+                    dtype=dtype, device=device, non_blocking=True
                 )
-                for idx in range(len(self.config.mafia_DC_thresholds))
+                for idx in range(len(self.config.mafia_DC_multipliers))
             ]  # Each: (batch, 1, T_w, 5)
 
             # Optional: pre-embedded TA output (kept for backward compatibility)
@@ -1774,7 +2025,7 @@ class MAFIAModel(nn.Module):
             )  # (batch, T_w, D)
             # Market-DC TA outputs (per threshold, kept separate)
             if self.mkt_dc_ta_list is not None and len(P_dc_mkt_list) > 0:
-                for i in range(len(self.config.mafia_DC_thresholds)):
+                for i in range(len(self.config.mafia_DC_multipliers)):
                     O_dc = self.mkt_dc_ta_list[i](
                         P_dc_mkt_list[i], dc_features=P_dc_mkt_list[i]
                     )  # (batch, T_w, D)

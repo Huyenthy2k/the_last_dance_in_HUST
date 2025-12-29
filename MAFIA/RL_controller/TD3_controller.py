@@ -40,27 +40,13 @@ from stable_baselines3.common.preprocessing import get_action_dim
 from .controllers import RL_withController
 
 # Import LiveDisplay check for stdout suppression
-try:
-    from utils.display_integration import get_display, smart_print, update_td3
-
-    LIVE_DISPLAY_AVAILABLE = True
-except ImportError:
-    LIVE_DISPLAY_AVAILABLE = False
-    
-    def update_td3(*args, **kwargs): pass
-
-    def get_display():
-        return None
-
-    smart_print = print  # Fallback to normal print
+# Import Unified Logger
+from utils.display_integration import get_display, smart_print, update_td3
 
 
 def _is_live_display_active() -> bool:
-    """Check if LiveDisplay is currently active and rendering."""
-    if not LIVE_DISPLAY_AVAILABLE:
-        return False
-    display = get_display()
-    return display is not None and display.enabled
+    """Mock for compatibility."""
+    return False
 
 
 SelfTD3 = TypeVar("SelfTD3", bound="TD3")
@@ -570,6 +556,7 @@ class TD3Controller(OffPolicyAlgorithm):
         )
         
         # Update Dashboard
+        # Update Dashboard / Logger
         update_td3(
             actor_loss=mean_actor_loss,
             critic_loss=mean_critic_loss,
@@ -579,7 +566,9 @@ class TD3Controller(OffPolicyAlgorithm):
                 self.replay_buffer.size()
                 if hasattr(self.replay_buffer, "size")
                 else len(self.replay_buffer)
-            )
+            ),
+            updates=self._n_updates,
+            td3_topk_display=topk_display,  # Pass Top-K info
         )
 
         config_ref = getattr(self, "mafia_config", None)
@@ -626,17 +615,7 @@ class TD3Controller(OffPolicyAlgorithm):
         except Exception:
             pass
 
-        # Enhanced TD3 training log
-        smart_print(
-            f"\n[TD3 PORTFOLIO ALLOCATOR] ✅ Gradient Update Hoàn Thành\n"
-            f"  📊 Số lần updates: {n_updates_before} → {n_updates_after} (+{n_updates_after - n_updates_before})\n"
-            f"  📉 Actor Loss (Policy Network - tối ưu phân bổ): {mean_actor_loss:.6f}\n"
-            f"  📉 Critic Loss (Q-Network - đánh giá giá trị): {mean_critic_loss:.6f}\n"
-            f"  📈 Mean Reward (trung bình từ replay buffer): {mean_sample_reward:.6f}\n"
-            f"  💾 Replay Buffer Size: {buffer_size:,}\n"
-            f"  🎯 Đang tối ưu phân bổ cho Top-K: {topk_display}",
-            flush=True,
-        )
+
 
     def learn(
         self: SelfTD3,

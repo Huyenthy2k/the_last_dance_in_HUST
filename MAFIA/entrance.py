@@ -264,6 +264,11 @@ def RLcontroller(config):
     # Initialize MAFIA observer (always enabled)
     mkt_observer = MAFIAObserver(config=config, action_dim=stock_num)
 
+    # Enable feature caching for faster training
+    # Pre-compute SMA, RSI, ATR once instead of every forward pass
+    stock_list = data_dict["train"]["stock"].unique().tolist()
+    mkt_observer.enable_feature_caching(data_dict["train"], stock_list)
+
     # ============================================================
     # Walk-Forward Phase 2: Load pre-trained observer and freeze
     # (observer_pretrained_path, freeze_observer, is_observer_only already determined above)
@@ -1264,7 +1269,7 @@ def RLcontroller(config):
     )
 
     logger.set_phase(TrainingPhase.TRAIN)
-
+    
     log_interval = 10
     callback1 = PoCallback(
         config=config, train_env=env_train, valid_env=env_valid, test_env=env_test

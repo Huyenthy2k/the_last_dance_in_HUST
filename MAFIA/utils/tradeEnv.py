@@ -447,7 +447,7 @@ class StockPortfolioEnv(gym.Env):
             )
 
         self.curData = self._ensure_dataframe(
-            copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
+            self.rawdata.loc[self.curTradeDay, :].copy()
         )
         self.curData.sort_values(["stock"], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
@@ -1416,7 +1416,7 @@ class StockPortfolioEnv(gym.Env):
         self.lastDayData = self.curData.copy()
         self.last_slippage_drift = self.cur_slippage_drift
         self.curData = self._ensure_dataframe(
-            copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
+            self.rawdata.loc[self.curTradeDay, :].copy()
         )
         self.curData.sort_values(["stock"], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
@@ -2184,7 +2184,7 @@ class StockPortfolioEnv(gym.Env):
         }
 
         self.curData = self._ensure_dataframe(
-            copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
+            self.rawdata.loc[self.curTradeDay, :].copy()
         )
         self.curData.sort_values(["stock"], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)
@@ -4120,6 +4120,7 @@ class StockPortfolioEnv(gym.Env):
                 topk_indices_np,
                 topk_embeddings_np,
                 topk_scores_np,
+                market_logits_np,
             ) = _predict(
                 pg_flag=selection_trigger,
                 collect_pg=selection_trigger,
@@ -4346,6 +4347,7 @@ class StockPortfolioEnv(gym.Env):
                     topk_indices_np,
                     topk_embeddings_np,
                     topk_scores_np,
+                    market_logits_np,
                 ) = _predict(
                     pg_flag=True,
                     collect_pg=True,
@@ -5776,7 +5778,7 @@ class StockPortfolioEnv_cash(StockPortfolioEnv):
         self.lastDayData = self.curData.copy()
         self.last_slippage_drift = self.cur_slippage_drift
         self.curData = self._ensure_dataframe(
-            copy.deepcopy(self.rawdata.loc[self.curTradeDay, :])
+            self.rawdata.loc[self.curTradeDay, :].copy()
         )
         self.curData.sort_values(["stock"], ascending=True, inplace=True)
         self.curData.reset_index(drop=True, inplace=True)

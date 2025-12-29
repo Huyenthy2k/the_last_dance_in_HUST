@@ -15,6 +15,7 @@ See: Đặc Tả Kỹ Thuật (Technical Specification) - MAFIA.md
 """
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import torch as th
@@ -22,6 +23,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from typing import Tuple, Dict, Callable, Any, Optional
+
+# Import HybridRiskLoss for consistent risk loss computation
+from RL_controller.observer_offline_trainer import HybridRiskLoss
 
 th.autograd.set_detect_anomaly(True)
 
@@ -113,54 +117,157 @@ class MAFIAObserver:
         self.mafia_model = MAFIAModel(config=config, action_dim=action_dim)
         self.mafia_model = self.mafia_model.to(self.device)
 
-        # Setup optimizer and scheduler
-        self.optimizer = optim.Adam(
-            self.mafia_model.parameters(),
-            lr=config.mafia_learning_rate,
-            weight_decay=config.mafia_weight_decay,
+        # === SEPARATED TRAINING: Set Train Mode & Filter Optimizer ===
+        # Apply mode-specific freezing (Macro vs Selection)
+        self.mafia_model.set_train_mode(config.mafia_train_mode)
+
+        # === DIFFERENTIAL LEARNING RATES (Per-Head) ===
+        # Create parameter groups with different learning rates
+        lr_direction = getattr(config, "mafia_lr_direction_head", 5e-4)
+        lr_risk = getattr(config, "mafia_lr_risk_head", 1e-4)
+        lr_backbone = getattr(config, "mafia_lr_backbone", 3e-4)
+        weight_decay = config.mafia_weight_decay
+        weight_decay_risk = getattr(config, "mafia_weight_decay_risk_head", 0.01)
+
+        # Initialize HybridRiskLoss for consistent risk loss computation
+        # Same as offline trainer for consistency
+        risk_corr_alpha = float(getattr(config, "risk_loss_correlation_alpha", 0.7))
+        risk_corr_eps = float(getattr(config, "risk_loss_correlation_eps", 1e-8))
+        self.risk_criterion = HybridRiskLoss(
+            alpha=risk_corr_alpha,
+            eps=risk_corr_eps,
+            reduction="mean"
         )
-        # Learning-rate schedule: align with TD3-style decay
-        schedule_mode = getattr(config, "mafia_lr_schedule", "linear")
-        start_lr = config.mafia_learning_rate
-        end_lr = start_lr * getattr(config, "mafia_lr_end_factor", 0.2)
-        frac = getattr(config, "mafia_lr_end_fraction", 0.5)
+        smart_print(
+            f"[MAFIAObserver] Risk Loss: HybridRiskLoss(α={risk_corr_alpha}, "
+            f"MSE={int((1-risk_corr_alpha)*100)}%, Corr={int(risk_corr_alpha*100)}%)"
+        )
 
-        if schedule_mode == "linear":
-            decay_epochs = max(1, int(config.num_epochs * frac))
+        # Access heads via signal_generator (DenseMoESignalGenerator)
+        signal_gen = self.mafia_model.signal_generator
 
+        # Collect parameter IDs for each head to avoid duplicates
+        direction_head_params = set(id(p) for p in signal_gen.direction_head.parameters())
+        risk_head_params = set(id(p) for p in signal_gen.risk_head.parameters())
+
+        # Build parameter groups
+        param_groups = []
+
+        # Group 1: Direction Head (higher LR - was learning slow)
+        direction_params = [
+            p for p in signal_gen.direction_head.parameters()
+            if p.requires_grad
+        ]
+        if direction_params:
+            param_groups.append({
+                "params": direction_params,
+                "lr": lr_direction,
+                "name": "direction_head"
+            })
+
+        # Group 2: Risk Head (lower LR + higher weight decay - prevent overfit)
+        risk_params = [
+            p for p in signal_gen.risk_head.parameters()
+            if p.requires_grad
+        ]
+        if risk_params:
+            param_groups.append({
+                "params": risk_params,
+                "lr": lr_risk,
+                "weight_decay": weight_decay_risk,  # Higher regularization
+                "name": "risk_head"
+            })
+
+        # Group 3: Backbone (all other parameters)
+        backbone_params = [
+            p for p in self.mafia_model.parameters()
+            if p.requires_grad and id(p) not in direction_head_params and id(p) not in risk_head_params
+        ]
+        if backbone_params:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": lr_backbone,
+                "name": "backbone"
+            })
+
+        self.optimizer = optim.AdamW(
+            param_groups,
+            weight_decay=weight_decay,
+        )
+
+        # Log parameter group info
+        print(f"[MAFIA Observer] Differential LR initialized:")
+        print(f"  - Direction Head: lr={lr_direction:.1e} ({len(direction_params)} params)")
+        print(f"  - Risk Head:      lr={lr_risk:.1e}, wd={weight_decay_risk:.1e} ({len(risk_params)} params)")
+        print(f"  - Backbone:       lr={lr_backbone:.1e} ({len(backbone_params)} params)")
+
+        # === LEARNING RATE SCHEDULE ===
+        schedule_mode = getattr(config, "mafia_lr_schedule", "cosine")
+        warmup_epochs = getattr(config, "mafia_lr_warmup_epochs", 2)
+        min_lr = getattr(config, "mafia_lr_min", 1e-6)
+        total_epochs = max(1, config.num_epochs)
+
+        if schedule_mode == "cosine":
+            # Cosine Annealing with Warmup (recommended for stable training)
             def _lr_lambda(epoch):
-                if epoch >= decay_epochs:
-                    return end_lr / start_lr
-                # Linear decay from start_lr to end_lr over decay_epochs (one-shot over full run)
-                return 1.0 - (1.0 - end_lr / start_lr) * (epoch / float(decay_epochs))
+                if epoch < warmup_epochs:
+                    # Linear warmup: scale from min_lr to full lr
+                    return max(min_lr / lr_backbone, (epoch + 1) / warmup_epochs)
+                # Cosine decay after warmup
+                progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return max(min_lr / lr_backbone, cosine_decay)
 
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=_lr_lambda
             )
+            print(f"  - Schedule: Cosine with {warmup_epochs} warmup epochs, min_lr={min_lr:.1e}")
+
+        elif schedule_mode == "linear":
+            # Legacy linear decay
+            end_factor = getattr(config, "mafia_lr_end_factor", 0.2)
+            frac = getattr(config, "mafia_lr_end_fraction", 0.5)
+            decay_epochs = max(1, int(total_epochs * frac))
+
+            def _lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return (epoch + 1) / warmup_epochs
+                adj_epoch = epoch - warmup_epochs
+                adj_decay = max(1, decay_epochs - warmup_epochs)
+                if adj_epoch >= adj_decay:
+                    return end_factor
+                return 1.0 - (1.0 - end_factor) * (adj_epoch / float(adj_decay))
+
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=_lr_lambda
+            )
+            print(f"  - Schedule: Linear decay to {end_factor}x over {frac*100:.0f}% epochs")
+
         elif schedule_mode == "linear_per_epoch":
             # Repeat linear decay every epoch: use a cycle on scheduler steps
-            cycle_steps = max(
-                1,
-                int(getattr(config, "observer_mini_epoch_steps", 1)),
-            )
+            cycle_steps = max(1, int(getattr(config, "observer_mini_epoch_steps", 1)))
+            end_factor = getattr(config, "mafia_lr_end_factor", 0.2)
+            frac = getattr(config, "mafia_lr_end_fraction", 0.5)
             decay_steps = max(1, int(cycle_steps * frac))
 
             def _lr_lambda(step_idx):
                 step_in_cycle = step_idx % cycle_steps
                 if step_in_cycle >= decay_steps:
-                    return end_lr / start_lr
-                return 1.0 + (end_lr / start_lr - 1.0) * (
-                    step_in_cycle / float(decay_steps)
-                )
+                    return end_factor
+                return 1.0 + (end_factor - 1.0) * (step_in_cycle / float(decay_steps))
 
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=_lr_lambda
             )
+            print(f"  - Schedule: Linear per-epoch decay")
+
         else:
-            decay_steps = max(1, config.num_epochs // 3)  # Ensure at least 1
+            # Step decay (fallback)
+            decay_steps = max(1, total_epochs // 3)
             self.lr_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=decay_steps, gamma=0.1
             )
+            print(f"  - Schedule: Step decay every {decay_steps} epochs")
 
         # Training buffers (for Policy Gradient)
         self.market_vector_lst = []  # Store market_vector for each step (with gradient)
@@ -237,11 +344,28 @@ class MAFIAObserver:
         else:
             return self._gumbel_temp_inference
 
+    def enable_feature_caching(self, rawdata, stock_list):
+        """
+        Enable feature caching for the underlying MAFIAModel.
+
+        This pre-computes technical indicators (SMA, RSI, ATR) for the entire
+        time series once, avoiding redundant computation on every forward pass.
+        Should be called once during setup with the full rawdata.
+
+        Args:
+            rawdata: DataFrame with columns [stock, date, open, high, low, close, volume]
+            stock_list: List of stock symbols to pre-compute for
+        """
+        if hasattr(self, 'mafia_model') and self.mafia_model is not None:
+            self.mafia_model.enable_feature_caching(rawdata, stock_list)
+        else:
+            print("[MAFIAObserver] Warning: mafia_model not initialized, caching not enabled")
+
     def _validate_config(self):
         """Validate that config has all required MAFIA hyperparameters."""
         required_params = [
             "mafia_T_w",
-            "mafia_DC_thresholds",
+            "mafia_DC_multipliers",
             "mafia_D",
             "mafia_D_h",
             "mafia_encoder_layers",
@@ -265,7 +389,7 @@ class MAFIAObserver:
     ) -> th.Tensor:
         """
         Compute explicit signals for Direction Head Wide Path (Spec §3.5.1 v2.1).
-        Returns (1, 4) tensor: [DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore]
+        Returns (1, 6) tensor: [Vol_Std20, DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore, Drawdown60]
 
         Args:
             market_close_price: Current market close price (for online inference)
@@ -274,7 +398,7 @@ class MAFIAObserver:
             market_volume: Current market volume - for VPI calculation
 
         Returns:
-            explicit_signals: (1, 4) tensor with normalized values
+            explicit_signals: (1, 6) tensor with normalized values
         """
         # Initialize buffers on first call
         if self.price_history_buffer is None:
@@ -318,25 +442,42 @@ class MAFIAObserver:
             rs = avg_gain / avg_loss
             return 100 - (100 / (1 + rs))
 
-        # === 1. DC_Event_Flag: Structural break detection (binary) ===
+        # === 1. DC_Event_Flag: Structural break detection (Adaptive ATR-based) ===
         dc_event_flag = 0.0
+        
+        # Calculate ATR on buffer (Need at least 15 days)
+        current_atr = 0.0
+        dc_k = float(getattr(self.config, "mafia_DC_multipliers", [1.0])[1]) # Default k=1.0
+        
+        if len(self.price_history_buffer) >= 15:
+            # Convert buffer to arrays
+            p_hist = np.array(self.price_history_buffer[-15:])
+            # Ideal ATR needs High/Low, here we approximate with Close differences
+            # TR = |C_t - C_{t-1}| (simple approximation for close-only data)
+            tr_vals = np.abs(np.diff(p_hist))
+            current_atr = np.mean(tr_vals) # Simple MA of TR = ATR approximation
+        
         if market_close_price is not None and len(self.price_history_buffer) >= 2:
             if self.dc_state["p_ext"] is None:
                 self.dc_state["p_ext"] = self.price_history_buffer[0]
                 self.dc_state["mode"] = "up"
+            
+            # Dynamic Threshold
+            adaptive_threshold = dc_k * (current_atr / (market_close_price + 1e-8))
+            adaptive_threshold = max(adaptive_threshold, 0.005) # Min 0.5% floor
 
             p_ext = self.dc_state["p_ext"]
             var = (market_close_price - p_ext) / (p_ext + 1e-8)
 
             if self.dc_state["mode"] == "up":
-                if var < -self.dc_threshold:
+                if var < -adaptive_threshold:
                     dc_event_flag = 1.0  # Downward DC (Crash)
                     self.dc_state["mode"] = "down"
                     self.dc_state["p_ext"] = market_close_price
                 elif market_close_price > p_ext:
                     self.dc_state["p_ext"] = market_close_price
             else:
-                if var > self.dc_threshold:
+                if var > adaptive_threshold:
                     dc_event_flag = 1.0  # Upward DC (Rally)
                     self.dc_state["mode"] = "up"
                     self.dc_state["p_ext"] = market_close_price
@@ -405,9 +546,38 @@ class MAFIAObserver:
                 vpi_zscore = (vpi - vpi_mean) / vpi_std
                 vpi_zscore = float(np.clip(vpi_zscore, -3, 3))
 
-        # Create tensor (1, 4)
+        # === 0. Volatility: Relative Volatility (Robustness Fix) ===
+        # Replaces raw Vol_Std20 with Vol10 / Vol30
+        vol_relative = 1.0 # Default neutral
+        if len(self.price_history_buffer) >= 31:
+             recent_prices = np.array(self.price_history_buffer[-31:])
+             returns = np.diff(recent_prices) / (recent_prices[:-1] + 1e-8)
+             
+             # Compute Vol10 and Vol30
+             vol10 = np.std(returns[-10:])
+             vol30 = np.std(returns[-30:])
+             
+             if vol30 > 1e-8:
+                 vol_relative = vol10 / vol30
+             
+        # === 5. Drawdown60: Max Drawdown over last 60 steps ===
+        drawdown60 = 0.0
+        dd_lookback = 60
+        if len(self.price_history_buffer) >= 2:
+            # Use available history up to 60
+            window = self.price_history_buffer[-dd_lookback:] if len(self.price_history_buffer) > dd_lookback else self.price_history_buffer
+            window_np = np.array(window)
+            
+            # Calculate running max
+            running_max = np.maximum.accumulate(window_np)
+            # Calculate drawdown
+            dd = (window_np - running_max) / (running_max + 1e-8)
+            # Max drawdown is the minimum value (deepest trough)
+            drawdown60 = np.min(dd)
+
+        # Create tensor (1, 6) in proper order [Vol, DC, Breadth, Div, VPI, DD]
         explicit_signals = th.tensor(
-            [[dc_event_flag, breadth_gap, div_signal, vpi_zscore]],
+            [[vol_relative, dc_event_flag, breadth_gap, div_signal, vpi_zscore, drawdown60]],
             dtype=th.float32,
             device=self.device,
         )
@@ -571,6 +741,7 @@ class MAFIAObserver:
         collect_pg: bool = True,
         collect_eta: bool = True,
         force_topk_indices=None,
+        prev_holdings=None,
         **kwargs,
     ):
         """
@@ -580,6 +751,7 @@ class MAFIAObserver:
             raw_ochlv_data: (N, M, T_w) - Direct MAFIA input (required)
             finemkt_feat: Deprecated - kept for interface compatibility
             finestock_feat: Deprecated - kept for interface compatibility
+            prev_holdings: (B, N) Binary mask of currently held stocks for Inertia Bias
             **kwargs: Must include 'mode' ('train', 'valid', 'test')
 
         Returns:
@@ -702,8 +874,8 @@ class MAFIAObserver:
                 market_vector,
                 risk_eta,
                 market_scores_full,
-                market_context,
                 sigma_logits,
+                market_context,
                 topk_indices,
                 topk_embeddings,
                 topk_scores,
@@ -714,7 +886,7 @@ class MAFIAObserver:
                 force_topk_indices=force_topk_indices,
                 router_context_buffer=router_context_buffer,
                 explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
-                prev_holdings=kwargs.get("prev_holdings", None),  # Memory Injection
+                prev_holdings=prev_holdings,  # Memory Injection
             )
         else:
             self.mafia_model.eval()
@@ -723,8 +895,8 @@ class MAFIAObserver:
                     market_vector,
                     risk_eta,
                     market_scores_full,
-                    market_context,
                     sigma_logits,
+                    market_context,
                     topk_indices,
                     topk_embeddings,
                     topk_scores,
@@ -1038,9 +1210,11 @@ class MAFIAObserver:
             torch.Tensor: (1, 1, 5, T_w) tensor on device
         """
         mkt_ochlv_tensor = th.from_numpy(market_index_ochlv_data).to(th.float32)
-        mkt_ochlv_tensor = mkt_ochlv_tensor.unsqueeze(
-            0
-        )  # Add batch dim: (1, 1, 5, T_w)
+        
+        # Add batch dim only if missing (single sample input)
+        if mkt_ochlv_tensor.dim() == 3:
+            mkt_ochlv_tensor = mkt_ochlv_tensor.unsqueeze(0)  # (1, 1, 5, T_w)
+            
         mkt_ochlv_tensor = mkt_ochlv_tensor.to(self.device)
         return mkt_ochlv_tensor
 
@@ -1207,16 +1381,19 @@ class MAFIAObserver:
 
     def _compute_direction_label_from_env(self, env, current_date):
         """
-        Compute future-based direction label using cumulative return over lookahead window.
-        Labeling:
-            Bear (0): R_fut < -delta
-            Side (1): -delta <= R_fut <= delta
-            Bull (2): R_fut > delta
+        Compute future-based direction label using Dynamic Threshold + Path Dependency (Spec §5.1.3).
+
+        Labeling Rules:
+            Bear (0): R_fut < -δ_t  OR  IntraDD < StopLoss_limit
+            Side (1): |R_fut| <= δ_t  AND  IntraDD >= StopLoss_limit
+            Bull (2): R_fut > δ_t  AND  IntraDD >= StopLoss_limit
+
+        Dynamic Threshold: δ_t = max(δ_min, k_atr * ATR / P_t)
+        IntraDD = min(Low_{t+1..t+k}) / P_t - 1
 
         Fallback Strategy (when lookahead data is insufficient):
             - Use most recent predicted direction (last_sigma_pred) from previous step
             - This ensures consistency: Direction Head already predicted from macro context at t-1
-            - Avoids noise from 1-step momentum or lookback-only approaches
         """
         if env is None or not hasattr(env, "extra_data"):
             return None
@@ -1231,12 +1408,22 @@ class MAFIAObserver:
         ):
             return None
 
-        close_col = f"mkt_{getattr(self.config, 'finefreq', '1d')}_close"
+        # Column names based on finefreq
+        finefreq = getattr(self.config, "finefreq", "1d")
+        close_col = f"mkt_{finefreq}_close"
+        high_col = f"mkt_{finefreq}_high"
+        low_col = f"mkt_{finefreq}_low"
+
+        # Fallback column names
         if close_col not in fine_market.columns:
-            if "close" in fine_market.columns:
-                close_col = "close"
-            else:
-                return None
+            close_col = "close" if "close" in fine_market.columns else None
+        if high_col not in fine_market.columns:
+            high_col = "high" if "high" in fine_market.columns else None
+        if low_col not in fine_market.columns:
+            low_col = "low" if "low" in fine_market.columns else None
+
+        if close_col is None:
+            return None
 
         fm_sorted = fine_market.sort_values("date").reset_index(drop=True)
         mask = fm_sorted["date"] == current_date
@@ -1245,19 +1432,21 @@ class MAFIAObserver:
             return None
         idx = int(idx_arr[-1])
 
-        lookahead = int(getattr(self.config, "direction_label_lookahead", 5))
-        delta = float(getattr(self.config, "direction_label_delta", 0.025))
+        # Config parameters (Spec §5.1.3)
+        lookahead = int(getattr(self.config, "direction_label_lookahead", 21))
+        atr_period = int(getattr(self.config, "direction_label_atr_period", 21))
+        k_atr = float(getattr(self.config, "direction_label_atr_multiplier", 1.5))
+        delta_min = float(getattr(self.config, "direction_label_delta_min", 0.015))
+        stop_loss = float(getattr(self.config, "direction_label_stop_loss", -0.07))
+
         future_idx = idx + lookahead
 
         # Check if lookahead data is available
         if future_idx >= len(fm_sorted):
             # Fallback: Use most recent predicted direction from Direction Head
-            # This is consistent with model behavior since Direction Head predicted at t-1
-            # from macro context, avoiding noise from simple lookback approaches
             if self.last_sigma_pred is not None:
                 return int(self.last_sigma_pred.item())
             else:
-                # If no previous prediction available, return None (conservative)
                 return None
 
         try:
@@ -1265,18 +1454,59 @@ class MAFIAObserver:
             price_future = float(fm_sorted.iloc[future_idx][close_col])
         except Exception:
             return None
-        if (
-            not np.isfinite(price_now)
-            or not np.isfinite(price_future)
-            or price_now <= 0
-        ):
+
+        if not np.isfinite(price_now) or not np.isfinite(price_future) or price_now <= 0:
             return None
+
+        # Compute R_fut
         r_fut = (price_future - price_now) / price_now
-        if r_fut < -delta:
+
+        # Compute Dynamic Threshold δ_t = max(δ_min, k_atr * ATR / P_t)
+        delta_t = delta_min  # Default fallback
+        if high_col is not None and low_col is not None:
+            try:
+                # Get ATR window data
+                atr_start = max(0, idx - atr_period)
+                high_arr = fm_sorted.iloc[atr_start : idx + 1][high_col].astype(float).to_numpy()
+                low_arr = fm_sorted.iloc[atr_start : idx + 1][low_col].astype(float).to_numpy()
+                close_arr = fm_sorted.iloc[atr_start : idx + 1][close_col].astype(float).to_numpy()
+
+                if len(high_arr) >= 2:
+                    # True Range: TR = max(H-L, |H-Cp|, |L-Cp|)
+                    tr1 = high_arr[1:] - low_arr[1:]
+                    tr2 = np.abs(high_arr[1:] - close_arr[:-1])
+                    tr3 = np.abs(low_arr[1:] - close_arr[:-1])
+                    tr = np.maximum(np.maximum(tr1, tr2), tr3)
+                    current_atr = float(np.mean(tr)) if len(tr) > 0 else 0.0
+
+                    # Dynamic threshold
+                    atr_ratio = current_atr / price_now if price_now > 0 else 0.0
+                    delta_t = max(delta_min, k_atr * atr_ratio)
+            except Exception:
+                pass  # Keep delta_t = delta_min
+
+        # Compute IntraDD = min(Low_{t+1..t+k}) / P_t - 1
+        intra_dd = 0.0  # Default: no drawdown
+        if low_col is not None:
+            try:
+                future_lows = fm_sorted.iloc[idx + 1 : future_idx + 1][low_col].astype(float).to_numpy()
+                if len(future_lows) > 0:
+                    min_low = float(np.min(future_lows))
+                    if np.isfinite(min_low) and price_now > 0:
+                        intra_dd = (min_low / price_now) - 1.0
+            except Exception:
+                pass  # Keep intra_dd = 0.0
+
+        # Labeling Rules (Spec §5.1.3)
+        # Bear (0): R_fut < -δ_t OR IntraDD < StopLoss
+        if r_fut < -delta_t or intra_dd < stop_loss:
             return 0
-        if r_fut > delta:
+        # Bull (2): R_fut > δ_t AND IntraDD >= StopLoss
+        elif r_fut > delta_t and intra_dd >= stop_loss:
             return 2
-        return 1
+        # Side (1): Otherwise
+        else:
+            return 1
 
     def train(self, **label_kwargs):
         """
@@ -1729,14 +1959,13 @@ class MAFIAObserver:
                 pred_eta = _slice_tensor_range(pred_eta, seq_range_global)
                 target_eta = _slice_tensor_range(target_eta, seq_range_global)
 
-            # Compute per-sample MSE (don't reduce yet)
-            eta_loss_per_sample = F.mse_loss(
-                pred_eta, target_eta, reduction="none"
-            )  # (T_eta,)
-            risk_losses_per_step.append(eta_loss_per_sample)
+            # Compute HybridRiskLoss (MSE + Correlation) on full batch
+            # This provides better pattern learning and reduces overfitting
+            eta_loss = self.risk_criterion(pred_eta, target_eta)  # scalar
+            # Store as (1,) tensor for compatibility with aggregation logic
+            risk_losses_per_step.append(eta_loss.unsqueeze(0))
 
-            # For logging/monitoring, compute aggregated loss
-            eta_loss = eta_loss_per_sample.mean()
+            # For logging/monitoring
             eta_mae = F.l1_loss(pred_eta, target_eta)
             loss_dict["loss_risk"] = float(eta_loss.detach().cpu().item())
 
@@ -1797,6 +2026,46 @@ class MAFIAObserver:
         # Initialize total loss
         total_loss = th.tensor(0.0, device=self.device)
         eps = 1e-8  # Prevent division by zero
+
+        # === SEPARATED TRAINING: LOSS MASKING LOGIC ===
+        from config import MafiaTrainMode # Import Enum for comparison
+
+        # 1. PG Loss (Selection)
+        # Only active if NOT in MACRO_ONLY mode
+        if self.config.mafia_train_mode != MafiaTrainMode.MACRO_ONLY:
+            if pg_losses and len(pg_losses) > 0 and len(selection_mask) > 0:
+                pg_tensor = pg_losses[0]  # (T, B) - already stacked
+                # Ensure mask matches (T, B)
+                if selection_mask.dim() == 1:
+                   cadence_mask = selection_mask.unsqueeze(-1).expand_as(pg_tensor)
+                else:
+                   cadence_mask = selection_mask 
+                
+                # Apply Mask: L_PG_masked = (L_PG * mask) / (sum(mask) + eps)
+                masked_pg_loss = pg_tensor * cadence_mask
+                
+                # Normalize by effective number of rebalancing events
+                mask_sum = cadence_mask.sum()
+                pg_loss_term = masked_pg_loss.sum() / (mask_sum + eps)
+                
+                total_loss += weight_pg * pg_loss_term
+        
+        # 2. Risk Loss (Macro)
+        # Only active if NOT in SELECTION_ONLY mode
+        if self.config.mafia_train_mode != MafiaTrainMode.SELECTION_ONLY:
+            if risk_losses_per_step and len(risk_losses_per_step) > 0:
+                risk_tensor = risk_losses_per_step[0] # (T_m, ...)
+                # Normalize by total samples (B*T_m)
+                risk_loss_term = risk_tensor.mean() 
+                total_loss += eta_weight * risk_loss_term
+
+        # 3. Direction Loss (Macro)
+        # Only active if NOT in SELECTION_ONLY mode
+        if self.config.mafia_train_mode != MafiaTrainMode.SELECTION_ONLY:
+            if dir_losses_per_step and len(dir_losses_per_step) > 0:
+                dir_tensor = dir_losses_per_step[0]
+                dir_loss_term = dir_tensor.mean()
+                total_loss += dir_weight * dir_loss_term
 
         # 1. PG Loss (Sparse - normalized by EVENT COUNT)
         # L_PG_term = λ_pg × (Σ_{b,t} m_{t,b} × L_PG^{(t,b)}) / (Σ_{b,t} m_{t,b} + ε)
@@ -1978,10 +2247,10 @@ class MAFIAObserver:
             f"    │  • L_direction:           {fmt(direction_loss_val):>12}  ← train DAILY (không mask)  │\n"
             f"    └─────────────────────────────────────────────────────────────────────────┘\n"
             f"    ┌─────────────────────────────────────────────────────────────────────────┐\n"
-            f"    │ 3️⃣  L_risk (Risk Tolerance η - MSE Regression)                          │\n"
+            f"    │ 3️⃣  L_risk (Risk Tolerance η - Hybrid MSE+Corr)                         │\n"
             f"    │     Mục tiêu: Dự đoán η ∈ [0.7, 1.3] để scale σ_target = σ_base × η    │\n"
             f"    ├─────────────────────────────────────────────────────────────────────────┤\n"
-            f"    │  • L_risk (MSE):          {fmt(eta_loss_val):>12}  ← train DAILY (không mask)  │\n"
+            f"    │  • L_risk (Hybrid):       {fmt(eta_loss_val):>12}  ← train DAILY (không mask)  │\n"
             f"    │  • MAE (|η_pred - η_true|): {fmt(eta_mae_val):>10}  ← prediction error         │\n"
             f"    └─────────────────────────────────────────────────────────────────────────┘\n",
             flush=True,
@@ -2301,7 +2570,7 @@ class MAFIAObserver:
             "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
             "config": {
                 "mafia_T_w": self.config.mafia_T_w,
-                "mafia_DC_thresholds": self.config.mafia_DC_thresholds,
+                "mafia_DC_multipliers": self.config.mafia_DC_multipliers,
                 "mafia_D": self.config.mafia_D,
                 "mafia_D_h": self.config.mafia_D_h,
                 "mafia_encoder_layers": self.config.mafia_encoder_layers,
@@ -2319,12 +2588,13 @@ class MAFIAObserver:
             flush=True,
         )
 
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
         """
         Load MAFIA observer checkpoint.
 
         Args:
             checkpoint_path: Path to checkpoint file
+            load_optimizer: Whether to load optimizer/scheduler state (default: True)
 
         Returns:
             epoch: Epoch number from checkpoint
@@ -2346,21 +2616,133 @@ class MAFIAObserver:
                 flush=True,
             )
             self.mafia_model.load_state_dict(mafia_state, strict=False)
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        try:
-            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
-        except KeyError as e:
-            # Backward compatibility: scheduler type changed (e.g., StepLR -> LambdaLR)
-            smart_print(
-                f"[MAFIA] Warning: LR scheduler state missing key {e}; using freshly-initialized scheduler state.",
-                flush=True,
-            )
+        
+        if load_optimizer:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except ValueError as e:
+                 smart_print(f"[MAFIA] Warning: Optimizer load failed ({e}). Skipping optimizer load.", flush=True)
+
+            try:
+                self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+            except KeyError as e:
+                # Backward compatibility: scheduler type changed (e.g., StepLR -> LambdaLR)
+                smart_print(
+                    f"[MAFIA] Warning: LR scheduler state missing key {e}; using freshly-initialized scheduler state.",
+                    flush=True,
+                )
 
         epoch = checkpoint.get("epoch", 0)
         smart_print(
             f"MAFIA Observer checkpoint loaded from {checkpoint_path} (epoch {epoch})",
             flush=True,
         )
+
+        return epoch
+
+    def load_merged_checkpoints(
+        self,
+        frozen_checkpoint_path: str,
+        trainable_checkpoint_path: str,
+        load_optimizer: bool = False,
+    ) -> int:
+        """
+        Merge two checkpoints for SELECTION_ONLY training:
+        - Frozen params (Direction/Risk Heads, Temporal Encoder) from MACRO checkpoint
+        - Trainable params (Gate Network, Stock Experts) from previous SELECTION checkpoint
+
+        This enables:
+        1. Macro heads aligned with current year's training window
+        2. Selection knowledge transfer from previous iteration
+
+        Args:
+            frozen_checkpoint_path: Path to MACRO checkpoint (same year)
+            trainable_checkpoint_path: Path to previous SELECTION checkpoint
+            load_optimizer: Whether to load optimizer state from trainable checkpoint
+
+        Returns:
+            epoch: Epoch number from trainable checkpoint (for resume tracking)
+        """
+        if not os.path.exists(frozen_checkpoint_path):
+            raise FileNotFoundError(f"Frozen (MACRO) checkpoint not found: {frozen_checkpoint_path}")
+        if not os.path.exists(trainable_checkpoint_path):
+            raise FileNotFoundError(f"Trainable (SELECTION) checkpoint not found: {trainable_checkpoint_path}")
+
+        # Load both checkpoints
+        frozen_ckpt = th.load(frozen_checkpoint_path, map_location=self.device)
+        trainable_ckpt = th.load(trainable_checkpoint_path, map_location=self.device)
+
+        frozen_state = frozen_ckpt["mafia_model_state_dict"]
+        trainable_state = trainable_ckpt["mafia_model_state_dict"]
+
+        # Define frozen param prefixes (SELECTION_ONLY frozen components)
+        # These come from MACRO checkpoint (aligned with current year's window)
+        frozen_prefixes = [
+            # Macro Stream (Direction/Risk Heads)
+            "signal_generator.direction_head.",
+            "signal_generator.risk_head.",
+            "signal_generator.macro_adapter.",
+            "signal_generator.delta_norm.",
+            # Temporal Encoder (Router backbone)
+            "signal_generator.gating_router.temporal_encoder.",
+            "signal_generator.gating_router.mkt_proj.",
+            "signal_generator.gating_router.context_norm.",
+            # Market Agents
+            "mkt_ta.",
+            "mkt_dc_ta_list.",
+        ]
+
+        # Merge state dicts
+        merged_state = {}
+        frozen_count = 0
+        trainable_count = 0
+
+        for key in self.mafia_model.state_dict().keys():
+            is_frozen = any(key.startswith(prefix) for prefix in frozen_prefixes)
+            if is_frozen:
+                if key in frozen_state:
+                    merged_state[key] = frozen_state[key]
+                    frozen_count += 1
+                else:
+                    smart_print(f"[WARN] Frozen key '{key}' not found in MACRO checkpoint, using current weights")
+                    merged_state[key] = self.mafia_model.state_dict()[key]
+            else:
+                if key in trainable_state:
+                    merged_state[key] = trainable_state[key]
+                    trainable_count += 1
+                elif key in frozen_state:
+                    # Fallback to frozen state if not in trainable
+                    merged_state[key] = frozen_state[key]
+                    trainable_count += 1
+                else:
+                    smart_print(f"[WARN] Trainable key '{key}' not found in any checkpoint, using current weights")
+                    merged_state[key] = self.mafia_model.state_dict()[key]
+
+        # Ensure dynamically created embeddings exist
+        self._ensure_temp_embeddings_from_state(merged_state)
+
+        # Load merged state
+        try:
+            self.mafia_model.load_state_dict(merged_state)
+        except RuntimeError as e:
+            smart_print(f"[MAFIA] Warning: Strict merged load failed ({e}). Retrying with strict=False...")
+            self.mafia_model.load_state_dict(merged_state, strict=False)
+
+        # Optionally load optimizer from trainable checkpoint
+        if load_optimizer:
+            try:
+                self.optimizer.load_state_dict(trainable_ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                smart_print(f"[MAFIA] Warning: Optimizer load failed ({e}). Using fresh optimizer.")
+
+        epoch = trainable_ckpt.get("epoch", 0)
+        smart_print(
+            f"[MAFIA] Merged checkpoints loaded:",
+            flush=True,
+        )
+        smart_print(f"  - Frozen params ({frozen_count}): {os.path.basename(frozen_checkpoint_path)}")
+        smart_print(f"  - Trainable params ({trainable_count}): {os.path.basename(trainable_checkpoint_path)}")
+        smart_print(f"  - Resume from epoch: {epoch}")
 
         return epoch
 
@@ -2373,52 +2755,81 @@ class MAFIAObserver:
         continuing from the decayed LR of the previous window.
         """
         config = self.config
-        start_lr = config.mafia_learning_rate
-        schedule_mode = getattr(config, "mafia_lr_schedule", "linear_per_epoch")
-        end_lr = start_lr * getattr(config, "mafia_lr_end_factor", 0.2)
+
+        # Get differential learning rates
+        lr_direction = getattr(config, "mafia_lr_direction_head", 5e-4)
+        lr_risk = getattr(config, "mafia_lr_risk_head", 1e-4)
+        lr_backbone = getattr(config, "mafia_lr_backbone", 3e-4)
+
+        schedule_mode = getattr(config, "mafia_lr_schedule", "cosine")
+        warmup_epochs = getattr(config, "mafia_lr_warmup_epochs", 2)
+        min_lr = getattr(config, "mafia_lr_min", 1e-6)
+        total_epochs = max(1, config.num_epochs)
+        end_factor = getattr(config, "mafia_lr_end_factor", 0.2)
         frac = getattr(config, "mafia_lr_end_fraction", 0.5)
 
-        if schedule_mode == "linear":
-            decay_epochs = max(1, int(config.num_epochs * frac))
-
+        if schedule_mode == "cosine":
+            # Cosine Annealing with Warmup
             def _lr_lambda(epoch):
-                if epoch >= decay_epochs:
-                    return end_lr / start_lr
-                return 1.0 - (1.0 - end_lr / start_lr) * (epoch / float(decay_epochs))
+                if epoch < warmup_epochs:
+                    return max(min_lr / lr_backbone, (epoch + 1) / warmup_epochs)
+                progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return max(min_lr / lr_backbone, cosine_decay)
 
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=_lr_lambda
             )
-        elif schedule_mode == "linear_per_epoch":
-            cycle_steps = max(
-                1,
-                int(getattr(config, "observer_mini_epoch_steps", 1)),
+
+        elif schedule_mode == "linear":
+            decay_epochs = max(1, int(total_epochs * frac))
+
+            def _lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return (epoch + 1) / warmup_epochs
+                adj_epoch = epoch - warmup_epochs
+                adj_decay = max(1, decay_epochs - warmup_epochs)
+                if adj_epoch >= adj_decay:
+                    return end_factor
+                return 1.0 - (1.0 - end_factor) * (adj_epoch / float(adj_decay))
+
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=_lr_lambda
             )
+
+        elif schedule_mode == "linear_per_epoch":
+            cycle_steps = max(1, int(getattr(config, "observer_mini_epoch_steps", 1)))
             decay_steps = max(1, int(cycle_steps * frac))
 
             def _lr_lambda(step_idx):
                 step_in_cycle = step_idx % cycle_steps
                 if step_in_cycle >= decay_steps:
-                    return end_lr / start_lr
-                return 1.0 + (end_lr / start_lr - 1.0) * (
-                    step_in_cycle / float(decay_steps)
-                )
+                    return end_factor
+                return 1.0 + (end_factor - 1.0) * (step_in_cycle / float(decay_steps))
 
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=_lr_lambda
             )
         else:
-            decay_steps = max(1, config.num_epochs // 3)
+            decay_steps = max(1, total_epochs // 3)
             self.lr_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=decay_steps, gamma=0.1
             )
 
-        # Reset optimizer param groups to initial LR
+        # Reset optimizer param groups to initial differential LRs
+        lr_map = {
+            "direction_head": lr_direction,
+            "risk_head": lr_risk,
+            "backbone": lr_backbone,
+        }
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = start_lr
-            param_group["initial_lr"] = start_lr
+            group_name = param_group.get("name", "backbone")
+            initial_lr = lr_map.get(group_name, lr_backbone)
+            param_group["lr"] = initial_lr
+            param_group["initial_lr"] = initial_lr
 
         smart_print(
-            f"[MAFIA] LR scheduler reset: mode={schedule_mode}, initial_lr={start_lr}",
+            f"[MAFIA] LR scheduler reset: mode={schedule_mode}, "
+            f"direction={lr_direction:.1e}, risk={lr_risk:.1e}, backbone={lr_backbone:.1e}",
             flush=True,
         )

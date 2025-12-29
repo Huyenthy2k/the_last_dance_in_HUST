@@ -1,7 +1,8 @@
 """
-Display Integration Layer (Simplified)
-======================================
-Integrates simplified LiveDisplay with MAFIA training components.
+Display Integration Layer (Unified Text Logger)
+===============================================
+Standardized text-based logger for MAFIA (Observer & TD3).
+Replaces legacy LiveDisplay with detailed, step-by-step console logging.
 """
 
 import os
@@ -9,21 +10,14 @@ import sys
 import time
 import atexit
 from typing import Any, Dict, List, Optional
-from contextlib import contextmanager
 
-from utils.live_display import LiveDisplay, init_display, get_display, ANSI
-
-
-# Check if LiveDisplay should be disabled via environment variable
-_LIVE_DISPLAY_DISABLED = os.environ.get("MAFIA_NO_LIVE_DISPLAY", "0") == "1"
+# Remove LiveDisplay imports
 
 # Global state
-_display_enabled = True and not _LIVE_DISPLAY_DISABLED
+_display_enabled = True 
 _log_file_path: Optional[str] = None
-_suppress_prints = False
-
-# Walk-forward iteration tracking (to prevent event log spam)
-_last_logged_wf_iteration = -1
+_logger_instance = None
+_last_logged_wf_iteration = -1  # Track Walk-Forward iteration to prevent spam
 
 
 def setup_display(
@@ -33,54 +27,177 @@ def setup_display(
     total_epochs: int = 50,
     window: int = 0,
     seed: int = 2025,
-) -> LiveDisplay:
-    """Setup and initialize the live display."""
-    global _display_enabled, _log_file_path, _suppress_prints
-
-    # Check env var override
-    if _LIVE_DISPLAY_DISABLED:
-        enabled = False
+) -> "UnifiedLogger":
+    """Setup and initialize the unified text logger."""
+    global _display_enabled, _log_file_path, _logger_instance
 
     _display_enabled = enabled
     _log_file_path = log_file
-    _suppress_prints = enabled
 
-    display = init_display(enabled=enabled, log_file=log_file)
-    display.update(
+    logger = UnifiedLogger(log_file=log_file)
+    logger.update(
         total_epochs=total_epochs,
         window=window,
         seed=seed,
     )
+    _logger_instance = logger
+    return logger
 
-    if enabled:
-        display.initialize()
-        # Capture stdout/stderr to prevent breaking the display
-        display.capture_stdout()
-        # Enable print suppression
-        enable_display_mode()
-        atexit.register(_cleanup_display_at_exit, display)
+def get_display():
+    global _logger_instance
+    if _logger_instance is None:
+        _logger_instance = UnifiedLogger()
+    return _logger_instance
 
-    return display
-
-
-def _cleanup_display_at_exit(display):
-    """Cleanup function for atexit.
-
-    Order is important:
-    1. cleanup() - Clear display and position cursor correctly (while still capturing stdout)
-    2. release_stdout() - Restore original stdout/stderr
-    3. disable_display_mode() - Restore normal print behavior
-    """
-    display.cleanup()  # First: cleanup display while stdout is still captured
-    display.release_stdout()  # Second: restore original stdout
-    disable_display_mode()  # Last: restore normal print
-
-
-def cleanup_display():
-    """Cleanup the display on exit."""
+def smart_print(msg: str, flush: bool = False):
+    """Pass-through to logger if available, else print."""
     display = get_display()
-    if display and display.enabled:
-        display.cleanup()
+    if display:
+        display.log(msg)
+    else:
+        print(msg, flush=flush)
+
+
+class UnifiedLogger:
+    """
+    A unified text-based logger that prints detailed, step-by-step metrics 
+    for both Observer (Batch/Epoch) and TD3 (Update/Summary).
+    """
+    def __init__(self, log_file=None):
+        self.log_file = log_file
+        self.state = {}
+        self.last_epoch = -1
+        self.last_step = -1
+        self.last_td3_update = -1
+        self.enabled = True 
+
+    def update(self, **kwargs):
+        self.state.update(kwargs)
+        
+        # Observer Batch Update Logic
+        step = self.state.get('step', -1)
+        # Check if we have sample_details which implies Observer batch context
+        if 'sample_details' in self.state and step != self.last_step and step >= 0:
+            self._print_batch_update()
+            self.last_step = step
+            
+        # TD3 Batch Update Logic
+        td3_updates = self.state.get('td3_updates', -1)
+        if td3_updates != self.last_td3_update and td3_updates > 0:
+            self._print_td3_update()
+            self.last_td3_update = td3_updates
+
+    def initialize(self): pass
+    def cleanup(self): pass
+    def capture_stdout(self): pass
+    def release_stdout(self): pass
+
+    def log(self, msg, level="INFO"):
+        if level == "INFO":
+            print(f"{msg}")
+        else:
+            print(f"[{level}] {msg}")
+
+    def add_event(self, type, msg):
+        print(f"[{type}] {msg}")
+
+    def render(self, force=False):
+        # Handle End-of-Epoch Summaries
+        epoch = self.state.get('epoch', 0)
+        if epoch != self.last_epoch and epoch > 0:
+            self._print_epoch_summary()
+            self.last_epoch = epoch
+
+    def _print_batch_update(self):
+        s = self.state
+        if 'sample_details' not in s: return
+        d = s['sample_details']
+        
+        epoch = s.get('epoch', 0)
+        batch = s.get('batch', 0)
+        step_str = f"{d.get('step_t',0)+1}/{d.get('total_steps_in_traj',0)}"
+        trig = d.get('trigger', 'N/A')
+        icon = '⏸' if 'Hold' in trig else '🔄'
+        
+        print(f"  ⏱  [Epoch {epoch}] Batch {batch+1} | Step {step_str} | {icon}  {trig.upper()}  [Sample 1/{s.get('batch_size', '?')} trajectories]")
+        print(f"     Trigger: {d.get('trigger_details', 'N/A')}")
+        print(f"     📈 Market:    RawReturn={d.get('market_raw_return', 0):+.4f} | CtxDiff={d.get('ctx_diff', 0):.3f}")
+        
+        t_pen = d.get('cost_turn_pen', 0)
+        s_pen = d.get('cost_symdiff_pen', 0)
+        tp_str = f"{t_pen:.4f}" if t_pen > 0 else "N/A (HOLD)"
+        sp_str = f"{s_pen:.4f}" if s_pen > 0 else "N/A (HOLD)"
+        print(f"     💸 Costs:     TurnPen={tp_str} | SymDiffPen={sp_str}")
+        
+        print(f"     ⚖️  Outcome:   R_total={d.get('score_r_total',0):+.4f} | R_baseline={d.get('score_r_baseline',0):+.4f} | Advantage={d.get('score_advantage',0):+.4f} | R_hold={d.get('score_r_hold',0):+.4f}")
+        print(f"     📉 Losses:    L_PG={d.get('loss_pg',0):.4f} | L_risk={d.get('loss_risk',0):.4f} | L_dir={d.get('loss_dir',0):.4f} | L_bal={d.get('loss_bal',0):.4f}")
+        
+        tickers = d.get('portfolio_tickers', [])
+        ticker_str = ", ".join(tickers[:5]) + ("..." if len(tickers)>5 else "")
+        print(f"     📊 Portfolio: Held={int(d.get('portfolio_held_count',0))} | {ticker_str}")
+        
+        dir_map = {0: "Bear", 1: "Side", 2: "Bull"}
+        pred_cls = dir_map.get(d.get('forecast_dir_pred'), '?')
+        gt_cls = dir_map.get(d.get('forecast_dir_gt'), '?')
+        match = "✅" if pred_cls == gt_cls else "❌"
+        probs = d.get('forecast_dir_probs', [0,0,0])
+        prob_str = f"[Bear={probs[0]:.2f}, Side={probs[1]:.2f}, Bull={probs[2]:.2f}]"
+        
+        print(f"     🔮 Forecast:  Risk(η)={d['forecast_risk_eta']:.2f}(Tg={d['forecast_risk_target']:.2f}) | Dir={pred_cls} (GT: {gt_cls}){match} {prob_str}")
+        
+        gw = d.get('gate_weights', {})
+        gw_str = ", ".join([f"{k}={v*100:.1f}%" for k,v in gw.items()]) if gw else "(No Gate Info)"
+        print(f"     🧩 Gate:      {gw_str}")
+        print("")
+
+    def _print_td3_update(self):
+        """Detailed TD3 Update Log matching Observer format."""
+        s = self.state
+        updates = s.get('td3_updates', 0)
+        actor_loss = s.get('td3_actor_loss', 0.0)
+        critic_loss = s.get('td3_critic_loss', 0.0)
+        reward = s.get('td3_reward', 0.0)
+        buffer_size = s.get('td3_buffer_size', 0)
+        
+        # Trying to mock "Batch" concept via updates count or similar.
+        # Since TD3 updates continuously, we can treat each log as a "Batch"
+        print(f"  ⏱  [TD3 Training] Update {updates} | Buffer {buffer_size:,} | 🔄 REGIMES: {s.get('last_regime_to', 'N/A')}")
+        print(f"     📉 Actor Loss:  {actor_loss:+.6f} (Policy Optimization)")
+        print(f"     📉 Critic Loss: {critic_loss:+.6f} (Q-Value Error)")
+        print(f"     💰 Batch Reward: {reward:+.6f} (Avg sampled from Replay Buffer)")
+        
+        # If we had action distribution stats, we'd print them here.
+        # For now, print Top-K info if available in state
+        if 'td3_topk_display' in s:
+             print(f"     🧩 Top-K Focus: {s['td3_topk_display']}")
+             
+        print("")
+
+    def _print_epoch_summary(self):
+        s = self.state
+        print(f"\n{'='*100}")
+        print(f"📊 EPOCH {s.get('epoch', 0)} SUMMARY")
+        print(f"{'-'*100}")
+        print(f"  📈 Returns:     Mean={s.get('epoch_return', 0):+.4f} | Std={s.get('volatility', 0):.4f}")
+        print(f"  💰 Net Reward:  Mean={s.get('obs_r_sel_total', 0):+.4f}")
+        print(f"  ⚖️  Sharpe:      {s.get('sharpe', 0):.4f}")
+        dir_acc = s.get('win_rate', 0) * 100 
+        print(f"  🎯 Direction:   Accuracy={dir_acc:.1f}%")
+        print(f"  📉 Risk η:      Mean={s.get('obs_eta_pred', 0):.3f}")
+        print(f"{'-'*100}")
+        print(f"  📉 Losses:")
+        print(f"    ├─ Total:     {s.get('obs_loss_total', 0):.6f}")
+        print(f"    ├─ PG:        {s.get('obs_loss_pg', 0):.6f}")
+        print(f"    ├─ Risk:      {s.get('obs_loss_eta', 0):.6f}")
+        print(f"    └─ Direction: {s.get('obs_loss_dir', 0):.6f}")
+        print(f"{'-'*100}")
+        if s.get('td3_updates', 0) > 0:
+             print(f"  🤖 TD3 Status: {s.get('td3_updates')} updates | Avg Reward: {s.get('td3_reward', 0):.4f}")
+        print(f"{'='*100}\n")
+
+# Placeholder for cleanup functions
+def _cleanup_display_at_exit(display): pass
+def cleanup_display(): pass
 
 
 def update_step(
@@ -230,7 +347,7 @@ def update_observer(
     pg_r_return: float = 0.0,  # mean_return component
     pg_r_turnover: float = 0.0,  # α_turnover × turnover penalty
     pg_r_change: float = 0.0,  # α_change × symdiff penalty
-    pg_r_total: float = 0.0,  # Total shaped return (R_t)
+    pg_r_total: float = 0.0,  # Total shaped reward sum
     pg_r_diversity: float = 0.0,  # Legacy (kept for compat)
     **kwargs,  # Ignore extra args
 ):
@@ -622,39 +739,60 @@ def set_training_mode(
 
     if mode == "OBSERVER_ONLY":
         # Phase 1: Observer training, TD3 frozen (uniform weights)
-        # CBF is disabled because TD3 actions are just uniform weights, not learned
         display.update(
             training_mode="OBSERVER_ONLY",
             observer_frozen=False,  # Observer is TRAINING
             td3_frozen=True,  # TD3 is FROZEN
-            cbf_enabled=False,  # CBF disabled (TD3 frozen, uniform weights)
+            cbf_enabled=False,  # CBF disabled
             observer_checkpoint_source="",
-            phase="OBSERVER_PRETRAIN",  # Set appropriate phase
+            phase="OBSERVER_PRETRAIN",
         )
+        msg = (
+            "\n"
+            "╔══════════════════════════════════════════════════════════════════════════════╗\n"
+            "║ 🔮 PHASE 1A: MACRO SPECIALIST TRAINING (Observer Only)                       ║\n"
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n"
+            "║ • Goal:      Train Grid-Trader Backbone + Direction/Risk Heads               ║\n"
+            "║ • Frozen:    Selection Head (Top-K) & TD3 Agent                              ║\n"
+            "║ • Strategy:  Iterative Expanding Window (Quarterly Updates)                  ║\n"
+            "╚══════════════════════════════════════════════════════════════════════════════╝\n"
+        )
+        display.log(msg)
         display.add_event("EPOCH", "🔮 Phase 1: Observer Walk-Forward Training")
-    else:  # RL_ONLY
-        # Phase 2: TD3 training, Observer frozen (Static Expert)
+
+    else:  # RL_ONLY / SELECTION_ONLY logic (Phase 2)
+        # Phase 2: Selection Specialist (RL) or TD3
         display.update(
             training_mode="RL_ONLY",
             observer_frozen=True,  # Observer is FROZEN (Static Expert)
             td3_frozen=False,  # TD3 is TRAINING
-            cbf_enabled=True,  # CBF enabled (TD3 learning real actions)
+            cbf_enabled=True,  # CBF enabled
             observer_checkpoint_source=observer_checkpoint,
-            phase="WARMUP",  # Start with warmup
-            epoch=1,  # Phase 2 starts at epoch 1 (will be updated by callback)
-            step=0,  # Reset step for new phase
+            phase="WARMUP",
+            epoch=1,
+            step=0,
         )
         obs_src = (
             observer_checkpoint[-40:]
             if len(observer_checkpoint) > 40
             else observer_checkpoint
         )
+        msg = (
+            "\n"
+            "╔══════════════════════════════════════════════════════════════════════════════╗\n"
+            "║ 🎯 PHASE 2: SELECTION SPECIALIST (Portfolio Manager)                         ║\n"
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n"
+            "║ • Goal:      Train Selection Head (Top-K) via Policy Gradient / TD3          ║\n"
+            "║ • Frozen:    Backbone, Direction/Risk Heads (Loaded from Phase 1)            ║\n"
+            "║ • Source:    {:<63} ║\n"
+            "╚══════════════════════════════════════════════════════════════════════════════╝\n"
+        ).format(obs_src or "None")
+        display.log(msg)
         display.add_event(
             "EPOCH", f"🎯 Phase 2: TD3 Training (Observer: {obs_src or 'N/A'})"
         )
-
+    
     display.render(force=True)
-    display.log(f"Training mode set: {mode}")
 
 
 def update_walkforward_iteration(
@@ -778,184 +916,4 @@ def log_epoch_end(epoch: int, metrics: Dict[str, Any]):
                 display.log(f"  {key}: {value}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CRITICAL: Print Suppression System for LiveDisplay
-# ═══════════════════════════════════════════════════════════════════════════════
-# This system ensures ALL print statements go to the log file, not the terminal,
-# when LiveDisplay is active. This is critical for maintaining the fixed layout.
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# Store references to ORIGINAL print and stdout BEFORE any redirection
-# Use sys.__stdout__ which Python guarantees is never redirected
-import builtins
-
-_original_print = builtins.print
-_original_stdout = sys.__stdout__  # The REAL stdout, never redirected
-
-
-def _display_aware_print(*args, **kwargs):
-    """Print function that respects display mode.
-
-    When LiveDisplay is active:
-    - ALL prints are COMPLETELY SUPPRESSED from terminal
-    - Prints are logged to the log file only (if available)
-    - This ensures the display layout remains fixed
-
-    CRITICAL: Never write to terminal when display is active!
-    """
-    display = get_display()
-    live_display_active = display and display.enabled
-
-    if not live_display_active:
-        # Display not active, use normal print via original stdout
-        # Use _original_print which goes to _original_stdout
-        try:
-            _original_print(*args, **kwargs)
-        except Exception:
-            pass
-        return
-
-    # ═══ LiveDisplay is ACTIVE - SUPPRESS ALL terminal output ═══
-    # Only write to log file, NEVER to terminal
-
-    if args:
-        msg = " ".join(str(arg) for arg in args)
-        end = kwargs.get("end", "\n")
-        full_msg = msg + end
-
-        # Method 1: Use display's log method (preferred)
-        if display and hasattr(display, "log"):
-            try:
-                display.log(msg.rstrip())  # Remove trailing newline for log
-                return
-            except Exception:
-                pass
-
-        # Method 2: Write directly to log file if available
-        if display and display.log_file:
-            try:
-                with open(display.log_file, "a", encoding="utf-8") as f:
-                    f.write(full_msg)
-                return
-            except Exception:
-                pass
-
-    # If we get here, completely suppress output
-    # This is intentional - we MUST keep the display fixed
-    return
-
-
-def enable_display_mode():
-    """Enable display mode and suppress old print statements.
-
-    This patches builtins.print to route all prints through _display_aware_print,
-    which logs to file instead of terminal when LiveDisplay is active.
-    """
-    builtins.print = _display_aware_print
-
-
-def disable_display_mode():
-    """Disable display mode and restore normal printing."""
-    builtins.print = _original_print
-
-
-@contextmanager
-def suppress_old_prints():
-    """Context manager to temporarily suppress old print statements."""
-    enable_display_mode()
-    try:
-        yield
-    finally:
-        disable_display_mode()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SMART PRINT FUNCTION - To be imported by other modules for verbose logging
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def smart_print(*args, verbose: bool = True, **kwargs):
-    """Smart print function that routes verbose logs to file when appropriate.
-
-    This function should be used by all modules that have verbose logging
-    (tradeEnv.py, TD3_controller.py, controllers.py, callback_func.py, etc.)
-    to ensure terminal layout remains fixed when LiveDisplay is active.
-
-    Key behaviors:
-    - If display.enabled=True (TTY available): Route to log file, suppress terminal
-    - If display.enabled=False but log_file exists: Route to log file, suppress terminal
-    - If no log file: Print normally (fallback)
-    - If verbose=False: Always print (critical messages)
-    - If MAFIA_QUIET_STARTUP=1: Suppress pre-training messages (LiveDisplay will be used)
-
-    Args:
-        *args: Arguments to print
-        verbose: If False, always print (used for critical messages)
-        **kwargs: Keyword arguments for print (flush, end, etc.)
-
-    Usage:
-        from utils.display_integration import smart_print
-        smart_print("[ENV] day= 0 | η=1.0 | ...")  # Goes to log file when display active
-        smart_print("[CRITICAL] Error!", verbose=False)  # Always prints
-    """
-    # Force flush=True for realtime logging unless explicitly disabled
-    if "flush" not in kwargs:
-        kwargs["flush"] = True
-
-    # Suppress startup messages when LiveDisplay will be used (they get overwritten anyway)
-    if os.environ.get("MAFIA_QUIET_STARTUP", "") == "1" and verbose:
-        # During startup, suppress verbose output since LiveDisplay will overwrite it
-        return
-
-    display = get_display()
-
-    # If verbose=False, always print (critical messages)
-    if not verbose:
-        _original_print(*args, **kwargs)
-        return
-
-    # Check if we should route to log file:
-    # - Display is enabled (TTY mode with live display)
-    # - OR display has a log file (even if TTY unavailable)
-    should_log_only = (display and display.enabled) or (display and display.log_file)
-
-    # If no display or no log file, print normally
-    if not should_log_only:
-        try:
-            _original_print(*args, **kwargs)
-        except Exception:
-            pass
-        return
-
-    # ═══ Route to log file only - Suppress terminal output ═══
-    if args:
-        msg = " ".join(str(arg) for arg in args)
-        end = kwargs.get("end", "\n")
-        full_msg = msg + end
-
-        # Method 1: Use display's log method (if enabled)
-        if display and display.enabled and hasattr(display, "log"):
-            try:
-                display.log(msg.rstrip())
-                return
-            except Exception:
-                pass
-
-        # Method 2: Write directly to log file
-        if display and display.log_file:
-            try:
-                with open(display.log_file, "a", encoding="utf-8") as f:
-                    f.write(full_msg)
-                return
-            except Exception:
-                pass
-
-
-def is_display_active() -> bool:
-    """Check if LiveDisplay is currently active.
-
-    Returns True if display is enabled and running, False otherwise.
-    Use this to conditionally skip expensive formatting for verbose logs.
-    """
-    display = get_display()
-    return display is not None and display.enabled

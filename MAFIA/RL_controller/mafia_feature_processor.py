@@ -56,8 +56,11 @@ def _compute_dc_sequence_jit(close, high, low, threshold):
     event_flag[0] = 1.0
 
     for t in range(1, T_w):
+        # Handle dynamic threshold (array) or static (scalar)
+        thresh_t = threshold[t] if threshold.ndim > 0 else threshold
+        
         if current_trend == 1:
-            if close[t] <= current_extreme * (1 - threshold):
+            if close[t] <= current_extreme * (1 - thresh_t):
                 current_trend = -1
                 current_extreme = close[t]
                 event_price = close[t]
@@ -68,7 +71,7 @@ def _compute_dc_sequence_jit(close, high, low, threshold):
                     current_extreme = high[t]
                 event_flag[t] = 0.5
         else:
-            if close[t] >= current_extreme * (1 + threshold):
+            if close[t] >= current_extreme * (1 + thresh_t):
                 current_trend = 1
                 current_extreme = close[t]
                 event_price = close[t]
@@ -86,17 +89,44 @@ def _compute_dc_sequence_jit(close, high, low, threshold):
     return state, magnitude, duration, event_flag
 
 class MAFIAFeatureProcessor:
-    # ... (rest of class init, skipped for brevity in replacement) ...
-    # REDEFINING _compute_dc_sequence inside class is hard with tool.
-    # I will replace the block from "NUMBA_AVAILABLE = False" down to "_compute_dc_sequence" logic.
-
     """
     Feature processor for MAFIA agents.
 
     Generates features for:
     - Technical Agent (i=0): Raw OCHLV + Technical Indicators (SMA, RSI, ATR)
     - DC Agents (i=1,2,3): Directional Change features (State, Magnitude, Duration, Volume_Ratio, Event_Flag)
+
+    Normalization:
+    - CHANGE features: Clamped to [-clip, +clip] to bound outliers
+    - Volume: Log-transform + z-score normalization
+    - DC Magnitude: Clamped to prevent extreme values
+    - DC Volume_Ratio: Log-transform + clamp
     """
+
+    # Normalization constants (can be overridden via config)
+    DEFAULT_PRICE_CHANGE_CLIP = 0.3  # ±30% max daily change for OCHLV
+    DEFAULT_VOLUME_CHANGE_CLIP = 3.0  # ±3 std for log-volume changes
+    DEFAULT_DC_MAGNITUDE_CLIP = 0.5  # ±50% max magnitude from DC event
+    DEFAULT_DC_VOLUME_RATIO_CLIP = 5.0  # Max volume ratio (relative to mean)
+
+    @staticmethod
+    def _soft_clip(x: np.ndarray, limit: float) -> np.ndarray:
+        """
+        Apply soft clipping using tanh to compress outliers while preserving order.
+        output = limit * tanh(x / limit)
+        """
+        if limit <= 0:
+            return x
+        return limit * np.tanh(x / limit)
+
+    @staticmethod
+    def _compute_rolling_vol(returns: pd.Series, window: int) -> np.ndarray:
+        """
+        Compute safe rolling volatility (std dev of returns).
+        """
+        return returns.rolling(window=window, min_periods=1).std(ddof=0).values
+    
+
 
     def __init__(self, config):
         """
@@ -107,13 +137,161 @@ class MAFIAFeatureProcessor:
         """
         self.config = config
         self.T_w = config.mafia_T_w  # Observation window size (30)
-        self.DC_thresholds = config.mafia_DC_thresholds  # [0.005, 0.01, 0.02]
+        # Use multipliers for adaptive thresholds (k * ATR) or fallback to static list if not found
+        self.DC_multipliers = getattr(config, 'mafia_DC_multipliers', [0.5, 1.0, 2.0])
         self.M_tech = config.mafia_M_tech  # 8 features for Technical agent
         self.M_dc = config.mafia_M_dc  # 5 features for DC agents
-        
+
+        # Normalization parameters (from config or defaults)
+        self.price_change_clip = getattr(
+            config, 'mafia_price_change_clip', self.DEFAULT_PRICE_CHANGE_CLIP
+        )
+        self.volume_change_clip = getattr(
+            config, 'mafia_volume_change_clip', self.DEFAULT_VOLUME_CHANGE_CLIP
+        )
+        self.dc_magnitude_clip = getattr(
+            config, 'mafia_dc_magnitude_clip', self.DEFAULT_DC_MAGNITUDE_CLIP
+        )
+        self.dc_volume_ratio_clip = getattr(
+            config, 'mafia_dc_volume_ratio_clip', self.DEFAULT_DC_VOLUME_RATIO_CLIP
+        )
+
         # Cache for DC features to avoid redundant computation
         # Key: (data_hash, threshold) -> Value: P_DC array
         self._dc_cache = {}
+
+        # Cache for pre-computed technical indicators
+        # Key: stock_id -> {'sma_20': array, 'rsi_14': array, 'atr_14': array, 'close': array}
+        self._tech_cache = {}
+        self._tech_cache_enabled = False
+
+        # Cache for pre-computed DC features (per stock, per multiplier)
+        # Key: (stock_id, multiplier) -> {'state': array, 'magnitude': array, ...}
+        self._dc_precomputed_cache = {}
+        self._dc_cache_enabled = False
+
+        # Per-forward-pass cache for ATR to avoid redundant computation
+        # Reset at the start of each forward pass
+        self._atr_cache = None  # Will be (N, T_w) array
+        self._atr_cache_hash = None  # Hash of input data to detect changes
+
+    def precompute_technical_indicators(self, rawdata: pd.DataFrame, stock_list: list):
+        """
+        Pre-compute technical indicators for entire time series.
+        Call this once during data loading to enable caching.
+
+        Args:
+            rawdata: DataFrame with columns [stock, date, open, high, low, close, volume]
+            stock_list: List of stock symbols to pre-compute for
+        """
+        print("[MAFIAFeatureProcessor] Pre-computing technical indicators...")
+        self._tech_cache = {}
+
+        for stock_id in stock_list:
+            stock_data = rawdata[rawdata['stock'] == stock_id].sort_values('date')
+            if len(stock_data) < 30:  # Skip if not enough data
+                continue
+
+            close_prices = stock_data['close'].values.astype(np.float64)
+            high_prices = stock_data['high'].values.astype(np.float64)
+            low_prices = stock_data['low'].values.astype(np.float64)
+            open_prices = stock_data['open'].values.astype(np.float64)
+            volumes = stock_data['volume'].values.astype(np.float64)
+            dates = stock_data['date'].values
+
+            # Compute indicators on full time series
+            sma_20 = self._compute_sma(close_prices, window=20)
+            rsi_14 = self._compute_rsi(close_prices, period=14)
+            atr_14 = self._compute_atr(high_prices, low_prices, close_prices, period=14)
+
+            self._tech_cache[stock_id] = {
+                'sma_20': sma_20,
+                'rsi_14': rsi_14,
+                'atr_14': atr_14,
+                'close': close_prices,
+                'high': high_prices,
+                'low': low_prices,
+                'open': open_prices,
+                'volume': volumes,
+                'dates': dates,
+            }
+
+        self._tech_cache_enabled = True
+        print(f"[MAFIAFeatureProcessor] Cached indicators for {len(self._tech_cache)} stocks")
+
+    def get_cached_indicators(self, stock_id: str, day_indices: np.ndarray) -> Optional[dict]:
+        """
+        Get pre-computed indicators for a stock at specific day indices.
+
+        Args:
+            stock_id: Stock symbol
+            day_indices: Array of indices into the stock's time series
+
+        Returns:
+            Dict with 'sma_20', 'rsi_14', 'atr_14', 'close' arrays, or None if not cached
+        """
+        if not self._tech_cache_enabled or stock_id not in self._tech_cache:
+            return None
+
+        cache = self._tech_cache[stock_id]
+        T = len(day_indices)
+
+        # Validate indices
+        max_idx = len(cache['close']) - 1
+        valid_indices = np.clip(day_indices, 0, max_idx).astype(int)
+
+        return {
+            'sma_20': cache['sma_20'][valid_indices],
+            'rsi_14': cache['rsi_14'][valid_indices],
+            'atr_14': cache['atr_14'][valid_indices],
+            'close': cache['close'][valid_indices],
+        }
+
+    def clear_cache(self):
+        """Clear all caches to free memory."""
+        self._tech_cache = {}
+        self._tech_cache_enabled = False
+        self._dc_precomputed_cache = {}
+        self._dc_cache_enabled = False
+        self._dc_cache = {}
+        self._atr_cache = None
+        self._atr_cache_hash = None
+
+    def _get_cached_atr(self, high_prices: np.ndarray, low_prices: np.ndarray,
+                        close_prices: np.ndarray, period: int = 14) -> np.ndarray:
+        """
+        Get ATR for all stocks, using cache if available.
+        This avoids recomputing ATR 4x per timestep (1x tech + 3x DC).
+
+        Args:
+            high_prices: (N, T_w) array
+            low_prices: (N, T_w) array
+            close_prices: (N, T_w) array
+            period: ATR period (default 14)
+
+        Returns:
+            atr_all: (N, T_w) array of ATR values for all stocks
+        """
+        # Create hash of input to detect if data changed
+        data_hash = hash((close_prices.tobytes(), high_prices.shape))
+
+        if self._atr_cache is not None and self._atr_cache_hash == data_hash:
+            return self._atr_cache
+
+        # Compute ATR for all stocks
+        N, T_w = close_prices.shape
+        atr_all = np.zeros((N, T_w), dtype=np.float64)
+
+        for n in range(N):
+            atr_all[n, :] = self._compute_atr(
+                high_prices[n, :], low_prices[n, :], close_prices[n, :], period
+            )
+
+        # Cache for subsequent calls in same forward pass
+        self._atr_cache = atr_all
+        self._atr_cache_hash = data_hash
+
+        return atr_all
 
     def process_technical_features(self, ochlv_data: np.ndarray) -> np.ndarray:
         """
@@ -146,12 +324,24 @@ class MAFIAFeatureProcessor:
         # Initialize output array
         P_Tech = np.zeros((N, T_w, self.M_tech), dtype=np.float32)
 
-        # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV)
+        # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV) with normalization
         raw_feat_stack = [open_prices, close_prices, high_prices, low_prices, volumes]
         for feat_idx, feat_vals in enumerate(raw_feat_stack):
             if feat_vals.shape[1] <= 1:
                 change = np.zeros_like(feat_vals)
-            else:
+            elif feat_idx == 4:  # Volume: use log-transform + z-score
+                # Log-transform to handle skewed distribution
+                log_vol = np.log1p(feat_vals)  # log(1 + volume)
+                # Compute change in log-space (log-return)
+                log_change = np.diff(log_vol, axis=1, prepend=log_vol[:, :1])
+                # Z-score normalization per-stock across the window
+                log_mean = np.mean(log_change, axis=1, keepdims=True)
+                log_std = np.std(log_change, axis=1, keepdims=True)
+                log_std = np.where(log_std == 0, 1.0, log_std)  # Avoid div by zero
+                change = (log_change - log_mean) / log_std
+                # Clip to bound outliers
+                change = self._soft_clip(change, self.volume_change_clip)
+            else:  # Price features: percentage change with clipping
                 prev_vals = feat_vals[:, :-1]
                 cur_vals = feat_vals[:, 1:]
                 change = np.divide(
@@ -164,7 +354,12 @@ class MAFIAFeatureProcessor:
                 change = np.concatenate(
                     [np.zeros((N, 1), dtype=change.dtype), change], axis=1
                 )
+                # Clip price changes to bound extreme values (e.g., stock halts)
+                change = self._soft_clip(change, self.price_change_clip)
             P_Tech[:, :, feat_idx] = change.astype(np.float32)
+
+        # Get cached ATR for all stocks (computed once, used by both tech and DC features)
+        atr_all = self._get_cached_atr(high_prices, low_prices, close_prices, period=14)
 
         # Compute technical indicators for each asset
         for n in range(N):
@@ -178,19 +373,16 @@ class MAFIAFeatureProcessor:
             rsi_14 = self._compute_rsi(close_prices[n, :], period=14)
             P_Tech[n, :, 6] = rsi_14 / 100.0
 
-            # ATR(14) -> Scale by Close (Volatility %)
-            atr_14 = self._compute_atr(
-                high_prices[n, :], low_prices[n, :], close_prices[n, :], period=14
-            )
-            P_Tech[n, :, 7] = atr_14 / safe_close
+            # ATR(14) -> Scale by Close (Volatility %) - use cached value
+            P_Tech[n, :, 7] = atr_all[n, :] / safe_close
 
         return P_Tech.astype(np.float32)
 
     def process_dc_features(
-        self, ochlv_data: np.ndarray, dc_threshold: float
+        self, ochlv_data: np.ndarray, k_multiplier: float
     ) -> np.ndarray:
         """
-        Process features for a DC Agent with given threshold.
+        Process features for a DC Agent with adaptive threshold.
 
         Input: Raw price data
         - ochlv_data: (N, 5, T_w) where 5 = [open, close, high, low, volume]
@@ -204,7 +396,7 @@ class MAFIAFeatureProcessor:
 
         Args:
             ochlv_data: (N, 5, T_w) numpy array
-            dc_threshold: DC threshold (e.g., 0.005, 0.01, 0.02)
+            k_multiplier: Multiplier for ATR-based threshold (Threshold = k * ATR / Close)
 
         Returns:
             P_DC: (N, T_w, 5) numpy array
@@ -222,24 +414,33 @@ class MAFIAFeatureProcessor:
         # Initialize output array
         P_DC = np.zeros((N, T_w, self.M_dc), dtype=np.float32)
 
-        # Compute DC features for each asset
+        # Get cached ATR for all stocks (computed once, reused across DC multipliers)
+        atr_all = self._get_cached_atr(high_prices, low_prices, close_prices, period=14)
+
+        # VECTORIZED: Pre-compute safe_close and dynamic_thresholds for all stocks
+        safe_close_all = np.where(close_prices == 0, 1.0, close_prices)  # (N, T_w)
+        dynamic_thresholds_all = np.maximum(
+            k_multiplier * atr_all / safe_close_all, 1e-4
+        )  # (N, T_w)
+
+        # VECTORIZED: Pre-compute volume ratios for all stocks
+        volume_means = np.mean(volumes, axis=1, keepdims=True)  # (N, 1)
+        volume_means = np.where(volume_means == 0, 1.0, volume_means)  # Avoid div by zero
+        vol_ratios = volumes / volume_means  # (N, T_w)
+        vol_ratios_log = np.log1p(vol_ratios) - np.log(2)  # (N, T_w)
+        vol_ratios_clipped = self._soft_clip(vol_ratios_log, np.log(self.dc_volume_ratio_clip))
+
+        # Compute DC features for each asset (DC sequence must be per-stock due to state machine)
         for n in range(N):
             state, magnitude, duration, event_flag = self._compute_dc_sequence(
-                close_prices[n, :], high_prices[n, :], low_prices[n, :], dc_threshold
+                close_prices[n, :], high_prices[n, :], low_prices[n, :],
+                dynamic_thresholds_all[n, :]
             )
 
-            P_DC[n, :, 0] = state  # State
-            P_DC[n, :, 1] = magnitude  # Magnitude
-            # Duration -> Scale by Window Size T_w
-            P_DC[n, :, 2] = duration / float(self.T_w)  # Duration (0.0 to 1.0+)
-
-            # Volume_Ratio: Volume[t] / Mean(Volume[0...T_w-1])
-            volume_mean = np.mean(volumes[n, :])
-            if volume_mean > 0:
-                P_DC[n, :, 3] = volumes[n, :] / volume_mean
-            else:
-                P_DC[n, :, 3] = 1.0
-
+            P_DC[n, :, 0] = state  # State (already bounded: +1/-1)
+            P_DC[n, :, 1] = self._soft_clip(magnitude, self.dc_magnitude_clip)  # Magnitude
+            P_DC[n, :, 2] = duration / float(self.T_w)  # Duration
+            P_DC[n, :, 3] = vol_ratios_clipped[n, :]  # Volume ratio (pre-computed)
             P_DC[n, :, 4] = event_flag  # Event_Flag
 
         return P_DC.astype(np.float32)
@@ -261,7 +462,7 @@ class MAFIAFeatureProcessor:
             event_flag: (T_w,) - 1.0 (DC event) or 0.5 (OS event)
         """
         if NUMBA_AVAILABLE:
-            return _compute_dc_sequence_jit(close, high, low, float(threshold))
+            return _compute_dc_sequence_jit(close, high, low, threshold)
         
         # Pure Python implementation (Fallback)
         T_w = len(close)
@@ -425,12 +626,24 @@ class MAFIAFeatureProcessor:
         M_mkt = getattr(self.config, "mafia_M_mkt", 19)  # change(5) + basic(3) + extended(11)
         P_Mkt = np.zeros((1, T_w, M_mkt), dtype=np.float32)
 
-        # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV) - same as Technical Agent
+        # Compute CHANGE features (ΔO, ΔC, ΔH, ΔL, ΔV) with normalization
         raw_feat_stack = [open_prices, close_prices, high_prices, low_prices, volumes]
         for feat_idx, feat_vals in enumerate(raw_feat_stack):
             if len(feat_vals) <= 1:
                 change = np.zeros_like(feat_vals)
-            else:
+            elif feat_idx == 4:  # Volume: use log-transform + z-score
+                # Log-transform to handle skewed distribution
+                log_vol = np.log1p(feat_vals)  # log(1 + volume)
+                # Compute change in log-space (log-return)
+                log_change = np.diff(log_vol, prepend=log_vol[0])
+                # Z-score normalization across the window
+                log_mean = np.mean(log_change)
+                log_std = np.std(log_change)
+                log_std = log_std if log_std > 0 else 1.0  # Avoid div by zero
+                change = (log_change - log_mean) / log_std
+                # Clip to bound outliers
+                change = self._soft_clip(change, self.volume_change_clip)
+            else:  # Price features: percentage change with clipping
                 prev_vals = feat_vals[:-1]
                 cur_vals = feat_vals[1:]
                 change = np.divide(
@@ -441,6 +654,8 @@ class MAFIAFeatureProcessor:
                 )
                 change = change - 1.0
                 change = np.concatenate([np.zeros(1, dtype=change.dtype), change])
+                # Clip price changes to bound extreme values
+                change = self._soft_clip(change, self.price_change_clip)
             P_Mkt[0, :, feat_idx] = change.astype(np.float32)
 
         # Basic technical indicators (same as Technical Agent)
@@ -564,10 +779,19 @@ class MAFIAFeatureProcessor:
             np.nan_to_num(cci20.values, nan=0.0, posinf=0.0, neginf=0.0) / 100.0
         )
 
-        # Volatility std of returns (20) (Already %, kept as is)
+        # Volatility: Relative Volatility (Vol_10 / Vol_30)
+        # Using 10-day (fast) vs 30-day (window baseline) to detect regime shifts
         returns = pd.Series(close_prices).pct_change(fill_method=None).fillna(0.0)
-        vol_std20 = returns.rolling(window=20, min_periods=1).std(ddof=0).values
-        P_Mkt[0, :, 16] = vol_std20
+        vol_std10 = self._compute_rolling_vol(returns, window=10)
+        vol_std30 = self._compute_rolling_vol(returns, window=30)
+        # Relative vol: >1 means current short-term is more volatile than the full window baseline
+        vol_relative = np.divide(
+            vol_std10, 
+            vol_std30, 
+            out=np.ones_like(vol_std10), 
+            where=vol_std30 > 1e-6
+        )
+        P_Mkt[0, :, 16] = np.clip(vol_relative - 1.0, -1.0, 4.0)  # Center at 0.0 (Ratio 1.0 -> 0.0)
 
         # Drawdown (relative to rolling 60-day peak) (Already %, kept as is)
         rolling_peak60 = (

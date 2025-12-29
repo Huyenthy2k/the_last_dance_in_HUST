@@ -71,8 +71,24 @@ class ObserverValidationResult:
     """
     
     epoch: int
-    
-    # Composite Efficiency Score (Moved to top as requested)
+
+    # Training mode (MACRO_ONLY or SELECTION_ONLY)
+    training_mode: str = ""
+
+    # Phase-specific score for checkpoint selection
+    # MACRO_ONLY: 0.5 * direction_score + 0.5 * risk_score
+    # SELECTION_ONLY: 0.6 * sharpe_score + 0.4 * hit_rate
+    phase_score: float = 0.0
+
+    # Component scores for MACRO_ONLY (displayed in CSV)
+    # direction_score: Direction F1 Macro (range 0-1)
+    # risk_score: (1-α)*mse_score + α*corr_score (HybridLoss, α=0.7)
+    #   mse_score = 1 - mse_norm (higher = better)
+    #   corr_score = max(0, correlation) (clamp negative to 0)
+    direction_score: float = 0.0
+    risk_score: float = 0.0
+
+    # Composite Efficiency Score (legacy, kept for SELECTION_ONLY compatibility)
     ces_score: float = 0.0
     ces_rank_sharpe: float = 0.0
     ces_rank_dir_f1: float = 0.0
@@ -87,6 +103,7 @@ class ObserverValidationResult:
     
     # Selection performance
     topk_sharpe_ratio: float = 0.0
+    topk_hit_rate: float = 0.0  # Win rate: % of days portfolio outperforms index
     topk_mean_return: float = 0.0
     topk_volatility: float = 0.0
     topk_turnover: float = 0.0
@@ -114,18 +131,64 @@ class ObserverValidationResult:
 
     
     # Removed RL metrics (always 0 in validation)
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for CSV export."""
-        return asdict(self)
+
+    # Fields specific to each training phase
+    # MACRO_ONLY: Direction + Risk heads (no PG, no Balance loss)
+    MACRO_ONLY_FIELDS = {
+        "epoch", "training_mode", "phase_score",
+        "direction_score", "risk_score",  # Component scores
+        "loss_total", "loss_risk", "loss_dir",  # NO loss_pg, NO loss_bal
+        "direction_accuracy", "direction_f1_bear", "direction_f1_side",
+        "direction_f1_bull", "direction_f1_macro",
+        "risk_mse", "risk_mae", "risk_correlation",
+    }
+
+    # SELECTION_ONLY: PG + Gate Network (no Risk, no Direction loss)
+    SELECTION_ONLY_FIELDS = {
+        "epoch", "training_mode", "phase_score",
+        "loss_total", "loss_pg", "loss_bal",  # NO loss_risk, NO loss_dir
+        "topk_sharpe_ratio", "topk_hit_rate", "topk_mean_return", "topk_volatility", "topk_turnover",
+        "topk_advantage", "topk_hold_reward",
+        "reward", "net_reward", "turnover_penalty", "symdiff_penalty",
+    }
+
+    def to_dict(self, filter_by_phase: bool = True) -> Dict:
+        """
+        Convert to dictionary for CSV export.
+
+        Args:
+            filter_by_phase: If True, only include fields relevant to training_mode
+
+        Returns:
+            Dictionary with filtered or all fields
+        """
+        all_fields = asdict(self)
+
+        if not filter_by_phase or not self.training_mode:
+            return all_fields
+
+        # Filter based on training mode
+        if self.training_mode == "MACRO_ONLY":
+            return {k: v for k, v in all_fields.items() if k in self.MACRO_ONLY_FIELDS}
+        elif self.training_mode == "SELECTION_ONLY":
+            return {k: v for k, v in all_fields.items() if k in self.SELECTION_ONLY_FIELDS}
+
+        return all_fields
     
     def summary_str(self) -> str:
-        """Return one-line summary for logging."""
-        return (
-            f"Epoch {self.epoch} | "
-            f"CES: {self.ces_score:.4f} | "            
-            f"Sharpe: {self.topk_sharpe_ratio:.3f} | "
-            f"Dir_F1: {self.direction_f1_macro:.3f} | "
-            f"Risk_MSE: {self.risk_mse:.4f} | "
-            f"Loss: {self.loss_total:.4f}"
-        )
+        """Return one-line summary for logging (phase-aware)."""
+        if self.training_mode == "MACRO_ONLY":
+            return (
+                f"Epoch {self.epoch} | "
+                f"Score: {self.phase_score:.4f} (Dir: {self.direction_score:.3f}, Risk: {self.risk_score:.3f}) | "
+                f"Dir_F1: {self.direction_f1_macro:.3f} | "
+                f"Risk_MSE: {self.risk_mse:.4f} | "
+                f"Loss: {self.loss_total:.4f}"
+            )
+        else:  # SELECTION_ONLY
+            return (
+                f"Epoch {self.epoch} | "
+                f"Sharpe: {self.topk_sharpe_ratio:.3f} | "
+                f"Turnover: {self.topk_turnover:.3f} | "
+                f"Loss: {self.loss_total:.4f}"
+            )

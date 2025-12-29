@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import sys
 import time
+from typing import Optional
 from stable_baselines3.td3.policies import MultiInputPolicy
 from RL_controller.compressed_replay_buffer import (
     CompressedDictReplayBuffer,
@@ -20,6 +21,36 @@ from RL_controller.compressed_replay_buffer import (
 #     MAFIAMultiBranchExtractor as MAFIASingleStageMLP,
 # )
 from stable_baselines3.common.utils import LinearSchedule
+
+
+class MafiaTrainMode:
+    """Enumeration for MAFIA training modes (Phase 1 Split)"""
+
+    FULL = "FULL"
+    MACRO_ONLY = "MACRO_ONLY"  # Phase 1A: Backbone + Direction/Risk (Supervised)
+    SELECTION_ONLY = "SELECTION_ONLY"  # Phase 1B: Selection Head (RL/Fine-tune)
+
+
+def get_phase_subdir(train_mode: str) -> str:
+    """
+    Get phase subdirectory name based on training mode.
+
+    Args:
+        train_mode: One of MafiaTrainMode values (MACRO_ONLY, SELECTION_ONLY)
+
+    Returns:
+        Subdirectory name: "phase1_macro" or "phase2_selection"
+
+    Raises:
+        ValueError: If train_mode is not MACRO_ONLY or SELECTION_ONLY
+    """
+    if train_mode == MafiaTrainMode.MACRO_ONLY:
+        return "phase1_macro"
+    elif train_mode == MafiaTrainMode.SELECTION_ONLY:
+        return "phase2_selection"
+    raise ValueError(
+        f"Invalid train_mode: {train_mode}. Must be MACRO_ONLY or SELECTION_ONLY"
+    )
 
 
 class Config:
@@ -35,6 +66,12 @@ class Config:
         "cnn": "Temporal convolution (CNN) gating that extracts short-term patterns before routing.",
         "lstm": "Unidirectional LSTM gating (causal, forward-only) that captures sequential dependencies.",
     }
+
+    # Walk-Forward Training Configuration (Class Level for Patching)
+    walkforward_base_lr = 1e-4  # LR for Iter 0 (Warmup/Scratch)
+    walkforward_finetune_lr = 5e-5  # LR for Iter > 0 (Fine-tune)
+    walkforward_base_epochs = 50  # Epochs for Iter 0
+    walkforward_finetune_epochs = 20  # Epochs for Iter > 0
 
     def __init__(self, seed_num=2022, current_date=None, create_dirs=True):
         """
@@ -53,6 +90,9 @@ class Config:
         self.market_name = "VNINDEX"  # Financial Index: 'DJIA', 'SP500', 'CSI300'
         self.topK = 10  # Number of assets in a portfolio (10, 20, 30)
         self.num_epochs = 50  # episodes for convergence
+        self.mps_max_batch_size = (
+            64  # Override MPS safe limit (default 16) as requested
+        )
 
         # MAFIA configuration (fixed)
         self.rl_model_name = "TD3"  # RL agent implemented by TD3
@@ -104,15 +144,27 @@ class Config:
         # - False: After pretrain, Observer frozen as "Static Expert"
         self.mafia_allow_observer_training = False
         # Warmup: Minimum samples to collect before first Observer training update
-        # Observer will skip training until buffer has >= this many samples
         self.observer_warmup_samples = 300
+        self.log_trajectory_details = (
+            False  # [SPEED-FIX] Disabled by default - has many .item() sync calls
+        )
         # Observer sequence sampling: train on contiguous mini-batch with random start
         # Set >0 to sample a window of this length from observer buffers at each train()
         self.observer_seq_len = 128  # window length T_m (days); 0 = use full buffer
+        self.mafia_direction_window_size = 20  # Window size for direction history
         self.observer_seq_sampling = "random"  # options: "random", "recent"
         # Trajectory configuration (Spec §6)
         self.mafia_trajectory_length = 128  # T_m for on-policy batch segments
-        self.mafia_sampling_strategy = "random_trajectory"  # or "recent_trajectory"
+        self.mafia_sampling_strategy = (
+            "hybrid_weighted"  # Options: 'uniform', 'class_balanced', 'hybrid_weighted'
+        )
+        # Hybrid Sampling Ratios (must sum to 1.0)
+        self.mafia_sampling_recency_ratio = 0.5
+        self.mafia_sampling_regime_ratio = 0.3
+        self.mafia_sampling_random_ratio = 0.2
+        self.mafia_sampling_recency_power = (
+            1.0  # Linear decay for recency weights (gentler than quadratic)
+        )
         # MAFIA state mode: 'compact' (Top-K market_vector) or 'full-score' (full market_scores_full)
         # Top-K only: Observer chọn Top-K → State có Top-K → RL tối ưu trên Top-K (full-universe mode bị vô hiệu hóa)
         self.mafia_state_mode = "compact"
@@ -143,6 +195,9 @@ class Config:
         # Load Balancing Loss: Penalty for Expert Collapse (Spec 3.6.4)
         # Weight for auxiliary loss: L_balance = lambda * CV(avg_gate_weights)
         self.mafia_lambda_balance = 0.1
+        # Scale factor for balance loss to bring it to similar magnitude as other losses
+        # L_balance = sum((avg_gate - 0.25)^2) * scale_factor
+        self.mafia_balance_loss_scale = 100.0
 
         # Solver boost behavior (only active in 'full-score' mode when RL has selected Top-K)
         # In 'full-score' mode: Solver can boost stocks already selected by RL, or keep original logic
@@ -174,7 +229,7 @@ class Config:
         self.entropy_coef = 0.2  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
         # Policy Gradient horizon for observer PG loss (Top-K compounding window)
         self.mafia_pg_reward_horizon = (
-            14  # Increased from 1 to learn longer-term patterns
+            21  # h: lookahead horizon aligned with rebalance_interval
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
         # Penalty coefficients (stronger to stand against reward scaling=100)
@@ -184,7 +239,9 @@ class Config:
             5.0  # Trend Holding Bonus (Reward for holding profitable stocks)
         )
         # Direction label generation (future-based)
-        self.direction_label_lookahead = 14  # k days ahead for R_fut
+        self.direction_label_lookahead = (
+            21  # k days ahead for R_fut (aligned with rebalance_interval)
+        )
         self.direction_label_delta = (
             0.025  # symmetric threshold δ (default 2.5%) - used in online mode
         )
@@ -193,9 +250,15 @@ class Config:
         # Used in offline batch training for adaptive thresholding based on market volatility
         # δ_t = max(δ_min, k_atr * ATR_14 / P_t)
         # Optimized based on VNINDEX analysis: ATR/Price mean=1.4%, IntraDD P10=-8.5%
-        self.direction_label_atr_period = 14  # ATR window (days)
-        self.direction_label_atr_multiplier = 2.0  # k_atr: ATR multiplier (2σ margin)
-        self.direction_label_delta_min = 0.020  # δ_min: minimum threshold (2.0%)
+        self.direction_label_atr_period = (
+            21  # ATR window (days) - aligned with 21-day lookahead
+        )
+        self.direction_label_atr_multiplier = (
+            1.5  # [FIX] Reduced from 2.0 to 1.5 to capture steady bull runs
+        )
+        self.direction_label_delta_min = (
+            0.015  # [UPDATED] Floor set to 1.5% for 21-day horizon (Annualized ~18%)
+        )
         self.direction_label_stop_loss = -0.07  # IntraDD threshold (-7%, P10)
 
         # ============================================================
@@ -250,12 +313,15 @@ class Config:
         self.risk_eta_down = 0.7  # bear
         # Supervised eta label generation (lookback/lookahead)
         self.risk_eta_label_lookback = 60
-        self.risk_eta_lookahead = 14  # Default 14 days lookahead for eta target
+        self.risk_eta_lookahead = 21  # Aligned with rebalance_interval (21 days)
         self.risk_eta_label_epsilon = 1e-6
-        # S_risk: Scaling factor for MSE (amplify gradient)
-        # L_risk (MSE) ≈ 0.01, need to scale up to match L_selection (~1.0) and L_direction (~1.0)
-        # With scale=10.0: L_risk contribution ≈ 0.01 × 10 = 0.1 (balanced)
-        self.scale_factor_risk = 10.0
+        # Loss Weights (Spec §5)
+        # Note: mafia_lambda_dir is set in load_market_observer_config() = 1.0
+
+        # S_risk: Scaling factor for HybridRiskLoss (amplify gradient)
+        # L_risk = (1-α)*MSE + α*(1-Corr), default α=0.7
+        # Scale factor ensures balanced gradients with other losses
+
         # S_reward: Scaling factor for PG Reward (amplify Advantage gradient)
         # Raw compounding returns ~0.01, scale to ~1.0 for stable gradients
         self.scale_factor_reward = 100.0
@@ -269,12 +335,12 @@ class Config:
         # Observer eta scaling (tanh-based, clipped)
         # FIX: Expanded range to match target eta range [0.1, 2.0]
         # Target eta formula: eta = 1.0 + lambda_val*tanh(z) - lambda_dd*clip(dd/ref,0,1)
-        # With lambda_val=0.3, lambda_dd=0.5 => raw range [0.2, 1.3], clipped to [0.1, 2.0]
+        # With lambda_val=0.3, lambda_dd=0.5 => raw range [0.2, 1.3], clipped to [0.5, 1.5]
         # Predicted must cover same range for proper correlation
-        self.mafia_eta_base = 1.05  # Center of [0.1, 2.0]
-        self.mafia_eta_amplitude = 0.95  # (2.0 - 0.1) / 2 = 0.95
-        self.mafia_eta_min = 0.1
-        self.mafia_eta_max = 2.0
+        self.mafia_eta_base = 1.0  # Center of [0.5, 1.5]
+        self.mafia_eta_amplitude = 0.5  # (1.5 - 0.5) / 2 = 0.5
+        self.mafia_eta_min = 0.5
+        self.mafia_eta_max = 1.5
         # Legacy aliases maintained for backward compatibility
         self.risk_default = self.risk_eta_default
         self.risk_hold_bound = self.risk_eta_hold
@@ -395,7 +461,7 @@ class Config:
 
         # Epoch schedule (varies by iteration)
         self.walkforward_base_epochs = 50  # Iteration 0: train from scratch
-        self.walkforward_finetune_epochs = 20  # Iteration 1+: finetune
+        self.walkforward_finetune_epochs = 5  # Iteration 1+: finetune
         self.walkforward_base_lr = 1e-4  # Base learning rate
         self.walkforward_finetune_lr = 1e-5  # Finetune learning rate
         self.walkforward_base_patience = 15  # Early stopping patience (base)
@@ -440,7 +506,7 @@ class Config:
         self.finetune_lr_factor = 0.1  # lr = base_lr * factor (e.g., 1e-4 * 0.1 = 1e-5)
 
         # Rebalance interval for selection head training (days)
-        self.topk_rebalance_interval = 14  # Selection Head update every 14 days
+        self.topk_rebalance_interval = 21  # Selection Head update every 21 days
 
         # Output directories for walk-forward artifacts
         self.walkforward_checkpoint_dir = None  # Directory for observer checkpoints
@@ -496,9 +562,16 @@ class Config:
         # Top-K/market-direction refreshed on rebalance window or regime-shift trigger
         self.mafia_topk_rebalance_interval = int(
             os.environ.get(
-                "MAFIA_TOPK_REBALANCE_INTERVAL", 10
-            )  # Changed from 15 to 10 days
+                "MAFIA_TOPK_REBALANCE_INTERVAL", 21
+            )  # Changed from 15 to 21 days (Monthly)
         )
+
+        # Training Mode (Phase 1 Split Strategy)
+        # FULL: Default joint training
+        # MACRO_ONLY: Freeze Selection, Train Backbone + Direction/Risk
+        # SELECTION_ONLY: Freeze Backbone + Direction/Risk, Train Selection
+        self.mafia_train_mode = os.environ.get("MAFIA_TRAIN_MODE", MafiaTrainMode.FULL)
+        self.mafia_freeze_backbone = os.environ.get("MAFIA_FREEZE_BACKBONE", "0") == "1"
         # Eta/risk calibration tick (env step granularity); keep daily by default
         self.mafia_eta_update_interval = 1
         # Allow regime detector to force early rebalance outside fixed cadence
@@ -642,7 +715,7 @@ class Config:
         # Reset LR scheduler when resuming from checkpoint for new window.
         # When True: LR starts fresh from initial learning rate (recommended for walk-forward).
         # When False: LR continues from where it left off in previous window.
-        self.reset_lr_scheduler_on_resume = True
+        self.reset_lr_scheduler_on_resume = False
 
         self.save_replay_buffer_on_step_checkpoints = (
             False  # Skip 3GB+ replay buffer for frequent step checkpoints
@@ -718,6 +791,14 @@ class Config:
             self.test_date_start = None
             self.test_date_end = None
 
+        # Initialize MAFIA parameters (must be called at end of __init__)
+        self._init_shared_attributes()
+        self.load_para()
+        self.load_model_config()
+        self.load_market_observer_config()
+
+    def _init_shared_attributes(self):
+        """Initialize attributes shared between __init__ and update_dates_for_walkforward."""
         # Use a fixed fallback for market risk (observer will emit dynamic bounds)
         self.risk_market = self.default_risk_market
         self._calibrate_risk_bounds()
@@ -739,7 +820,7 @@ class Config:
         ]
         # Market Risk-Free Rate (Annual %) - Vietnam 10Y Bond Yield proxy (2025)
         self.mkt_rf = {
-            "VNINDEX": 4.2,  # Risk-free rate for Vietnam market (based on 10-year government bond yield, ~4.2% as of 2025). Adjust based on your data period.
+            "VNINDEX": 4.2,  # Risk-free rate for Vietnam market
         }
 
         self.market_close_time = {
@@ -758,14 +839,63 @@ class Config:
         # Legacy algorithm lists (kept for reference, not used)
         self.only_long_algo_lst = []  # Removed legacy algorithms
         self.use_cash_algo_lst = []  # Removed legacy algorithms
-        # MAFIA always uses RLcontroller mode with controller enabled
-        # (removed legacy branching that disabled controller)
 
         # MAFIA uses its own DC feature generation
         if self.mktobs_algo == "mafia_1":
             self.is_gen_dc_feat = False
         else:
             self.is_gen_dc_feat = False
+
+    def update_dates_for_walkforward(
+        self,
+        train_start_str: str,
+        train_end_str: str,
+        valid_start_str: Optional[str] = None,
+        valid_end_str: Optional[str] = None,
+        test_start_str: Optional[str] = None,
+        test_end_str: Optional[str] = None,
+    ):
+        """
+        Dynamically update training/validation dates for Walk-Forward iteration.
+
+        Args:
+            train_start_str: "YYYY-MM-DD HH:MM:SS"
+            train_end_str: "YYYY-MM-DD HH:MM:SS"
+            valid_start_str: Optional "YYYY-MM-DD HH:MM:SS"
+            valid_end_str: Optional "YYYY-MM-DD HH:MM:SS"
+            test_start_str: Optional "YYYY-MM-DD HH:MM:SS"
+            test_end_str: Optional "YYYY-MM-DD HH:MM:SS"
+        """
+        try:
+            self.train_date_start = pd.Timestamp(train_start_str)
+            self.train_date_end = pd.Timestamp(train_end_str)
+
+            if valid_start_str and valid_end_str:
+                self.valid_date_start = pd.Timestamp(valid_start_str)
+                self.valid_date_end = pd.Timestamp(valid_end_str)
+            else:
+                self.valid_date_start = None
+                self.valid_date_end = None
+
+            if test_start_str and test_end_str:
+                self.test_date_start = pd.Timestamp(test_start_str)
+                self.test_date_end = pd.Timestamp(test_end_str)
+            else:
+                self.test_date_start = None
+                self.test_date_end = None
+
+            print(f"[CONFIG] Updated Dates for Walk-Forward:")
+            print(f"  Train: {self.train_date_start} -> {self.train_date_end}")
+            if self.valid_date_start:
+                print(f"  Valid: {self.valid_date_start} -> {self.valid_date_end}")
+            if self.test_date_start:
+                print(f"  Test:  {self.test_date_start} -> {self.test_date_end}")
+
+        except Exception as e:
+            raise ValueError(f"Failed to parse dates for walk-forward update: {e}")
+
+        # Re-initialize shared attributes (in case they depend on updated dates)
+        self._init_shared_attributes()
 
         self.load_para()
         self.load_model_config()
@@ -784,11 +914,18 @@ class Config:
 
         # MAFIA Hyperparameters (must be defined first as they're used below)
         self.mafia_T_w = 30  # Observation window size
-        self.mafia_DC_thresholds = [0.005, 0.01, 0.02]  # DC thresholds for 3 DC agents
+        self.mafia_DC_multipliers = [
+            0.5,
+            1.0,
+            2.0,
+        ]  # DC adaptive multipliers (k * ATR) for 3 DC agents
         self.mafia_D = 64  # Embedding dimension
         self.mafia_D_h = 128  # Hidden layer dimension
         self.mafia_encoder_layers = 2  # Number of transformer encoder layers
         self.mafia_encoder_heads = 4  # Number of attention heads
+        self.mafia_backbone_dropout = (
+            0.1  # Backbone Dropout: Keep low (0.1) to preserve features
+        )
         self.mafia_M_tech = 8  # Features for Technical agent (5 OCHLV + 3 indicators)
         self.mafia_M_dc = 5  # Features for DC agents
         # Market-index agent features: only 19 base kênh (ΔOHLCV + indicator set), không dùng regime append
@@ -796,16 +933,41 @@ class Config:
         # Regime features removed from market-index agent
         self.mafia_regime_feature_names = []
         self.mafia_regime_dim = 0
-        self.mafia_learning_rate = 1e-4  # Learning rate for MAFIA training
-        # Match TD3-style LR schedule for observer (linear decay)
-        self.mafia_lr_schedule = (
-            "linear_per_epoch"  # "linear_per_epoch", "linear", or "step"
+        self.mafia_learning_rate = (
+            1e-4  # Legacy LR (used as fallback if per-head LRs not set)
         )
+        # LR schedule: "cosine" (recommended), "linear", "linear_per_epoch", or "step"
+        self.mafia_lr_schedule = "cosine"  # Cosine with warmup for stable training
         self.mafia_lr_end_factor = 0.2  # end_lr = start_lr * end_factor
         self.mafia_lr_end_fraction = (
             0.5  # fraction of epoch/cycle where end_lr is reached
         )
+
+        # ===== Differential Learning Rates (Per-Head) =====
+        # Direction head learns slower than risk head, so use higher LR
+        self.mafia_lr_direction_head = (
+            3e-4  # Higher LR to compensate for High Dropout (0.3)
+        )
+        self.mafia_lr_risk_head = (
+            3e-4  # [LONG-TERM] Reduced to 1e-4 for stable 50-epoch run
+        )
+        self.mafia_lr_backbone = 1e-4  # Moderate LR for backbone (Stable)
+
+        # Warmup configuration for stable training
+        self.mafia_lr_warmup_epochs = 2  # Linear warmup for first N epochs
+        self.mafia_lr_min = 1e-6  # Minimum LR at end of cosine decay
+
         self.mafia_weight_decay = 0.003  # Weight decay for optimizer
+        self.mafia_weight_decay_risk_head = (
+            0.001  # [LONG-TERM] Increased to 0.01 to prevent Overfitting
+        )
+
+        # L1 Regularization (Lasso) coefficient
+        # Adds term: lambda * sum(|weights|) to loss to encourage sparsity
+        self.mafia_l1_lambda = (
+            1e-6  # [LONG-TERM] Increased to 3e-6 (Elastic Net Balance)
+        )
+
         self.hidden_vec_loss_weight = (
             1.0  # Weight for market_vector loss in Policy Gradient training
         )
@@ -861,15 +1023,26 @@ class Config:
 
         # Loss Weights (Spec §6)
         self.mafia_lambda_pg = 1.0  # Weight for L_PG (policy gradient loss)
-        self.mafia_lambda_risk = 0.3  # Weight for L_Risk (risk calibration loss)
-        self.mafia_lambda_dir = 1.0  # Weight for L_Dir (direction classification loss) - Increased to 1.0
+        self.mafia_lambda_risk = 1.0  # Weight for L_Risk - Equal to L_Dir (User req)
+        self.mafia_lambda_dir = 1.0  # Weight for L_Dir (User req)
+        self.scale_factor_risk = (
+            1.5  # Scale factor for HybridRiskLoss (balanced with Dir loss ~1.16)
+        )
+
+        # Hybrid Risk Loss Configuration (MSE + Correlation)
+        # L_risk = (1 - α) × MSE + α × (1 - Correlation)
+        # α = 0.0: Pure MSE (original behavior)
+        # α = 0.5: Balanced MSE + Correlation
+        # α = 0.7: Focus on pattern learning (recommended for reducing overfit)
+        self.risk_loss_correlation_alpha = 0.7  # Weight for correlation component (0.0 = pure MSE, 1.0 = pure correlation)
+        self.risk_loss_correlation_eps = 1e-8  # Numerical stability for correlation
 
         # Entropy Bonus for L_PG (spec 5.1.1)
         self.mafia_beta_entropy = 0.01  # β_ent: entropy bonus coefficient
 
         # Policy Gradient Reward Shaping
         self.mafia_pg_reward_horizon = (
-            14  # h: lookahead horizon for reward accumulation (spec §5.1.1)
+            21  # h: lookahead horizon aligned with rebalance_interval (spec §5.1.1)
         )
         # At time t, when Observer selects a portfolio, h determines how many days forward
         # to accumulate returns for evaluating that decision
@@ -885,29 +1058,38 @@ class Config:
 
         # Risk/Direction Head Config
         self.mafia_explicit_dim = 6  # [Vol20, DC, Breadth, Div, VPI, DD60]
-        self.direction_head_dropout = 0.3
-        self.mafia_direction_threshold = (
-            0.02  # δ: threshold for bull/bear classification
-        )
+        self.direction_head_dropout = 0.1
+        self.risk_head_dropout = 0.2  # Added for Risk Head regularization
+        self.mafia_direction_threshold = 0.02  # [DEPRECATED] Used as fallback/base
+        self.mafia_direction_delta_min = 0.02  # Minimum threshold (2%) even in low vol
+        self.mafia_direction_k_atr = 1.0  # Dynamic scaler: Threshold = k * ATR
+        self.mafia_risk_eta_dd_ref = 0.10  # Drawdown Reference (10%) for Risk Target
 
-        # Direction Loss (Focal Loss) Class Weights
-        # Optimized based on VNINDEX ground truth distribution: Bear=22.1%, Side=43.8%, Bull=34.1%
-        # α = [α_bear, α_side, α_bull] - balances gradient contribution across classes
-        #
-        # IMPORTANT: These weights compensate for class imbalance AND focal modulation
-        # With γ=2.0, easy (majority) samples get ~0.1x gradient vs hard samples
         # Direction Loss (Focal Loss) Class Weights: [Bear, Side, Bull]
-        # Based on VNINDEX distribution: Bear=22%, Side=44%, Bull=34%
-        # Tuned (v2): Increase Bull (1.15) to fix zero-recall, Side (0.75) to keep balance
-        self.mafia_focal_alpha = [1.7, 0.85, 1.15]
+        # Based on VNINDEX ground truth (2015-2025, 21-day lookahead, config params):
+        #   Bear=26.5%, Side=28.8%, Bull=44.8%
+        # Inverse Freq Weights normalized to Bull=1.0: [1.69, 1.56, 1.00]
+        # Bear/Side are minorities → higher weights to boost gradient
+        self.mafia_focal_alpha = [1.69, 1.56, 1.00]  # [Bear, Side, Bull]
         self.mafia_focal_gamma = (
-            3.0  # Focusing parameter γ: reduces loss for confident (easy) predictions
+            1.0  # γ=1.0 Soft Focal (Optimization: Balance focus without chasing noise)
         )
         # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
         # Helps model converge stably, avoids overconfidence on noisy labels
         self.mafia_direction_label_smoothing = 0.05  # ε: smoothing factor (reduced)
         # Temperature scaling for direction logits (T<1 sharpens, T>1 flattens)
         self.mafia_direction_temperature = 1
+
+        # Dynamic Class Weighting for Direction Loss (Per-Step)
+        # When True: Compute inverse-frequency weights from batch at each timestep
+        # When False: Use static mafia_focal_alpha weights (dataset-level)
+        self.mafia_use_dynamic_class_weights = True
+        # Minimum class count to avoid extreme weights (prevents division by zero)
+        self.mafia_dynamic_weight_min_count = 1
+        # Maximum weight cap to prevent extreme gradients
+        self.mafia_dynamic_weight_max = 2.0  # Conservative cap for stability
+        # Smoothing factor: 0=pure inverse-freq, 1=uniform weights
+        self.mafia_dynamic_weight_smoothing = 0.0  # Pure inverse-freq (no smoothing)
 
         # Gradient Clipping
         self.mafia_max_grad_norm = 1.0  # Max gradient norm for clipping
@@ -916,7 +1098,7 @@ class Config:
         self.mafia_top_k = 10  # Number of assets to select
 
         # Rebalance settings
-        self.mafia_topk_rebalance_interval = 14  # Rebalance every 14 days (User Intent)
+        self.mafia_topk_rebalance_interval = 21  # Rebalance every 21 days (User Intent)
         self.mafia_hard_topk_inference = True  # Use hard TopK at inference
 
         # Dense MoE Gating Configuration
@@ -924,7 +1106,9 @@ class Config:
             self.DEFAULT_GATING_ENCODER
         )  # Options: 'attention_based_aggregation', 'temporal_convolution', 'lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
-        self.mafia_gating_dropout = 0.2  # Dropout for gating networks
+        self.mafia_gating_dropout = (
+            0.3  # Dropout for gating networks (Optimization: Increased to 0.3)
+        )
         self.mafia_gating_lstm_layers = 2  # For lstm encoder
         self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
 
@@ -1332,7 +1516,9 @@ class Config:
         self.risk_eta_up = self.risk_up_bound
         self.risk_eta_down = self.risk_down_bound
 
-    def rebuild_result_paths(self, new_res_dir: str, create_dirs: bool = True):
+    def rebuild_result_paths(
+        self, new_res_dir: str, create_dirs: bool = True, train_mode: str = None
+    ):
         """
         Rebuild all result-related paths when res_dir changes.
 
@@ -1342,21 +1528,33 @@ class Config:
         Args:
             new_res_dir: New base directory for results
             create_dirs: Whether to create directories (default: True)
+            train_mode: Training mode (MACRO_ONLY or SELECTION_ONLY)
+                       If provided, creates phase-aware directory structure
 
-        Example:
-            config.rebuild_result_paths("./observer_walkforward/iter_0_valid_2017")
-            # This updates:
-            # - res_dir, res_root
-            # - res_model_dir, res_img_dir, checkpoint_dir
-            # - metrics_history_path, run_manifest_path
+        Example with train_mode:
+            config.rebuild_result_paths("./observer_offline", train_mode="MACRO_ONLY")
+            # Results in:
+            # - res_dir: ./observer_offline/phase1_macro
+            # - checkpoint_dir: ./observer_offline/checkpoints/macro
         """
-        self.res_dir = os.path.abspath(new_res_dir)
+        base_dir = os.path.abspath(new_res_dir)
+
+        # Get train_mode from config if not provided
+        if train_mode is None:
+            train_mode = getattr(self, "mafia_train_mode", MafiaTrainMode.MACRO_ONLY)
+
+        # Build phase subdirectory
+        phase_subdir = get_phase_subdir(train_mode)
+        self.res_dir = os.path.join(base_dir, phase_subdir)
         self.res_root = self.res_dir
 
-        # Rebuild subdirectories
+        # Subdirectories within phase folder
         self.res_model_dir = os.path.join(self.res_dir, "model")
         self.res_img_dir = os.path.join(self.res_dir, "graph")
-        self.checkpoint_dir = os.path.join(self.res_dir, "checkpoints")
+
+        # Checkpoints separated by phase (macro/selection)
+        ckpt_phase = "macro" if train_mode == MafiaTrainMode.MACRO_ONLY else "selection"
+        self.checkpoint_dir = os.path.join(base_dir, "checkpoints", ckpt_phase)
 
         # Rebuild file paths
         self.metrics_history_path = os.path.join(self.res_dir, "metrics_history.csv")
@@ -1452,6 +1650,15 @@ class Config:
             "enable_market_observer: {}, mktobs_algo: {}, feat_scaler: {} \n".format(
                 self.enable_market_observer, self.mktobs_algo, self.feat_scaler
             )
+        )
+        log_str = log_str + para_str
+        # HybridRiskLoss configuration
+        para_str = "risk_loss: HybridRiskLoss(α={}, MSE={}%, Corr={}%), L1={}, WD_risk={}\n".format(
+            self.risk_loss_correlation_alpha,
+            int((1 - self.risk_loss_correlation_alpha) * 100),
+            int(self.risk_loss_correlation_alpha * 100),
+            self.mafia_l1_lambda,
+            self.mafia_weight_decay_risk_head,
         )
         log_str = log_str + para_str
         log_str = log_str + "=" * 30 + "\n"

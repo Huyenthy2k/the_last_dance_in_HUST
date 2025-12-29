@@ -25,42 +25,57 @@ from RL_controller.observer_validation_metrics import ObserverValidationResult
 
 class ValidationMetricsTracker:
     """
-    Tracks validation metrics across epochs and computes CES score.
-    
+    Tracks validation metrics across epochs and computes phase-specific scores.
+
+    Phase-specific scoring:
+    - MACRO_ONLY: 0.5 * Dir_F1 + 0.5 * risk_score
+      where risk_score = (1-α)*mse_score + α*corr_score (HybridRiskLoss, α=0.7)
+    - SELECTION_ONLY: 0.6 * sharpe_score + 0.4 * hit_rate
+
     Responsibilities:
     - Accumulate validation results per epoch
-    - Perform rank-based normalization for CES computation
-    - Identify best checkpoint based on CES score
+    - Compute phase-appropriate scores for checkpoint selection
+    - Identify best checkpoint based on phase_score
     - Save validation history to CSV
-    
+
     Attributes:
         output_dir: Directory to save validation metrics CSV
+        training_mode: "MACRO_ONLY" or "SELECTION_ONLY"
         history: List of all validation results
-        best_epoch: Epoch index with highest CES score
-        best_ces: Best CES score achieved
+        best_epoch: Epoch index with highest phase_score
+        best_score: Best phase_score achieved
     """
-    
-    # Fixed N for rank-based normalization to ensure stable CES scores
-    # Using N=14 provides consistent scale regardless of current epoch count
-    CES_RANK_N_FIXED = 14
 
-    def __init__(self, output_dir: str, ces_rank_n: int = None):
+    # Fixed N for rank-based normalization to ensure stable scores
+    RANK_N_FIXED = 14
+
+    # HybridRiskLoss alpha: weight for correlation component
+    # Matches config.py risk_loss_correlation_alpha default
+    RISK_CORR_ALPHA = 0.7
+
+    def __init__(self, output_dir: str, training_mode: str = "MACRO_ONLY", rank_n: int = None):
         """
         Initialize tracker.
 
         Args:
             output_dir: Directory to save valid_metrics.csv
-            ces_rank_n: Fixed N for CES rank normalization (default: 14)
+            training_mode: "MACRO_ONLY" or "SELECTION_ONLY"
+            rank_n: Fixed N for rank normalization (default: 14)
         """
         self.output_dir = output_dir
+        self.training_mode = training_mode
         self.history: List[ObserverValidationResult] = []
         self.best_epoch: Optional[int] = None
-        self.best_ces: float = -np.inf
-        self.ces_rank_n = ces_rank_n if ces_rank_n is not None else self.CES_RANK_N_FIXED
+        self.best_score: float = -np.inf
+        self.rank_n = rank_n if rank_n is not None else self.RANK_N_FIXED
+
+        # Legacy alias for backward compatibility
+        self.best_ces = self.best_score
+        self.ces_rank_n = self.rank_n
         
     def add_epoch(self, result: ObserverValidationResult, allow_best_update: bool = True) -> bool:
         """
-        Add validation result for an epoch and update CES scores.
+        Add validation result for an epoch and update phase scores.
         If epoch already exists (from resume), replace it instead of duplicating.
 
         Args:
@@ -82,83 +97,65 @@ class ValidationMetricsTracker:
         else:
             self.history.append(result)
 
-        self._recompute_ces_scores()
+        self._compute_phase_scores()
         is_best = self._update_best(allow_best_update=allow_best_update)
         return is_best
     
-    def _recompute_ces_scores(self):
+    def _compute_phase_scores(self):
         """
-        Recompute CES scores with rank-based normalization per Spec §7.1164-1178.
+        Compute phase-specific scores for checkpoint selection.
 
-        Algorithm:
-        1. For each metric M (Sharpe, Dir_F1, Risk_MSE):
-            - Rank all checkpoints 1..N_actual (worst to best)
-            - Normalize: S_hat = (Rank(M) - 1) / (N_fixed - 1)
-        2. Compute CES = 1.0 × S_sharpe + 0.5 × S_dir_f1 + 0.5 × (1 - S_risk_mse)
+        MACRO_ONLY:
+            direction_score = Dir_F1_macro (range 0-1)
+            risk_score = (1-α)*mse_score + α*corr_score (HybridRiskLoss, α=0.7)
+                mse_score = 1 - mse_norm (higher = better)
+                corr_score = max(0, correlation) (clamp negative to 0)
+            phase_score = 0.5 * direction_score + 0.5 * risk_score (equal weights)
 
-        Note:
-        - Risk_MSE is inverted (lower is better)
-        - Uses fixed N (default 14) for stable normalization across training
+        SELECTION_ONLY:
+            phase_score = 0.6 * sharpe_score + 0.4 * hit_rate
+            where sharpe_score = clamp(Sharpe, 0, 3) / 3 (normalized to [0, 1])
         """
         N_actual = len(self.history)
         if N_actual == 0:
             return
 
-        # Use fixed N for normalization to ensure stable CES scores
-        # This prevents early epochs from having inflated/deflated scores
-        N_norm = self.ces_rank_n
+        if self.training_mode == "MACRO_ONLY":
+            # HybridRiskLoss: risk_score = (1-α)*mse_score + α*corr_score
+            alpha = self.RISK_CORR_ALPHA  # 0.7
+            MAX_MSE = 1.0
+            for hist in self.history:
+                # Component scores
+                hist.direction_score = hist.direction_f1_macro  # Already in [0, 1]
+                # MSE component: normalize and invert (higher = better)
+                mse_norm = min(hist.risk_mse / MAX_MSE, 1.0)  # Clamp to [0, 1]
+                mse_score = 1.0 - mse_norm
+                # Correlation component: clamp negative to 0
+                corr_score = max(0.0, hist.risk_correlation)
+                # HybridRiskLoss formula
+                hist.risk_score = (1.0 - alpha) * mse_score + alpha * corr_score
+                # Equal weights
+                hist.phase_score = 0.5 * hist.direction_score + 0.5 * hist.risk_score
 
-        # Extract raw metrics
-        sharpes = np.array([h.topk_sharpe_ratio for h in self.history])
-        dir_f1s = np.array([h.direction_f1_macro for h in self.history])
-        risk_mses = np.array([h.risk_mse for h in self.history])
+        elif self.training_mode == "SELECTION_ONLY":
+            # phase_score = 0.6 * sharpe_score + 0.4 * hit_rate
+            for hist in self.history:
+                # Normalize Sharpe to [0, 1]: clamp to [0, 3] then divide by 3
+                sharpe_norm = min(max(hist.topk_sharpe_ratio, 0.0), 3.0) / 3.0
+                hit_rate = getattr(hist, 'topk_hit_rate', 0.5)
+                hist.phase_score = 0.6 * sharpe_norm + 0.4 * hit_rate
 
-        def avg_rank(values: np.ndarray, higher_is_better: bool = True) -> np.ndarray:
-            """Compute tie-aware average ranks (1=worst) for a 1D array."""
-            if higher_is_better:
-                sort_order = np.argsort(values)  # ascending => worst to best
-            else:
-                sort_order = np.argsort(-values)  # invert: higher value = worse
+        # Update legacy best_ces alias
+        self.best_ces = self.best_score
 
-            ranks = np.zeros_like(values, dtype=float)
-            i = 0
-            N = len(values)
-            while i < N:
-                j = i
-                # group ties
-                while j + 1 < N and values[sort_order[j + 1]] == values[sort_order[i]]:
-                    j += 1
-                # average rank for ties (1-indexed)
-                avg = (i + 1 + j + 1) / 2.0
-                ranks[sort_order[i:j+1]] = avg
-                i = j + 1
-            return ranks
-
-        rank_sharpe_all = avg_rank(sharpes, higher_is_better=True)
-        rank_dir_all = avg_rank(dir_f1s, higher_is_better=True)
-        rank_risk_all = avg_rank(risk_mses, higher_is_better=False)  # lower MSE is better
-
-            # Normalize to [0, 1] using FIXED N for stable scaling
-            # Per Spec §7.1210: Ŝ_i = (Rank(M_i) - 1) / (N_fixed - 1)
-            # This ensures consistent scale regardless of current epoch count
-        for hist, r_s, r_d, r_r in zip(self.history, rank_sharpe_all, rank_dir_all, rank_risk_all):
-            hist.ces_rank_sharpe = (r_s - 1) / max(1, N_norm - 1)
-            hist.ces_rank_dir_f1 = (r_d - 1) / max(1, N_norm - 1)
-            hist.ces_rank_risk_mse = (r_r - 1) / max(1, N_norm - 1)
-
-            # CES formula from Spec §7.1200 (Updated)
-            # CES = 0.5 × Ŝ_Sharpe + 0.3 × Ŝ_Dir_F1 + 0.2 × (1 - Ŝ_Risk_MSE)
-            # Note: (1 - Ŝ_Risk_MSE) inverts the score since lower MSE is better
-            hist.ces_score = (
-                0.5 * hist.ces_rank_sharpe +
-                0.3 * hist.ces_rank_dir_f1 +
-                0.2 * hist.ces_rank_risk_mse
-            )
+    def _recompute_ces_scores(self):
+        """Legacy method - calls _compute_phase_scores for backward compatibility."""
+        self._compute_phase_scores()
     
     def _update_best(self, allow_best_update: bool = True) -> bool:
         """
-        Update best checkpoint tracker.
-        
+        Update best checkpoint tracker based on phase_score.
+
         Args:
             allow_best_update: If False, block update even if score is higher.
 
@@ -167,38 +164,42 @@ class ValidationMetricsTracker:
         """
         if not self.history:
             return False
-        
+
         last_idx = len(self.history) - 1
-        last_ces = self.history[last_idx].ces_score
-        
+        last_score = self.history[last_idx].phase_score
+
         # Only update "best" if allowed AND score improved
-        if allow_best_update and last_ces > self.best_ces:
-            self.best_ces = last_ces
+        if allow_best_update and last_score > self.best_score:
+            self.best_score = last_score
             self.best_epoch = last_idx
+            # Update legacy alias
+            self.best_ces = self.best_score
             return True
-        
+
         return False
     
     def get_best_checkpoint_info(self) -> Dict:
         """
         Get information about best checkpoint.
-        
+
         Returns:
-            Dict with epoch, CES score, and component metrics
+            Dict with epoch, phase_score, and phase-relevant metrics
         """
         if self.best_epoch is None or not self.history:
             return {
                 "epoch": -1,
-                "ces_score": 0.0,
+                "phase_score": 0.0,
+                "ces_score": 0.0,  # Legacy
                 "sharpe_ratio": 0.0,
                 "direction_f1": 0.0,
                 "risk_mse": 999.0,
             }
-        
+
         best = self.history[self.best_epoch]
         return {
             "epoch": best.epoch,
-            "ces_score": best.ces_score,
+            "phase_score": best.phase_score,
+            "ces_score": best.phase_score,  # Legacy alias
             "sharpe_ratio": best.topk_sharpe_ratio,
             "direction_f1": best.direction_f1_macro,
             "risk_mse": best.risk_mse,
@@ -289,12 +290,14 @@ class ValidationMetricsTracker:
                 # Filter out any extra keys from CSV that might not match the dataclass fields if any
                 data = row.to_dict()
                 
-                # Ensure types
+                # Ensure types (handle string fields like training_mode)
+                STRING_FIELDS = {"training_mode"}
                 try:
                     data["epoch"] = int(data["epoch"])
                     for k, v in data.items():
-                        if k != "epoch":
-                            data[k] = float(v)
+                        if k == "epoch" or k in STRING_FIELDS:
+                            continue  # Already handled or string field
+                        data[k] = float(v)
                 except ValueError as ve:
                      raise ValueError(f"Invalid data type in CSV row: {row}") from ve
                 
@@ -310,21 +313,25 @@ class ValidationMetricsTracker:
                 loaded_history.append(result)
             
             self.history = loaded_history
-            
-            # Recompute global bests
-            self._recompute_ces_scores()
+
+            # Recompute phase scores
+            self._compute_phase_scores()
+
             # Restore best tracker state
-            self.best_ces = -np.inf
+            self.best_score = -np.inf
             self.best_epoch = None
             for idx, res in enumerate(self.history):
-                if res.ces_score > self.best_ces:
-                    self.best_ces = res.ces_score
+                if res.phase_score > self.best_score:
+                    self.best_score = res.phase_score
                     self.best_epoch = idx
-            
+
+            # Update legacy alias
+            self.best_ces = self.best_score
+
             if self.best_epoch is not None:
-                print(f"[TRACKER] Loaded {len(self.history)} validation records. Best CES: {self.best_ces:.4f} (Epoch {self.history[self.best_epoch].epoch})")
+                print(f"[TRACKER] Loaded {len(self.history)} validation records. Best Phase Score: {self.best_score:.4f} (Epoch {self.history[self.best_epoch].epoch})")
             else:
-                print(f"[TRACKER] Loaded {len(self.history)} validation records (no valid CES found yet).")
+                print(f"[TRACKER] Loaded {len(self.history)} validation records (no valid score found yet).")
             
         except Exception as e:
             print(f"[TRACKER] 🛑 FATAL: Failed to load history from {csv_path}: {e}")

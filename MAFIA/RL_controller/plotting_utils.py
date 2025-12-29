@@ -61,7 +61,7 @@ def plot_loss_components(
     axes[1].grid(True, alpha=0.3)
     
     # Risk Loss
-    axes[2].plot(df['epoch'], df['loss_risk'], 'o-', color='orange', linewidth=2, label='L_Risk (MSE)')
+    axes[2].plot(df['epoch'], df['loss_risk'], 'o-', color='orange', linewidth=2, label='L_Risk (Hybrid)')
     axes[2].set_ylabel('L_Risk')
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
@@ -201,59 +201,60 @@ def plot_validation_metrics_grid(
 def plot_ces_progression(
     iterations_summary: List[Dict],
     output_path: Optional[str] = None,
-    title: str = "Walk-Forward CES Progression"
+    title: str = "Walk-Forward Sharpe Progression"
 ) -> plt.Figure:
     """
-    Plot CES scores across walk-forward iterations.
-    
+    Plot Sharpe Ratio (phase_score for SELECTION_ONLY) across walk-forward iterations.
+
     Args:
         iterations_summary: List of dicts with keys:
             - year: Validation year
-            - ces: Best CES score
+            - phase_score: Best phase score (Sharpe for SELECTION)
             - train_range: Training window (e.g., "2015-2017")
             - sharpe, dir_f1, risk_mse: Metric values
     """
     years = [it['year'] for it in iterations_summary]
-    ces_scores = [it['ces'] for it in iterations_summary]
-    
-    # Normalize CES to [0, 1] for color mapping
-    normalized_ces = np.array(ces_scores)
-    if normalized_ces.max() > normalized_ces.min():
-        normalized_ces = (normalized_ces - normalized_ces.min()) / (normalized_ces.max() - normalized_ces.min())
+    # Use phase_score (which is Sharpe for SELECTION_ONLY)
+    scores = [it.get('phase_score', it.get('sharpe', 0.0)) for it in iterations_summary]
+
+    # Normalize scores to [0, 1] for color mapping
+    normalized_scores = np.array(scores)
+    if normalized_scores.max() > normalized_scores.min():
+        normalized_scores = (normalized_scores - normalized_scores.min()) / (normalized_scores.max() - normalized_scores.min())
     else:
-        normalized_ces = np.ones_like(normalized_ces) * 0.5
-    
+        normalized_scores = np.ones_like(normalized_scores) * 0.5
+
     fig, ax = plt.subplots(figsize=(12, 7))
-    
+
     # Bar chart with gradient colors
-    colors = plt.cm.RdYlGn(normalized_ces)
-    bars = ax.bar(years, ces_scores, color=colors, edgecolor='black', linewidth=1.5)
-    
+    colors = plt.cm.RdYlGn(normalized_scores)
+    bars = ax.bar(years, scores, color=colors, edgecolor='black', linewidth=1.5)
+
     # Annotate bars
     for bar, it in zip(bars, iterations_summary):
         height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, height + 0.02, 
-                f"{it['train_range']}\nCES={height:.3f}",
+        ax.text(bar.get_x() + bar.get_width()/2, height + 0.02,
+                f"{it['train_range']}\nSharpe={height:.3f}",
                 ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
+
     ax.set_xlabel('Validation Year', fontsize=12)
-    ax.set_ylabel('Best CES Score', fontsize=12)
+    ax.set_ylabel('Best Sharpe Ratio', fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.set_ylim(0, max(ces_scores) * 1.2)
+    ax.set_ylim(0, max(scores) * 1.2 if max(scores) > 0 else 1.0)
     ax.grid(True, axis='y', alpha=0.3)
-    
+
     # Add color bar legend
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.RdYlGn, norm=plt.Normalize(vmin=min(ces_scores), vmax=max(ces_scores)))
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.RdYlGn, norm=plt.Normalize(vmin=min(scores), vmax=max(scores)))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label('CES Score', rotation=270, labelpad=20)
-    
+    cbar.set_label('Sharpe Ratio', rotation=270, labelpad=20)
+
     plt.tight_layout()
-    
+
     if output_path:
         plt.savefig(output_path, bbox_inches='tight')
-        print(f"[PLOT] Saved CES progression to {output_path}")
-    
+        print(f"[PLOT] Saved Sharpe progression to {output_path}")
+
     return fig
 
 
@@ -736,12 +737,22 @@ def plot_risk_calibration(
     # Normalize metrics for radar-like comparison
     final_row = df.iloc[-1]
 
-    # Create summary text box
+    # Create summary text box with HybridLoss formula
+    alpha = 0.7  # Default HybridLoss alpha
+    mse_score = 1.0 - min(final_row['risk_mse'], 1.0)
+    corr_score = max(0.0, final_row['risk_correlation'])
+    risk_score = (1.0 - alpha) * mse_score + alpha * corr_score
+
     summary_text = f"""Risk Calibration Summary (Epoch {int(final_row['epoch'])})
 
 MSE:  {final_row['risk_mse']:.4f}  {'(Good < 0.1)' if final_row['risk_mse'] < 0.1 else '(Needs improvement)'}
 MAE:  {final_row['risk_mae']:.4f}  {'(Good < 0.3)' if final_row['risk_mae'] < 0.3 else '(Needs improvement)'}
 Corr: {final_row['risk_correlation']:.4f}  {'(Good > 0.3)' if final_row['risk_correlation'] > 0.3 else '(Weak/Negative)'}
+
+HybridLoss Risk Score (α={alpha}):
+  mse_score  = 1 - MSE = {mse_score:.4f}
+  corr_score = max(0, ρ) = {corr_score:.4f}
+  risk_score = {int((1-alpha)*100)}%×{mse_score:.2f} + {int(alpha*100)}%×{corr_score:.2f} = {risk_score:.4f}
 
 Interpretation:
 - Positive correlation: Model learns risk dynamics
@@ -760,6 +771,143 @@ Interpretation:
     if output_path:
         plt.savefig(output_path, bbox_inches='tight')
         print(f"[PLOT] Saved risk calibration to {output_path}")
+
+    return fig
+
+
+def plot_macro_phase_score(
+    csv_path: str,
+    output_path: Optional[str] = None,
+    title: str = "MACRO Phase Score Breakdown",
+    alpha: float = 0.7  # HybridLoss alpha for risk_score calculation
+) -> plt.Figure:
+    """
+    Plot MACRO phase score breakdown showing direction_score and risk_score components.
+
+    Formula:
+        phase_score = 0.5 * direction_score + 0.5 * risk_score
+        risk_score = (1-α) * mse_score + α * corr_score  (HybridLoss)
+
+    Args:
+        csv_path: Path to valid_metrics.csv or train_metrics.csv
+        output_path: Optional path to save figure
+        title: Figure title
+        alpha: HybridLoss correlation weight (default 0.7)
+    """
+    df = pd.read_csv(csv_path)
+
+    # Check required columns
+    required_cols = ['epoch', 'risk_mse', 'risk_correlation', 'direction_f1_macro']
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        print(f"[WARN] Missing columns for phase score plot: {missing}")
+        return None
+
+    epochs = df['epoch']
+
+    # Compute scores using HybridLoss formula
+    MAX_MSE = 1.0
+    mse_norm = np.clip(df['risk_mse'] / MAX_MSE, 0, 1)
+    mse_score = 1.0 - mse_norm
+    corr_score = np.clip(df['risk_correlation'], 0, 1)  # Clamp negative to 0
+
+    # HybridLoss risk_score
+    risk_score = (1.0 - alpha) * mse_score + alpha * corr_score
+    direction_score = df['direction_f1_macro']
+
+    # Phase score (equal weights)
+    phase_score = 0.5 * direction_score + 0.5 * risk_score
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"{title} (α={alpha}: {int((1-alpha)*100)}%MSE + {int(alpha*100)}%Corr)",
+                 fontsize=14, fontweight='bold')
+
+    # Plot 1: Phase Score Progression
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, phase_score, 'o-', color='purple', linewidth=2, markersize=8, label='Phase Score')
+
+    # Best epoch
+    best_idx = phase_score.idxmax()
+    best_epoch = df.loc[best_idx, 'epoch']
+    best_score = phase_score[best_idx]
+    ax1.scatter(best_epoch, best_score, s=200, c='gold', marker='*',
+                edgecolor='black', zorder=5, label=f'Best: {best_score:.4f}')
+
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Phase Score')
+    ax1.set_title('1. MACRO Phase Score (Higher = Better)')
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(0, 1)
+
+    # Plot 2: Component Breakdown (Stacked Area)
+    ax2 = axes[0, 1]
+    dir_contrib = 0.5 * direction_score
+    risk_contrib = 0.5 * risk_score
+
+    ax2.stackplot(epochs, dir_contrib, risk_contrib,
+                  labels=['Direction (50%)', 'Risk (50%)'],
+                  colors=['#4CAF50', '#2196F3'], alpha=0.7)
+    ax2.axvline(best_epoch, color='red', linestyle='--', alpha=0.8, label='Best')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Contribution')
+    ax2.set_title('2. Phase Score Components')
+    ax2.legend(fontsize=9, loc='upper left')
+    ax2.set_ylim(0, 1)
+    ax2.grid(True, alpha=0.3)
+
+    # Plot 3: Risk Score Breakdown (MSE vs Corr)
+    ax3 = axes[1, 0]
+    mse_contrib = (1.0 - alpha) * mse_score
+    corr_contrib = alpha * corr_score
+
+    ax3.stackplot(epochs, mse_contrib, corr_contrib,
+                  labels=[f'MSE Score ({int((1-alpha)*100)}%)', f'Corr Score ({int(alpha*100)}%)'],
+                  colors=['#F44336', '#2196F3'], alpha=0.7)
+    ax3.plot(epochs, risk_score, 'k--', linewidth=1.5, label='Total Risk Score')
+    ax3.axvline(best_epoch, color='gold', linestyle='--', alpha=0.8)
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Risk Score')
+    ax3.set_title('3. Risk Score = (1-α)×MSE_score + α×Corr_score')
+    ax3.legend(fontsize=9, loc='upper left')
+    ax3.set_ylim(0, 1)
+    ax3.grid(True, alpha=0.3)
+
+    # Plot 4: Summary
+    ax4 = axes[1, 1]
+    final_row = df.iloc[-1]
+    final_phase = phase_score.iloc[-1]
+    final_risk = risk_score.iloc[-1]
+    final_dir = direction_score.iloc[-1]
+
+    summary_text = f"""MACRO Phase Score Summary (Epoch {int(final_row['epoch'])})
+
+Phase Score:     {final_phase:.4f}  (Target > 0.5)
+├─ Direction:    {final_dir:.4f}  × 0.5 = {0.5*final_dir:.4f}
+└─ Risk:         {final_risk:.4f}  × 0.5 = {0.5*final_risk:.4f}
+
+Risk Score Breakdown (α={alpha}):
+├─ MSE Score:    {mse_score.iloc[-1]:.4f}  × {1-alpha:.1f} = {(1-alpha)*mse_score.iloc[-1]:.4f}
+└─ Corr Score:   {corr_score.iloc[-1]:.4f}  × {alpha:.1f} = {alpha*corr_score.iloc[-1]:.4f}
+
+Best Epoch: {int(best_epoch)} (Score: {best_score:.4f})
+
+Formula:
+  risk_score = {int((1-alpha)*100)}%×(1-MSE) + {int(alpha*100)}%×max(0,ρ)
+  phase_score = 50%×dir_f1 + 50%×risk_score
+"""
+
+    ax4.text(0.05, 0.5, summary_text, transform=ax4.transAxes, fontsize=10,
+             verticalalignment='center', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    ax4.axis('off')
+    ax4.set_title('4. Score Summary')
+
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, bbox_inches='tight')
+        print(f"[PLOT] Saved MACRO phase score to {output_path}")
 
     return fig
 
@@ -863,7 +1011,8 @@ def create_all_charts(
     valid_csv: str,
     iterations_summary: Optional[List[Dict]] = None,
     trajectory_csv: Optional[str] = None,
-    output_dir: str = "./charts"
+    output_dir: str = "./charts",
+    training_mode: Optional[str] = None
 ):
     """
     Generate all visualization charts for MAFIA Observer analysis.
@@ -873,94 +1022,109 @@ def create_all_charts(
         iterations_summary: Optional list of iteration summaries for walk-forward charts
         trajectory_csv: Optional path to trajectory_details.csv for trigger analysis
         output_dir: Directory to save charts
+        training_mode: Training mode (MACRO_ONLY or SELECTION_ONLY) for display
     """
     import os
     os.makedirs(output_dir, exist_ok=True)
 
-    total_charts = 10
+    # Determine phase and label
+    is_macro = training_mode == "MACRO_ONLY"
+    is_selection = training_mode == "SELECTION_ONLY"
+
+    phase_label = ""
+    if is_macro:
+        phase_label = " [Phase 1: MACRO]"
+    elif is_selection:
+        phase_label = " [Phase 2: SELECTION]"
 
     print(f"\n{'='*70}")
-    print("GENERATING MAFIA OBSERVER INSIGHT CHARTS")
+    print(f"GENERATING MAFIA OBSERVER INSIGHT CHARTS{phase_label}")
     print(f"{'='*70}\n")
 
-    # Chart 1: Loss Components
-    print(f"[1/{total_charts}] Loss Components...")
+    chart_num = 0
+
+    # Chart: Loss Components (always generate)
+    chart_num += 1
+    print(f"[{chart_num}] Loss Components...")
     plot_loss_components(
         valid_csv,
         output_path=os.path.join(output_dir, "loss_components.png")
     )
     plt.close()
 
-    # Chart 2: Validation Metrics Grid
-    print(f"[2/{total_charts}] Validation Metrics Grid...")
-    plot_validation_metrics_grid(
-        valid_csv,
-        output_path=os.path.join(output_dir, "validation_metrics.png")
-    )
-    plt.close()
+    # SELECTION_ONLY charts
+    if is_selection:
+        chart_num += 1
+        print(f"[{chart_num}] Validation Metrics Grid...")
+        plot_validation_metrics_grid(
+            valid_csv,
+            output_path=os.path.join(output_dir, "validation_metrics.png")
+        )
+        plt.close()
 
-    # Chart 3: CES Components Breakdown (NEW)
-    print(f"[3/{total_charts}] CES Components Breakdown...")
-    plot_ces_components_breakdown(
-        valid_csv,
-        output_path=os.path.join(output_dir, "ces_breakdown.png")
-    )
-    plt.close()
+        chart_num += 1
+        print(f"[{chart_num}] CES Components Breakdown...")
+        plot_ces_components_breakdown(
+            valid_csv,
+            output_path=os.path.join(output_dir, "ces_breakdown.png")
+        )
+        plt.close()
 
-    # Chart 4: Direction Classification Breakdown (NEW)
-    print(f"[4/{total_charts}] Direction Classification Breakdown...")
-    plot_direction_breakdown(
-        valid_csv,
-        output_path=os.path.join(output_dir, "direction_breakdown.png")
-    )
-    plt.close()
+        chart_num += 1
+        print(f"[{chart_num}] Turnover-Sharpe Trade-off...")
+        plot_turnover_sharpe_tradeoff(
+            valid_csv,
+            output_path=os.path.join(output_dir, "turnover_tradeoff.png")
+        )
+        plt.close()
 
-    # Chart 5: Risk Calibration (NEW)
-    print(f"[5/{total_charts}] Risk Calibration Analysis...")
-    plot_risk_calibration(
-        valid_csv,
-        output_path=os.path.join(output_dir, "risk_calibration.png")
-    )
-    plt.close()
+    # MACRO_ONLY charts
+    if is_macro:
+        chart_num += 1
+        print(f"[{chart_num}] MACRO Phase Score Breakdown...")
+        plot_macro_phase_score(
+            valid_csv,
+            output_path=os.path.join(output_dir, "macro_phase_score.png")
+        )
+        plt.close()
 
-    # Chart 6: Turnover-Sharpe Trade-off (NEW)
-    print(f"[6/{total_charts}] Turnover-Sharpe Trade-off...")
-    plot_turnover_sharpe_tradeoff(
-        valid_csv,
-        output_path=os.path.join(output_dir, "turnover_tradeoff.png")
-    )
-    plt.close()
+        chart_num += 1
+        print(f"[{chart_num}] Direction Classification Breakdown...")
+        plot_direction_breakdown(
+            valid_csv,
+            output_path=os.path.join(output_dir, "direction_breakdown.png")
+        )
+        plt.close()
 
-    # Chart 7-8: Walk-forward (if data provided)
-    if iterations_summary:
-        print(f"[7/{total_charts}] CES Progression...")
+        chart_num += 1
+        print(f"[{chart_num}] Risk Calibration Analysis...")
+        plot_risk_calibration(
+            valid_csv,
+            output_path=os.path.join(output_dir, "risk_calibration.png")
+        )
+        plt.close()
+
+    # Walk-forward charts (SELECTION_ONLY - uses CES metrics)
+    if iterations_summary and is_selection:
+        chart_num += 1
+        print(f"[{chart_num}] Sharpe Progression...")
         plot_ces_progression(
             iterations_summary,
-            output_path=os.path.join(output_dir, "ces_progression.png")
+            output_path=os.path.join(output_dir, "sharpe_progression.png")
         )
         plt.close()
 
-        print(f"[8/{total_charts}] Walk-Forward Comparison...")
-        plot_walkforward_metrics_comparison(
-            iterations_summary,
-            output_path=os.path.join(output_dir, "walkforward_comparison.png")
-        )
-        plt.close()
-    else:
-        print(f"[7-8/{total_charts}] Skipping walk-forward charts (no iterations_summary)")
-
-    # Chart 9: Trigger Distribution (if trajectory data provided)
+    # Trigger Distribution (if trajectory data provided)
     if trajectory_csv and os.path.exists(trajectory_csv):
-        print(f"[9/{total_charts}] Trigger Distribution...")
+        chart_num += 1
+        print(f"[{chart_num}] Trigger Distribution...")
         plot_trigger_distribution(
             trajectory_csv,
             output_path=os.path.join(output_dir, "trigger_distribution.png")
         )
         plt.close()
-    else:
-        print(f"[9/{total_charts}] Skipping trigger distribution (no trajectory data)")
 
-    print(f"[10/{total_charts}] Done!")
+    print(f"[DONE] Generated {chart_num} charts")
 
     print(f"\n{'='*70}")
     print(f"MAFIA OBSERVER INSIGHT CHARTS GENERATED")
@@ -1078,8 +1242,12 @@ def plot_cockpit_dashboard(
     lines = line1 + line2
     labels = [l.get_label() for l in lines]
     ax4.legend(lines, labels, loc='upper center', fontsize=8)
-    ax4.set_title('4. Risk Calibration Quality', fontweight='bold')
+    ax4.set_title('4. Risk Calibration (HybridLoss: MSE+Corr)', fontweight='bold')
     ax4.grid(True, alpha=0.3)
+    # Annotation for HybridLoss balance
+    ax4.text(0.02, 0.98, 'Loss = 30%MSE + 70%Corr', transform=ax4.transAxes,
+             fontsize=7, verticalalignment='top', alpha=0.7,
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     # --- Panel 5: Efficiency (Turnover vs Sharpe) ---
     ax5 = fig.add_subplot(gs[2, 0])

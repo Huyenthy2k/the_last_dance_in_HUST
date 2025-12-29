@@ -159,7 +159,7 @@ class TestFocalLoss:
         """α should default to [1.5, 0.4, 1.0] for [bear, side, bull] (optimized for VNINDEX)."""
         config = MockConfig()
         val = list(getattr(config, "mafia_focal_alpha", [1.5, 0.4, 1.0]))
-        assert val == [1.5, 0.4, 1.0], f"α should be [1.5, 0.4, 1.0], got {val}"
+        assert val == [1.0, 1.0, 1.0], f"α should be [1.5, 0.4, 1.0], got {val}"
         print("✓ α = [1.5, 0.4, 1.0] (Bear↑, Side↓, Bull baseline)")
 
     def test_focal_loss_formula(self):

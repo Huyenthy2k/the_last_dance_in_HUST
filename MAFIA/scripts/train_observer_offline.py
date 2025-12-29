@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
 """
-Offline Batch Training for MAFIA Observer - Spec §6/§7 Compliant
+Offline Batch Training for MAFIA Observer - YEARLY Expanding Window
 
-This script trains the MAFIA Observer using the offline batch mode
-as specified in refactor_mafia.md Section 6 (Trajectory Configuration)
-and Section 7 (Observer Training Schedule).
+This script trains the MAFIA Observer using offline batch mode with
+YEARLY expanding window schedule per training_strategy_proposal.md.
 
-Key Features:
-1. Random trajectory sampling with fresh hidden state per batch
-2. Collect → Train → Discard loop (transient buffer)
-3. Cadence-aware loss masking
-4. Walk-forward expanding window validation
+Schedule (5 iterations):
+| Iter | Train Period | Valid Year |
+|------|--------------|------------|
+| 0    | 2015-2019    | 2020       |
+| 1    | 2015-2020    | 2021       |
+| 2    | 2015-2021    | 2022       |
+| 3    | 2015-2022    | 2023       |
+| 4    | 2015-2023    | 2024       |
 
 Usage:
-    python scripts/train_observer_offline.py \
-        --start-year 2015 \
-        --first-infer-year 2018 \
-        --last-infer-year 2022 \
+    # MACRO_ONLY training (Phase 1A)
+    python scripts/train_observer_offline.py \\
+        --mode MACRO_ONLY \\
         --output-dir ./observer_offline
 
-    # Single iteration test
-    python scripts/train_observer_offline.py \
-        --start-year 2015 \
-        --first-infer-year 2018 \
-        --last-infer-year 2018 \
-        --epochs 10 \
-        --output-dir ./observer_offline_test
+    # SELECTION_ONLY training (Phase 1B) - after MACRO_ONLY
+    python scripts/train_observer_offline.py \\
+        --mode SELECTION_ONLY \\
+        --init-checkpoint ./observer_offline/checkpoints/macro/Observer_Best_2024.pth \\
+        --output-dir ./observer_offline
 """
 
 import argparse
@@ -48,12 +47,12 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from config import Config
+from config import Config, get_phase_subdir, MafiaTrainMode
 from RL_controller.mafia_observer import MAFIAObserver
 from RL_controller.observer_offline_trainer import ObserverOfflineBatchTrainer
 from visualize_training import generate_epoch_report
 from utils.mafia_data_loader import load_mafia_data
-from scripts.generate_rl_states import generate_single_year
+# NOTE: generate_single_year removed - state generation now in train_walkforward.py
 
 # LiveDisplay smart_print for terminal-safe logging
 try:
@@ -87,56 +86,56 @@ def build_expanding_schedule(
     start_year: int, first_infer_year: int, last_infer_year: int
 ) -> List[Dict]:
     """
-    Build the QUARTERLY expanding-window schedule per spec Section 7 (Restored).
-
-    For each Target Year Y:
-    - Iter 1 (Q1): Train 2015 -> End Q3(Y-1). Valid Q4(Y-1). Infer Q1(Y).
-    - Iter 2 (Q2): Train 2015 -> End Q4(Y-1). Valid Q1(Y). Infer Q2(Y).
-    - Iter 3 (Q3): Train 2015 -> End Q1(Y). Valid Q2(Y). Infer Q3(Y).
-    - Iter 4 (Q4): Train 2015 -> End Q2(Y). Valid Q3(Y). Infer Q4(Y).
+    Build YEARLY expanding-window schedule per training_strategy_proposal.md.
+    
+    Strategy (5 iterations for 2020-2024):
+    | Iter | Train Period | Valid/Infer Year |
+    |------|--------------|------------------|
+    | 0    | 2015-2019    | 2020             |
+    | 1    | 2015-2020    | 2021             |
+    | 2    | 2015-2021    | 2022             |
+    | 3    | 2015-2022    | 2023             |
+    | 4    | 2015-2023    | 2024             |
+    
+    Args:
+        start_year: Training start year (fixed, e.g., 2015)
+        first_infer_year: First year to generate states for (e.g., 2020)
+        last_infer_year: Last year to generate states for (e.g., 2024)
+    
+    Returns:
+        List of schedule dicts with train/valid/infer periods
     """
     schedule = []
-    train_start = pd.Timestamp(f"{start_year}-01-01 00:00:00")
     
-    iter_idx = 0
-    # Loop through each target year
-    for year in range(first_infer_year, last_infer_year + 1):
-        for q in range(1, 5):
-            # Define Inference Period
-            m_start_infer = (q - 1) * 3 + 1
-            infer_start = pd.Timestamp(f"{year}-{m_start_infer:02d}-01 00:00:00")
-            infer_end = (infer_start + pd.DateOffset(months=3)) - pd.Timedelta(seconds=1)
-            
-            # Define Validation Period (Previous Quarter)
-            valid_start = infer_start - pd.DateOffset(months=3)
-            valid_end = infer_start - pd.Timedelta(seconds=1)
-            
-            # Define Training Period (Start to Before Valid)
-            train_end = valid_start - pd.Timedelta(seconds=1)
-            
-            if train_end <= train_start:
-                 raise ValueError(f"Invalid train window for {year} Q{q}")
-
-            schedule.append({
-                "iter_index": iter_idx,
-                "iter_display": iter_idx + 1,
-                "train_start": train_start,
-                "train_end": train_end,
-                "valid_start": valid_start,
-                "valid_end": valid_end,
-                "valid_year": valid_start.year,
-                "valid_quarter": (valid_start.month - 1) // 3 + 1,
-                "infer_year": year,
-                "infer_quarter": q,
-                "infer_start": infer_start,
-                "infer_end": infer_end,
-                "ckpt_name": f"Ckpt_Best_{valid_start.year}_Q{(valid_start.month - 1) // 3 + 1}",
-                "train_label": f"{train_start.date()} -> {train_end.date()}",
-                "valid_label": f"{valid_start.date()} -> {valid_end.date()} (Q{(valid_start.month - 1) // 3 + 1})",
-            })
-            iter_idx += 1
-
+    for iter_idx, valid_year in enumerate(range(first_infer_year, last_infer_year + 1)):
+        # Training: start_year -> (valid_year - 1)
+        train_end_year = valid_year - 1
+        
+        train_start = pd.Timestamp(f"{start_year}-01-01 00:00:00")
+        train_end = pd.Timestamp(f"{train_end_year}-12-31 23:59:59")
+        valid_start = pd.Timestamp(f"{valid_year}-01-01 00:00:00")
+        valid_end = pd.Timestamp(f"{valid_year}-12-31 23:59:59")
+        
+        schedule.append({
+            "iter_index": iter_idx,
+            "iter_display": iter_idx + 1,
+            "train_start": train_start,
+            "train_end": train_end,
+            "valid_start": valid_start,
+            "valid_end": valid_end,
+            "valid_year": valid_year,
+            "valid_quarter": None,  # YEARLY schedule, no quarters
+            "infer_year": valid_year,
+            "infer_quarter": None,  # YEARLY schedule, no quarters
+            "infer_start": valid_start,
+            "infer_end": valid_end,
+            "ckpt_name": f"Observer_Best_{valid_year}",
+            "train_label": f"{train_start.date()} -> {train_end.date()}",
+            "valid_label": f"{valid_start.date()} -> {valid_end.date()} (Full Year)",
+        })
+    
     return schedule
+
 
 def load_stock_data(config: Config) -> pd.DataFrame:
     """
@@ -168,12 +167,16 @@ def train_observer_offline_iteration(
     trainer: ObserverOfflineBatchTrainer,
     data_tensors: Dict[str, th.Tensor],
     checkpoint_dir: str,
+    results_dir: str,  # Phase-aware results directory
     num_epochs: Optional[int] = None,
     batches_per_epoch: Optional[int] = None,
     prev_checkpoint: Optional[str] = None,
     writer: Optional[SummaryWriter] = None,
     global_step_start: int = 0,
     verbose: bool = True,
+    training_mode: str = "FULL",
+    init_checkpoint: Optional[str] = None,  # MACRO checkpoint (frozen params for SELECTION_ONLY)
+    prev_selection_checkpoint: Optional[str] = None,  # Prev SELECTION checkpoint (trainable params)
 ) -> str:
     """
     Train one iteration using offline batch mode with CES Validation.
@@ -186,7 +189,9 @@ def train_observer_offline_iteration(
         checkpoint_dir: Directory to save checkpoints
         num_epochs: Number of training epochs
         batches_per_epoch: Steps per epoch
-        prev_checkpoint: Path to previous checkpoint for finetuning
+        prev_checkpoint: Path to previous checkpoint for finetuning (same phase)
+        init_checkpoint: MACRO checkpoint for SELECTION_ONLY (frozen params)
+        prev_selection_checkpoint: Previous SELECTION checkpoint (trainable params for knowledge transfer)
         verbose: Print progress
 
     Returns:
@@ -202,12 +207,17 @@ def train_observer_offline_iteration(
         if iteration == 0:
             num_epochs = int(getattr(config, "mafia_observer_base_epochs", 50))
         else:
-            num_epochs = int(getattr(config, "mafia_observer_finetune_epochs", 20))
+            num_epochs = int(getattr(config, "mafia_observer_finetune_epochs", 5))
 
     if verbose:
         train_mode = "Base Training" if iteration == 0 else "Finetuning"
         smart_print(f"[OFFLINE] {train_mode}: {num_epochs} epochs")
-        
+
+    # Scale curriculum warmup/rampup for finetune iterations
+    # This ensures lambda reaches 1.0 within the shorter training period
+    is_finetune = (iteration > 0)
+    trainer.scale_curriculum_for_finetune(num_epochs=num_epochs, is_finetune=is_finetune)
+
     # Update Dashboard Header
     update_walkforward_iteration(
         iteration=iteration,
@@ -220,10 +230,52 @@ def train_observer_offline_iteration(
         is_finetune=(iteration > 0)
     )
 
-    # Load previous checkpoint if finetuning
-    if prev_checkpoint and os.path.exists(prev_checkpoint):
-        smart_print(f"[OFFLINE] Loading checkpoint for finetuning: {prev_checkpoint}")
-        trainer.observer.load_checkpoint(prev_checkpoint)
+    # === CHECKPOINT LOADING LOGIC ===
+    # Priority for SELECTION_ONLY mode:
+    # 1. If both init_checkpoint (MACRO) AND prev_selection_checkpoint exist:
+    #    -> Use load_merged_checkpoints() to merge frozen from MACRO, trainable from SELECTION
+    # 2. If only init_checkpoint (MACRO) exists:
+    #    -> Load full MACRO checkpoint (Iter 0 or no prev SELECTION)
+    # 3. For other modes (MACRO_ONLY, FULL):
+    #    -> Use standard prev_checkpoint loading for same-phase resume
+
+    if training_mode == MafiaTrainMode.SELECTION_ONLY:
+        if init_checkpoint and prev_selection_checkpoint:
+            # MERGED LOADING: Frozen from MACRO, Trainable from prev SELECTION
+            if os.path.exists(init_checkpoint) and os.path.exists(prev_selection_checkpoint):
+                smart_print(f"[OFFLINE] Loading MERGED checkpoints:")
+                smart_print(f"  - Frozen (MACRO): {os.path.basename(init_checkpoint)}")
+                smart_print(f"  - Trainable (SELECTION): {os.path.basename(prev_selection_checkpoint)}")
+                trainer.observer.load_merged_checkpoints(
+                    frozen_checkpoint_path=init_checkpoint,
+                    trainable_checkpoint_path=prev_selection_checkpoint,
+                    load_optimizer=False,  # Fresh optimizer for new iteration
+                )
+            elif os.path.exists(init_checkpoint):
+                smart_print(f"[OFFLINE] Loading init_checkpoint (MACRO only): {init_checkpoint}")
+                trainer.observer.load_checkpoint(init_checkpoint)
+        elif init_checkpoint and os.path.exists(init_checkpoint):
+            # Iter 0: No prev SELECTION, load full MACRO
+            smart_print(f"[OFFLINE] Loading init_checkpoint (MACRO, Iter 0): {init_checkpoint}")
+            trainer.observer.load_checkpoint(init_checkpoint)
+    else:
+        # MACRO_ONLY or FULL mode: Use standard prev_checkpoint loading
+        if prev_checkpoint and os.path.exists(prev_checkpoint):
+            smart_print(f"[OFFLINE] Loading prev_checkpoint (Resume/WarmStart): {prev_checkpoint}")
+            trainer.observer.load_checkpoint(prev_checkpoint)
+
+        # Load INIT checkpoint if provided (overrides prev_checkpoint)
+        if init_checkpoint and os.path.exists(init_checkpoint):
+            smart_print(f"[OFFLINE] Loading init_checkpoint (Transfer): {init_checkpoint}")
+            trainer.observer.load_checkpoint(init_checkpoint)
+
+    # Create observer and trainer
+    # ... (observer creation logic) ...
+    # Initialize mode
+    if hasattr(trainer.observer, "set_train_mode"):
+        trainer.observer.set_train_mode(training_mode)
+        if verbose:
+             smart_print(f"[OFFLINE] Set Training Mode: {training_mode}")
 
     # Prepare train/valid splits
     dates = data_tensors["dates"]
@@ -238,18 +290,33 @@ def train_observer_offline_iteration(
     if len(valid_indices) == 0:
         raise ValueError(f"No validation data in range {schedule_entry['valid_label']}")
 
-    # Create views
+    # [OPTIMIZATION] Include h (rebalance_interval) days from VALIDATION as suffix for training
+    # This allows training on LAST days of training period (need horizon for ground truth/returns)
+    h = trainer.rebalance_interval  # Rebalance interval (21 days default)
+    suffix_length = min(h, len(valid_indices))  # Don't exceed validation length
+    train_data_end = train_indices[-1] + 1 + suffix_length  # Extend into validation
+
+
+    
+    # Create views with suffix
     train_tensors = {
-        "ochlv": data_tensors["ochlv"][train_indices[0] : train_indices[-1] + 1],
-        "returns": data_tensors["returns"][train_indices[0] : train_indices[-1] + 1],
-        "market_ochlv": data_tensors.get("market_ochlv", None)[train_indices[0] : train_indices[-1] + 1] if data_tensors.get("market_ochlv") is not None else None,
-        "market_returns": data_tensors.get("market_returns", None)[train_indices[0] : train_indices[-1] + 1] if data_tensors.get("market_returns") is not None else None,
-        "dates": dates[train_indices],
+        "ochlv": data_tensors["ochlv"][train_indices[0] : train_data_end],
+        "returns": data_tensors["returns"][train_indices[0] : train_data_end],
+        "market_ochlv": data_tensors.get("market_ochlv", None)[train_indices[0] : train_data_end] if data_tensors.get("market_ochlv") is not None else None,
+        "market_returns": data_tensors.get("market_returns", None)[train_indices[0] : train_data_end] if data_tensors.get("market_returns") is not None else None,
+        "dates": dates[train_indices[0] : train_indices[-1] + 1 + suffix_length],
         "stock_list": data_tensors["stock_list"],
-        "T_total": len(train_indices),
+        "T_total": len(train_indices) + suffix_length,  # Include suffix
         "N": data_tensors["N"],
+        # NEW: Suffix metadata
+        "suffix_length": suffix_length,  # How many days are lookahead suffix (from validation)
+        "train_end_idx": len(train_indices),  # Index where actual training ends (suffix starts)
     }
     
+    if verbose:
+        smart_print(f"[TRAIN] Training data: {train_tensors['T_total']} days (train={len(train_indices)}, suffix={suffix_length} from valid)")
+    
+
     # Auto-compute batches per epoch
     if batches_per_epoch is None:
         T_train = train_tensors["T_total"]
@@ -260,21 +327,41 @@ def train_observer_offline_iteration(
         available_starts = T_train - T_m - h - T_w
         batches_per_epoch = max(1, int(np.ceil(available_starts / batch_size)))
 
-    valid_tensors = {
-        "ochlv": data_tensors["ochlv"][valid_indices[0] : valid_indices[-1] + 1],
-        "returns": data_tensors["returns"][valid_indices[0] : valid_indices[-1] + 1],
-        "market_ochlv": data_tensors.get("market_ochlv", None)[valid_indices[0] : valid_indices[-1] + 1] if data_tensors.get("market_ochlv") is not None else None,
-        "market_returns": data_tensors.get("market_returns", None)[valid_indices[0] : valid_indices[-1] + 1] if data_tensors.get("market_returns") is not None else None,
-        "dates": dates[valid_indices],
-        "stock_list": data_tensors["stock_list"],
-        "T_total": len(valid_indices),
-        "N": data_tensors["N"],
-    }
+    # [OPTIMIZATION] Include T_w days from TRAINING data as prefix for validation warm-up
+    # This allows 100% validation utilization (no discarded days at start of validation year)
+    T_w = trainer.T_w  # Observation window = 30 days (lookback for OCHLV features)
+    prefix_length = T_w  # Only need T_w days for feature lookback
+    prefix_start = max(0, valid_indices[0] - prefix_length)
 
-    # Initialize ValidationMetricsTracker
-    iter_output_dir = os.path.normpath(os.path.join(checkpoint_dir, f"../iter_{iteration}_valid_{valid_year}"))
+    
+    # Slice data including prefix + validation period
+    valid_data_start = prefix_start
+    valid_data_end = valid_indices[-1] + 1
+    
+    # Calculate actual prefix length (may be less if valid_indices[0] < prefix_length)
+    actual_prefix_length = valid_indices[0] - prefix_start
+    
+    valid_tensors = {
+        "ochlv": data_tensors["ochlv"][valid_data_start : valid_data_end],
+        "returns": data_tensors["returns"][valid_data_start : valid_data_end],
+        "market_ochlv": data_tensors.get("market_ochlv", None)[valid_data_start : valid_data_end] if data_tensors.get("market_ochlv") is not None else None,
+        "market_returns": data_tensors.get("market_returns", None)[valid_data_start : valid_data_end] if data_tensors.get("market_returns") is not None else None,
+        "dates": dates[prefix_start : valid_indices[-1] + 1],  # Include prefix dates
+        "stock_list": data_tensors["stock_list"],
+        "T_total": valid_data_end - valid_data_start,
+        "N": data_tensors["N"],
+        # NEW: Prefix metadata for validation logic
+        "prefix_length": actual_prefix_length,  # How many days are warm-up prefix (from training)
+        "valid_start_idx": actual_prefix_length,  # Index where actual validation starts
+    }
+    
+    if verbose:
+        smart_print(f"[VALID] Validation data: {valid_tensors['T_total']} days (prefix={actual_prefix_length} from train, valid={len(valid_indices)})")
+
+    # Initialize ValidationMetricsTracker (inside phase results directory)
+    iter_output_dir = os.path.join(results_dir, f"iter_{iteration}_valid_{valid_year}")
     os.makedirs(iter_output_dir, exist_ok=True)
-    tracker = ValidationMetricsTracker(iter_output_dir)
+    tracker = ValidationMetricsTracker(iter_output_dir, training_mode=training_mode)
     
     # Checkpoint storage
     temp_ckpt_dir = os.path.join(checkpoint_dir, f"temp_iter_{iteration}")
@@ -326,9 +413,12 @@ def train_observer_offline_iteration(
                 loaded_epoch = trainer.observer.load_checkpoint(resume_path)
                 start_epoch = loaded_epoch + 1
 
-                # [RESUME-FIX] Restore Curriculum State
-                trainer._current_lambda_epoch = trainer._compute_lambda_epoch(loaded_epoch)
-                smart_print(f"[RESUME] Restored lambda_epoch = {trainer._current_lambda_epoch:.4f} for loaded epoch {loaded_epoch}")
+                # [RESUME-FIX] Restore Curriculum State (only for SELECTION_ONLY mode)
+                if training_mode == MafiaTrainMode.SELECTION_ONLY:
+                    trainer._current_lambda_epoch = trainer._compute_lambda_epoch(loaded_epoch)
+                    smart_print(f"[RESUME] Restored lambda_epoch = {trainer._current_lambda_epoch:.4f} for loaded epoch {loaded_epoch}")
+                else:
+                    trainer._current_lambda_epoch = 0.0  # Not used in MACRO_ONLY
 
                 # Restore Validation Tracker History
                 valid_csv_path = os.path.join(iter_output_dir, "valid_metrics.csv")
@@ -412,20 +502,21 @@ def train_observer_offline_iteration(
                             min_full = trainer.curriculum_warmup_epochs + trainer.curriculum_penalty_rampup
                             is_full_penalty = (recover_ep >= min_full)
                             is_best = tracker.add_epoch(val_result, allow_best_update=is_full_penalty)
-                            smart_print(f"           ✅ Recovered Epoch {recover_ep} (CES: {val_result.ces_score:.5f})")
-                            
+                            smart_print(f"           ✅ Recovered Epoch {recover_ep} (Score: {val_result.phase_score:.5f})")
+
                             # 5. Save incrementally
                             tracker.save_validation_history()
-                            
+
                             # 6. Plots
                             min_best_for_plot = trainer.curriculum_warmup_epochs + trainer.curriculum_penalty_rampup
-                            generate_epoch_report(tracker.output_dir, recover_ep, min_best_epoch=min_best_for_plot)
+                            generate_epoch_report(tracker.output_dir, recover_ep, min_best_epoch=min_best_for_plot,
+                                                  training_mode=training_mode)
 
                             # 7. Update Best Checkpoint if needed
                             if is_best:
                                 best_ckpt_path = os.path.join(temp_ckpt_dir, "best_checkpoint.pth")
                                 trainer.observer.save_checkpoint(best_ckpt_path, epoch=recover_ep)
-                                smart_print(f"           🏆 Updated best_checkpoint.pth (CES={val_result.ces_score:.4f})")
+                                smart_print(f"           🏆 Updated best_checkpoint.pth (Score={val_result.phase_score:.4f})")
                             
                         except Exception as e:
                             smart_print(f"           ❌ Failed to recover Epoch {recover_ep}: {e}")
@@ -509,9 +600,55 @@ def train_observer_offline_iteration(
                             
                             if new_len_t < original_len_t:
                                 smart_print(f"[RESUME] Truncating train history from {original_len_t} to {new_len_t} records (removed future epochs).")
-                                df_train.to_csv(train_csv_path, index=False)
+                                
+                                # [SAFETY-BACKUP] Backup before overwrite
+                                import shutil
+                                backup_path = train_csv_path + ".bak"
+                                shutil.copy2(train_csv_path, backup_path)
+                                smart_print(f"[RESUME] Created backup at: {backup_path}")
+
+                                # [SAFETY-CHECK] Prevent wiping history if we are resuming late
+                                if new_len_t == 0 and start_epoch > 0:
+                                    smart_print(f"[CRITICAL] 🚨 Resume would wipe ALL training history despite start_epoch={start_epoch}!")
+                                    smart_print(f"           Aborting truncation. Restoring from backup.")
+                                    shutil.copy2(backup_path, train_csv_path)
+                                else:
+                                    df_train.to_csv(train_csv_path, index=False)
                     except Exception as e:
                         smart_print(f"[WARN] Failed to truncate train_metrics.csv: {e}")
+
+                # [RESUME-FIX] Truncate trajectory_details.csv if exists
+                traj_csv_path = os.path.join(iter_output_dir, "trajectory_details.csv")
+                if os.path.exists(traj_csv_path):
+                    smart_print(f"[RESUME] Checking trajectory details from: {traj_csv_path}")
+                    try:
+                        df_traj = pd.read_csv(traj_csv_path)
+                        if "epoch" in df_traj.columns:
+                            df_traj["epoch"] = pd.to_numeric(df_traj["epoch"], errors='coerce')
+                            df_traj = df_traj.dropna(subset=["epoch"])
+
+                            original_len_traj = len(df_traj)
+                            df_traj = df_traj[df_traj["epoch"] < start_epoch]
+                            new_len_traj = len(df_traj)
+
+                            if new_len_traj < original_len_traj:
+                                smart_print(f"[RESUME] Truncating trajectory_details from {original_len_traj} to {new_len_traj} records (removed future epochs).")
+                                
+                                # [SAFETY-BACKUP]
+                                traj_backup = traj_csv_path + ".bak"
+                                shutil.copy2(traj_csv_path, traj_backup)
+                                
+                                if new_len_traj == 0 and start_epoch > 0:
+                                     smart_print(f"[CRITICAL] 🚨 Resume would wipe trajectory history! Restoring from backup.")
+                                     shutil.copy2(traj_backup, traj_csv_path)
+                                else:
+                                     df_traj.to_csv(traj_csv_path, index=False)
+                        else:
+                            # Old format without epoch column - delete entire file
+                            smart_print(f"[RESUME] trajectory_details.csv missing 'epoch' column (old format). Deleting file.")
+                            os.remove(traj_csv_path)
+                    except Exception as e:
+                        smart_print(f"[WARN] Failed to truncate trajectory_details.csv: {e}")
 
                 smart_print(f"[RESUME] Will continue from epoch {start_epoch}")
             except Exception as e:
@@ -545,9 +682,8 @@ def train_observer_offline_iteration(
             smart_print(f"[RESUME] Synced trainer._epoch to {trainer._epoch} (will become {start_epoch} after train_epoch())")
             smart_print(f"[RESUME] Synced global_step to {current_global_step}")
 
-    # Show chart location at training start
-    root_output_dir = os.path.dirname(iter_output_dir)
-    plots_dir = os.path.join(root_output_dir, "plots")
+    # Show chart location at training start (inside iteration folder)
+    plots_dir = os.path.join(iter_output_dir, "plots")
     if verbose:
         smart_print(f"\n📊 Charts will be saved to: {os.path.abspath(plots_dir)}")
         smart_print(f"   (Updated after each batch for real-time progress)\n")
@@ -562,7 +698,8 @@ def train_observer_offline_iteration(
             def on_batch_viz(batch_idx, total_batches):
                 # Generate charts after each batch for real-time progress
                 try:
-                    generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val)
+                    generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val,
+                                          training_mode=training_mode)
                 except Exception:
                     pass  # Silent fail - don't interrupt training
             
@@ -573,6 +710,10 @@ def train_observer_offline_iteration(
             # Use distinct name for batch-level metrics log
             batch_log_path = os.path.join(iter_output_dir, "batch_training_log.csv")
             
+            if verbose:
+                smart_print(f"\n[OFFLINE] Used {batches_per_epoch} batches per epoch.")
+                smart_print(f"[OFFLINE] Starting Epoch {epoch} Training...")
+
             train_res = trainer.train_epoch(
                 data_tensors=train_tensors,
                 steps_per_epoch=batches_per_epoch,
@@ -580,27 +721,28 @@ def train_observer_offline_iteration(
                 global_step_offset=current_global_step,
                 on_batch_done=on_batch_viz,  # Real-time chart updates
                 log_file=batch_log_path,      # Save batch-level dynamics
+                verbose=verbose,            # Pass verbose flag
+                training_mode=training_mode  # Pass training mode ("MACRO_ONLY", "SELECTION_ONLY")
             )
             current_global_step += batches_per_epoch
 
-            # Save training metrics to CSV
+            # Save training metrics to CSV (filtered by training phase)
             train_metrics_path = os.path.join(iter_output_dir, "train_metrics.csv")
             try:
-                # Convert ObserverValidationResult to dict
-                train_dict = asdict(train_res)
-                
-                # Remove CES-related columns from training metrics (they are always 0.0)
-                keys_to_remove = [k for k in train_dict.keys() if "ces_score" in k or "ces_rank" in k]
-                for k in keys_to_remove:
-                    del train_dict[k]
-                    
+                # Convert ObserverValidationResult to dict (filtered by phase)
+                train_dict = train_res.to_dict(filter_by_phase=True)
+
+                # For training metrics, also remove CES columns (always 0.0 during training)
+                train_dict = {k: v for k, v in train_dict.items()
+                              if not (k.startswith("ces_score") or k.startswith("ces_rank"))}
+
                 # Append to CSV
                 df_train = pd.DataFrame([train_dict])
-                
+
                 # [FORMAT-FIX] Ensure epoch is integer and consistent numbering
                 if "epoch" in df_train.columns:
                     df_train["epoch"] = df_train["epoch"].astype(int)
-                    
+
                 header = not os.path.exists(train_metrics_path)
                 df_train.to_csv(train_metrics_path, mode='a', header=header, index=False, float_format='%.5f')
             except Exception as e:
@@ -622,18 +764,22 @@ def train_observer_offline_iteration(
             val_result = trainer.validate_epoch(
                 data_tensors=valid_tensors,
                 compute_loss=True,
-                steps=max(1, batches_per_epoch // 4),
+                steps=2,  # Fixed 2 steps - đủ cover validation data, nhanh hơn ~2-3x
             )
 
             # 3. Track metrics and compute CES
             # Restrict "Best Model" updates to epochs with full penalty coefficients (lambda >= 1.0)
-            # Use small tolerance for float comparison
-            current_lambda = getattr(trainer, "_current_lambda_epoch", 1.0)
-            is_full_penalty = current_lambda >= 0.999
-            
+            # MACRO_ONLY: No curriculum learning, always allow best checkpoint updates
+            # SELECTION_ONLY: Use curriculum logic (block updates when lambda < 1.0)
+            if training_mode == MafiaTrainMode.MACRO_ONLY:
+                is_full_penalty = True  # Always allow updates in MACRO_ONLY
+            else:
+                current_lambda = getattr(trainer, "_current_lambda_epoch", 1.0)
+                is_full_penalty = current_lambda >= 0.999
+
             is_best = tracker.add_epoch(val_result, allow_best_update=is_full_penalty)
 
-            if verbose and not is_full_penalty:
+            if verbose and not is_full_penalty and training_mode == MafiaTrainMode.SELECTION_ONLY:
                 smart_print(f"      [INFO] Best Checkpoint update BLOCKED (Lambda {current_lambda:.3f} < 1.0)")
             
             # 4. Log to TensorBoard
@@ -645,7 +791,10 @@ def train_observer_offline_iteration(
                 writer.add_scalar("Valid/Metrics/Sharpe", val_result.topk_sharpe_ratio, epoch)
                 writer.add_scalar("Valid/Metrics/Dir_F1", val_result.direction_f1_macro, epoch)
                 writer.add_scalar("Valid/Metrics/Risk_MSE", val_result.risk_mse, epoch)
-                writer.add_scalar("Valid/Metrics/CES", val_result.ces_score, epoch)
+                writer.add_scalar("Valid/Metrics/Risk_Corr", val_result.risk_correlation, epoch)
+                writer.add_scalar("Valid/Metrics/Risk_Corr_Loss", 1.0 - val_result.risk_correlation, epoch)
+                writer.add_scalar("Valid/Config/Risk_Alpha", trainer.risk_corr_alpha, epoch)
+                writer.add_scalar("Valid/Metrics/PhaseScore", val_result.phase_score, epoch)
 
             # 5. Update Live Dashboard
             update_observer(
@@ -653,10 +802,10 @@ def train_observer_offline_iteration(
                 loss_eta=val_result.risk_mse,
                 loss_dir=val_result.loss_dir,
             )
-            
+
             update_walkforward_score(
-                current_score=val_result.ces_score,
-                best_score=tracker.best_ces,
+                current_score=val_result.phase_score,
+                best_score=tracker.best_score,
                 best_epoch=tracker.best_epoch if tracker.best_epoch is not None else epoch,
             )
 
@@ -676,7 +825,8 @@ def train_observer_offline_iteration(
             if verbose:
                 smart_print(f"      Running Visualization for Epoch {epoch}...")
             try:
-                generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val)
+                generate_epoch_report(tracker.output_dir, epoch, min_best_epoch=min_best_epoch_val,
+                                      training_mode=training_mode)
                 
                 # Log generated charts to TensorBoard
                 if trainer.tb_logger is not None and trainer.tb_logger.log_images:
@@ -691,12 +841,7 @@ def train_observer_offline_iteration(
                     loss_history_path = os.path.join(plots_dir, "loss_history.png")
                     if os.path.exists(loss_history_path):
                         trainer.tb_logger.log_image("charts/loss_history", loss_history_path, epoch, phase="valid")
-                    
-                    # Log dynamics chart
-                    dynamics_path = os.path.join(plots_dir, "dynamics_latest.png")
-                    if os.path.exists(dynamics_path):
-                        trainer.tb_logger.log_image("charts/dynamics", dynamics_path, epoch, phase="valid")
-                    
+
                     # Flush to ensure images are written
                     trainer.tb_logger.flush()
                     
@@ -712,15 +857,18 @@ def train_observer_offline_iteration(
     # Get best checkpoint info (Correctly filters for Full Penalty epochs via ValidationTracker)
     best_info = tracker.get_best_checkpoint_info()
     best_epoch = best_info["epoch"]
-    best_ces = best_info["ces_score"]
-    
+    best_score = best_info["phase_score"]
+
     if verbose:
-        smart_print(f"\n[OFFLINE] CES Selection for Iter {iteration}:")
+        score_name = "MACRO_SCORE" if training_mode == "MACRO_ONLY" else "Sharpe"
+        smart_print(f"\n[OFFLINE] Best Checkpoint Selection for Iter {iteration}:")
         smart_print(f"  Best Epoch: {best_epoch}")
-        smart_print(f"  Best CES: {best_ces:.4f}")
-        smart_print(f"  Sharpe: {best_info['sharpe_ratio']:.3f}")
-        smart_print(f"  Dir_F1: {best_info['direction_f1']:.3f}")
-        smart_print(f"  Risk_MSE: {best_info['risk_mse']:.4f}")
+        smart_print(f"  {score_name}: {best_score:.4f}")
+        if training_mode == "MACRO_ONLY":
+            smart_print(f"  Dir_F1: {best_info['direction_f1']:.3f}")
+            smart_print(f"  Risk_MSE: {best_info['risk_mse']:.4f}")
+        else:
+            smart_print(f"  Sharpe: {best_info['sharpe_ratio']:.3f}")
 
     # [LOG-FIX] Save Best Checkpoint Metrics to FILE
     # Find the full result object for the best epoch
@@ -750,10 +898,10 @@ def train_observer_offline_iteration(
     
     if os.path.exists(best_temp_path):
         trainer.observer.load_checkpoint(best_temp_path)
-        trainer.observer.save_checkpoint(final_ckpt_path, epoch=best_epoch, extra_data={"ces": best_ces})
+        trainer.observer.save_checkpoint(final_ckpt_path, epoch=best_epoch, extra_data={"phase_score": best_score})
     else:
         # Fallback: save current state if no best checkpoint found
-        trainer.observer.save_checkpoint(final_ckpt_path, epoch=num_epochs-1, extra_data={"ces": best_ces})
+        trainer.observer.save_checkpoint(final_ckpt_path, epoch=num_epochs-1, extra_data={"phase_score": best_score})
     
     # [PERSISTENCE-FIX] Do NOT delete temp checkpoints. User wants full history.
     # import shutil
@@ -771,7 +919,7 @@ def train_observer_offline_iteration(
 def run_offline_observer_training(
     start_year: int = 2015,
     first_infer_year: int = 2018,
-    last_infer_year: int = 2022,
+    last_infer_year: int = 2024,
     output_dir: str = "./observer_offline",
     num_epochs: Optional[int] = None,
     batches_per_epoch: Optional[int] = None,
@@ -782,13 +930,17 @@ def run_offline_observer_training(
     verbose: bool = True,
     max_iterations: Optional[int] = None,
     batch_size: Optional[int] = None,
+    mode: str = "FULL",  # ADDED
+    init_checkpoint: Optional[str] = None, # ADDED: Allow manual init checkpoint (e.g. for testing)
+    mps_batch_size: int = 64,  # ADDED: MPS-specific batch size limit
+    low_memory: bool = False,  # ADDED: Low memory mode for smaller Macs
 ) -> List[Dict]:
     """
     Run full walk-forward offline observer training.
 
     Per Spec §6 Training Duration:
     - Base training (iter 0): 50 epochs (default)
-    - Finetune (iter > 0): 20 epochs (default)
+    - Finetune (iter > 0): 5 epochs (default)
     - Steps per epoch: auto-computed as ceil((Len(Data) - T_m - h) / Batch_Size)
 
     Args:
@@ -833,16 +985,24 @@ def run_offline_observer_training(
         smart_print(f"  Output dir: {output_dir}")
         smart_print(f"{'#' * 70}\n")
 
-    # Create output directories
+    # Create output directories with phase-aware structure
     os.makedirs(output_dir, exist_ok=True)
-    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+
+    # Build phase-aware directories based on training mode
+    phase_subdir = get_phase_subdir(mode)
+    results_dir = os.path.join(output_dir, phase_subdir)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Checkpoints separated by phase (macro/selection)
+    ckpt_phase = "macro" if mode == "MACRO_ONLY" else "selection"
+    checkpoint_dir = os.path.join(output_dir, "checkpoints", ckpt_phase)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Load config and data
     # Pass create_dirs=False to prevent auto-creation of TD3 directories
     config = Config(create_dirs=False)
     config.seed = seed
-    config.res_root = output_dir  # For trajectory CSV output
+    config.res_root = results_dir  # Phase-aware results directory
     if traj_len:
         config.mafia_trajectory_length = traj_len
     if rebalance_interval is None:
@@ -851,16 +1011,34 @@ def run_offline_observer_training(
         config.mafia_batch_size = batch_size
         if verbose:
             smart_print(f"[CONFIG] Overriding batch size: {batch_size}")
-    
+
+    # [MPS-FIX] Set MPS batch size limit in config
+    config.mps_max_batch_size = mps_batch_size
+
+    # [CRITICAL-FIX] Set training mode BEFORE creating observer
+    # This ensures loss aggregation respects the mode (PG loss disabled in MACRO_ONLY, etc.)
+    # Bug: Previously config.mafia_train_mode stayed at default FULL, causing wrong loss calculation
+    config.mafia_train_mode = mode
+    if verbose:
+        smart_print(f"[CONFIG] Training mode set: {mode}")
+
+    # [MPS-FIX] Low memory mode for smaller Macs (8GB RAM)
+    if low_memory:
+        config.mafia_batch_size = 8
+        config.mafia_trajectory_length = 64
+        config.mps_max_batch_size = 8
+        if verbose:
+            smart_print("[CONFIG] Low memory mode ENABLED (batch=8, traj_len=64)")
+
     # Enable trajectory logging if requested
     if log_details:
         config.log_trajectory_details = True
         if verbose:
             smart_print("[CONFIG] Detailed trajectory logging ENABLED")
-            smart_print(f"  Output: {output_dir}/trajectory_details.csv\n")
+            smart_print(f"  Output: {results_dir}/trajectory_details.csv\n")
 
-    # Initialize TensorBoard Writer
-    log_dir = os.path.abspath(os.path.join(output_dir, "tb_logs"))
+    # Initialize TensorBoard Writer (inside phase results directory)
+    log_dir = os.path.abspath(os.path.join(results_dir, "tb_logs"))
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     global_step_counter = 0
@@ -963,7 +1141,7 @@ def run_offline_observer_training(
     
     # Import for Inference
     from utils.tradeEnv import StockPortfolioEnv
-    from scripts.generate_rl_states import RegimeShiftDetector
+    # NOTE: RegimeShiftDetector logic moved to observer_offline_trainer.generate_inference_state
 
     for sched in schedule:
         iteration = sched["iter_index"]
@@ -982,40 +1160,115 @@ def run_offline_observer_training(
             smart_print(f"{'=' * 70}")
             smart_print(f"  📚 Training Window (Expanding): {sched['train_label']}")
             smart_print(f"  ✅ Validation Period:           {sched['valid_label']}")
-            smart_print(f"  🎯 Inference Target (Live):     {sched['infer_year']} Q{sched['infer_quarter']}")
+            # YEARLY schedule - show year only
+            smart_print(f"  🎯 Inference Target (Live):     {sched['infer_year']} (Full Year)")
             smart_print(f"")
 
         # === RESUME / TRAIN LOGIC ===
         # NAMING CONVENTION FOR LIVE INFERENCE:
-        # The RL Agent needs to find the model for a specific period.
-        # We save it as: Observer_Infer_{InferYear}_Q{InferQuarter}.pth
+        # FULL: Observer_Infer_{year}_Q{q}.pth
+        # MACRO: Observer_Macro_{year}_Q{q}.pth
+        # SELECTION: Observer_Selection_{year}_Q{q}.pth
+        
+        ckpt_prefix = "Observer_Infer"
+        if mode == "MACRO_ONLY":
+            ckpt_prefix = "Observer_Macro"
+        elif mode == "SELECTION_ONLY":
+            ckpt_prefix = "Observer_Selection"
+            
         infer_year = sched["infer_year"]
-        infer_q = sched["infer_quarter"]
-        final_iter_ckpt = os.path.join(checkpoint_dir, f"Observer_Infer_{infer_year}_Q{infer_q}.pth")
+        # YEARLY schedule - checkpoint named by year only
+        final_iter_ckpt = os.path.join(checkpoint_dir, f"{ckpt_prefix}_{infer_year}.pth")
+        
+        # Logic for Phase 1B (Selection): Must load corresponding Macro Checkpoint as init
+        # AND chain trainable components from previous SELECTION iteration
+        iter_init_ckpt = init_checkpoint  # Use passed argument if provided
+        iter_prev_selection_ckpt = None  # Previous SELECTION checkpoint for trainable params
+
+        if mode == "SELECTION_ONLY":
+            # YEARLY schedule - checkpoint named by year only
+            macro_ckpt_name = f"Observer_Macro_{infer_year}.pth"
+            # Look in macro checkpoint directory (checkpoints/macro/), not selection
+            macro_checkpoint_dir = os.path.join(output_dir, "checkpoints", "macro")
+            macro_ckpt_path = os.path.join(macro_checkpoint_dir, macro_ckpt_name)
+
+            # [CRITICAL] MACRO checkpoint is REQUIRED for SELECTION_ONLY
+            if not os.path.exists(macro_ckpt_path):
+                raise FileNotFoundError(
+                    f"[CRITICAL] SELECTION_ONLY requires MACRO checkpoint at:\n"
+                    f"  {macro_ckpt_path}\n"
+                    f"Run MACRO_ONLY training first for year {infer_year}!"
+                )
+
+            if iter_init_ckpt is None:
+                iter_init_ckpt = macro_ckpt_path
+            smart_print(f"[CONFIG] Phase 1B: Found MACRO checkpoint: {macro_ckpt_name}")
+
+            # Find previous SELECTION checkpoint for trainable params (knowledge transfer)
+            if iteration > 0:
+                prev_infer_year = infer_year - 1
+                prev_selection_name = f"Observer_Selection_{prev_infer_year}.pth"
+                prev_selection_path = os.path.join(checkpoint_dir, prev_selection_name)
+
+                if os.path.exists(prev_selection_path):
+                    iter_prev_selection_ckpt = prev_selection_path
+                    smart_print(f"[CONFIG] Phase 1B: Found prev SELECTION checkpoint: {prev_selection_name}")
+                    smart_print(f"         Will merge: Frozen→MACRO_{infer_year}, Trainable→SELECTION_{prev_infer_year}")
+                else:
+                    smart_print(f"[WARN] Phase 1B: No prev SELECTION checkpoint found at {prev_selection_path}")
+                    smart_print(f"       Trainable params will be initialized from MACRO checkpoint.")
         
         # 1. Train if not already done
-        if os.path.exists(final_iter_ckpt):
-             smart_print(f"[RESUME] Found existing LIVE INFERENCE checkpoint: {final_iter_ckpt}")
+        # [FIX] Check both checkpoint exists AND training actually completed (all epochs trained)
+        valid_year = sched["valid_year"]
+        iter_output_dir = os.path.join(results_dir, f"iter_{iteration}_valid_{valid_year}")
+        train_csv_path = os.path.join(iter_output_dir, "train_metrics.csv")
+
+        training_complete = False
+        epochs_trained = 0
+        if os.path.exists(final_iter_ckpt) and os.path.exists(train_csv_path):
+            try:
+                df = pd.read_csv(train_csv_path)
+                epochs_trained = len(df)
+                if epochs_trained >= num_train_epochs:
+                    training_complete = True
+            except Exception as e:
+                smart_print(f"[WARN] Failed to read train_metrics.csv: {e}")
+
+        if training_complete:
+             smart_print(f"[RESUME] Found completed training ({epochs_trained}/{num_train_epochs} epochs)")
+             smart_print(f"         Checkpoint: {final_iter_ckpt}")
              smart_print(f"         Skipping training step.")
              prev_checkpoint = final_iter_ckpt
         else:
+             # Need to train: either no checkpoint or incomplete training
+             if os.path.exists(final_iter_ckpt):
+                 # Checkpoint exists but training incomplete - remove stale checkpoint
+                 smart_print(f"[RESUME] ⚠️ Incomplete training detected ({epochs_trained}/{num_train_epochs} epochs)")
+                 smart_print(f"         Removing stale checkpoint and retraining...")
+                 os.remove(final_iter_ckpt)
+
              # CALL TRAINER
              # Note: train_observer_offline_iteration saves its own "best" checkpoint internally to a temp name?
              # No, it returns a path to "observer_best_{valid_year}.pth" (or similar).
              # We need to Rename/Copy it to our Target Name.
-             
+
              best_ckpt_path = train_observer_offline_iteration(
                 config=config,
                 schedule_entry=sched,
                 trainer=trainer,
                 data_tensors=data_tensors,
                 checkpoint_dir=checkpoint_dir,
+                results_dir=results_dir,  # Phase-aware results directory
                 num_epochs=num_train_epochs,
                 batches_per_epoch=batches_per_epoch,
                 prev_checkpoint=prev_checkpoint,
                 writer=writer,
                 global_step_start=global_step_counter,
-                verbose=verbose
+                verbose=verbose,
+                training_mode=mode,
+                init_checkpoint=iter_init_ckpt,  # MACRO checkpoint (frozen params)
+                prev_selection_checkpoint=iter_prev_selection_ckpt,  # Prev SELECTION (trainable params)
              )
              
              # Rename/Copy to Final Inference Name
@@ -1027,6 +1280,19 @@ def run_offline_observer_training(
              else:
                  smart_print(f"[ERROR] Training failed to produce checkpoint.")
                  continue
+
+             # Record Result
+             results.append({
+                 "iteration": iteration,
+                 "valid_year": sched["valid_year"], # For record keeping
+                 "train_range": sched["train_label"],
+                 "final_checkpoint": final_iter_ckpt,
+                 "status": "success",
+                 # We can try to get metrics from trainer or reload them.
+                 # Ideally train_observer_offline_iteration returns metrics too?
+                 # For now, just mark success.
+                 "best_metrics": {} # detailed metrics loading requires parsing csv, omitted for now
+             })
 
              global_step_counter += (num_train_epochs * (batches_per_epoch or 10))
 
@@ -1060,24 +1326,27 @@ def run_offline_observer_training(
         smart_print(f"  Successful:        {successful}/{num_iterations}")
 
         # Best checkpoint info
-        best_ces = -1.0
+        best_phase_score = -1.0
         best_year = None
         best_metrics = {}
         for r in results:
             if r['status'] == 'success':
                 metrics = r.get('best_metrics', {})
-                ces = metrics.get('ces_score', 0.0)
-                if ces > best_ces:
-                    best_ces = ces
+                score = metrics.get('phase_score', 0.0)
+                if score > best_phase_score:
+                    best_phase_score = score
                     best_year = r.get('valid_year')
                     best_metrics = metrics
 
         if best_year:
+            score_name = "MACRO_SCORE" if mode == "MACRO_ONLY" else "Sharpe"
             smart_print(f"\n  🏆 Best Checkpoint: Ckpt_Best_{best_year}")
-            smart_print(f"     CES Score:      {best_ces:.4f}")
-            smart_print(f"     Sharpe Ratio:   {best_metrics.get('topk_sharpe_ratio', 0.0):.4f}")
-            smart_print(f"     Direction F1:   {best_metrics.get('direction_f1_macro', 0.0):.4f}")
-            smart_print(f"     Risk MSE:       {best_metrics.get('risk_mse', 0.0):.6f}")
+            smart_print(f"     {score_name}:    {best_phase_score:.4f}")
+            if mode == "MACRO_ONLY":
+                smart_print(f"     Direction F1:   {best_metrics.get('direction_f1_macro', 0.0):.4f}")
+                smart_print(f"     Risk MSE:       {best_metrics.get('risk_mse', 0.0):.6f}")
+            else:
+                smart_print(f"     Sharpe Ratio:   {best_metrics.get('topk_sharpe_ratio', 0.0):.4f}")
 
         smart_print(f"\n  📁 Summary saved to: {summary_file}")
         smart_print(f"  📌 Next Step: Run Stage 2 (TD3 Training) with frozen Observer")
@@ -1111,7 +1380,7 @@ def run_offline_observer_training(
 
                 iterations_summary.append({
                     "year": r.get("valid_year"),
-                    "ces": metrics.get("ces_score", 0.0),
+                    "phase_score": metrics.get("phase_score", 0.0),
                     "train_range": short_range,
                     "sharpe": metrics.get("topk_sharpe_ratio", 0.0),
                     "dir_f1": metrics.get("direction_f1_macro", 0.0),
@@ -1127,26 +1396,27 @@ def run_offline_observer_training(
                 # It is likely in os.path.dirname(checkpoint_path) if checkpoint_dir was passed.
                 # Let's verify existing file structure logic or just search.
                 
-                # Construct expected path
+                # Construct expected path (inside phase results directory)
                 iter_dir_name = f"iter_{r['iteration']}_valid_{r['valid_year']}"
-                possible_path = os.path.join(output_dir, iter_dir_name, "valid_metrics.csv")
+                possible_path = os.path.join(results_dir, iter_dir_name, "valid_metrics.csv")
                 if os.path.exists(possible_path):
                     last_valid_csv = possible_path
 
-        # 2. Trajectory CSV
-        traj_csv = os.path.join(output_dir, "trajectory_details.csv")
+        # 2. Trajectory CSV (inside phase results directory)
+        traj_csv = os.path.join(results_dir, "trajectory_details.csv")
         if not os.path.exists(traj_csv):
-            traj_csv = None # Passed as None if not found
-            
-        # 3. Generate Charts
+            traj_csv = None  # Passed as None if not found
+
+        # 3. Generate Charts (save in phase results directory)
         if last_valid_csv:
             create_all_charts(
                 valid_csv=last_valid_csv,
                 iterations_summary=iterations_summary,
                 trajectory_csv=traj_csv,
-                output_dir=output_dir # Save in root output dir
+                output_dir=results_dir,  # Save in phase results dir
+                training_mode=mode  # Pass training mode for phase label
             )
-            if verbose: smart_print(f"[CHARTS] Graphs saved to: {output_dir}")
+            if verbose: smart_print(f"[CHARTS] Graphs saved to: {results_dir}")
         else:
             if verbose: smart_print("[CHARTS] Warning: No valid_metrics.csv found, skipping chart generation.")
             
@@ -1172,9 +1442,10 @@ def main():
     parser.add_argument(
         "--first-infer-year",
         type=int,
-        default=2018,
-        help="First inference year (default: 2018)",
+        default=2020,
+        help="First inference/validation year (default: 2020, per training_strategy_proposal.md)",
     )
+
     parser.add_argument(
         "--last-infer-year",
         type=int,
@@ -1191,7 +1462,7 @@ def main():
         "--epochs",
         type=int,
         default=None,
-        help="Training epochs per iteration (default: None, use config: 50 for base, 20 for finetune)",
+        help="Training epochs per iteration (default: None, use config: 50 for base, 5 for finetune)",
     )
     parser.add_argument(
         "--batches",
@@ -1233,6 +1504,31 @@ def main():
         default=None,
         help="Override batch size (default: use config)",
     )
+    parser.add_argument(
+        "--mps-batch-size",
+        type=int,
+        default=64,
+        help="Max batch size for MPS (Apple Silicon) to prevent OOM (default: 64)",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Enable low memory mode: batch_size=8, traj_len=64 (for 8GB RAM Macs)",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="FULL",
+        choices=["FULL", "MACRO_ONLY", "SELECTION_ONLY"],
+        help="Training mode: FULL, MACRO_ONLY (Phase 1A), SELECTION_ONLY (Phase 1B)",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Path to initial checkpoint (required for SELECTION_ONLY to load Macro weights)",
+    )
 
     args = parser.parse_args()
 
@@ -1249,6 +1545,10 @@ def main():
         verbose=not args.quiet,
         max_iterations=args.max_iterations,
         batch_size=args.batch_size,
+        mode=args.mode,  # Pass parsed mode
+        init_checkpoint=args.init_checkpoint, # Pass init checkpoint
+        mps_batch_size=args.mps_batch_size,  # [MPS-FIX] MPS batch size limit
+        low_memory=args.low_memory,  # [MPS-FIX] Low memory mode
     )
 
     # Exit with error if any iteration failed
