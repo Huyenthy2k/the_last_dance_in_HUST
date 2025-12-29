@@ -41,82 +41,46 @@ def test_state_dimensions():
     print("EXPECTED STATE DIMENSIONS:")
     print("="*80)
     
-    if config.mafia_state_mode == 'compact':
-        # Compact mode: [market_vector(K), portfolio_value, (optional) risk_boundary]
-        k = config.mafia_top_k
-        risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
-        expected_state_dim = k + 1 + risk_dim
-        
-        print(f"\nCompact mode formula:")
-        print(f"  state_dim = K + 1 + risk_dim")
-        print(f"  state_dim = {k} + 1 + {risk_dim}")
-        print(f"  state_dim = {expected_state_dim}")
-        
-        print(f"\nState components:")
-        print(f"  1. market_vector(K):     {k} dims  <- Top-K from Observer")
-        print(f"  2. portfolio_value:      1 dim    <- log(current_capital / initial_capital)")
-        print(f"  3. risk_boundary:        {risk_dim} dim    <- boundary_risk from Observer")
-        print(f"  {'='*40}")
-        print(f"  Total:                   {expected_state_dim} dims")
-        
-    elif config.mafia_state_mode == 'full-score':
-        # Full-score mode: [market_scores_full(N), portfolio_value, (optional) risk_boundary]
-        risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
-        expected_state_dim = stock_num + 1 + risk_dim
-        
-        print(f"\nFull-score mode formula:")
-        print(f"  state_dim = N + 1 + risk_dim")
-        print(f"  state_dim = {stock_num} + 1 + {risk_dim}")
-        print(f"  state_dim = {expected_state_dim}")
-        
-        print(f"\nState components:")
-        print(f"  1. market_scores_full(N): {stock_num} dims  <- Full scores from Observer")
-        print(f"  2. portfolio_value:       1 dim     <- log(current_capital / initial_capital)")
-        print(f"  3. risk_boundary:         {risk_dim} dim     <- boundary_risk from Observer")
-        print(f"  {'='*40}")
-        print(f"  Total:                    {expected_state_dim} dims")
+    # Compact mode only (Top-K selection handled by Observer)
+    config.mafia_state_mode = 'compact'
+    k = config.mafia_top_k
+    risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
+    expected_state_dim = k + 1 + risk_dim
+    
+    print(f"\nCompact mode formula:")
+    print(f"  state_dim = K + 1 + risk_dim")
+    print(f"  state_dim = {k} + 1 + {risk_dim}")
+    print(f"  state_dim = {expected_state_dim}")
+    
+    print(f"\nState components:")
+    print(f"  1. market_vector(K):     {k} dims  <- Top-K from Observer")
+    print(f"  2. portfolio_value:      1 dim    <- log(current_capital / initial_capital)")
+    print(f"  3. risk_eta:             {risk_dim} dim    <- eta from Observer")
+    print(f"  {'='*40}")
+    print(f"  Total:                   {expected_state_dim} dims")
     
     # Compare with previous architecture
     print("\n" + "="*80)
     print("COMPARISON WITH PREVIOUS ARCHITECTURE:")
     print("="*80)
     
-    if config.mafia_state_mode == 'compact':
-        k = config.mafia_top_k
-        d_idx = getattr(config, "market_index_state_dim", 0)  # DEPRECATED
-        risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
-        previous_state_dim = k + d_idx + 1 + risk_dim
-        
-        print(f"\nPrevious architecture (with market_index_state):")
-        print(f"  state_dim = K + D_idx + 1 + risk_dim")
-        print(f"  state_dim = {k} + {d_idx} + 1 + {risk_dim}")
-        print(f"  state_dim = {previous_state_dim}")
-        
-        print(f"\nNew architecture (without market_index_state):")
-        print(f"  state_dim = K + 1 + risk_dim")
-        print(f"  state_dim = {k} + 1 + {risk_dim}")
-        print(f"  state_dim = {expected_state_dim}")
-        
-        print(f"\n✅ State dimension REDUCED by: {previous_state_dim - expected_state_dim} dims ({d_idx} market_index features removed)")
-        print(f"✅ Reduction percentage: {(previous_state_dim - expected_state_dim) / previous_state_dim * 100:.1f}%")
+    k = config.mafia_top_k
+    d_idx = getattr(config, "market_index_state_dim", 0)  # DEPRECATED
+    risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
+    previous_state_dim = k + d_idx + 1 + risk_dim
     
-    elif config.mafia_state_mode == 'full-score':
-        d_idx = getattr(config, "market_index_state_dim", 0)  # DEPRECATED
-        risk_dim = 1 if config.mafia_include_risk_boundary_in_state else 0
-        previous_state_dim = stock_num + d_idx + 1 + risk_dim
-        
-        print(f"\nPrevious architecture (with market_index_state):")
-        print(f"  state_dim = N + D_idx + 1 + risk_dim")
-        print(f"  state_dim = {stock_num} + {d_idx} + 1 + {risk_dim}")
-        print(f"  state_dim = {previous_state_dim}")
-        
-        print(f"\nNew architecture (without market_index_state):")
-        print(f"  state_dim = N + 1 + risk_dim")
-        print(f"  state_dim = {stock_num} + 1 + {risk_dim}")
-        print(f"  state_dim = {expected_state_dim}")
-        
-        print(f"\n✅ State dimension REDUCED by: {previous_state_dim - expected_state_dim} dims ({d_idx} market_index features removed)")
-        print(f"✅ Reduction percentage: {(previous_state_dim - expected_state_dim) / previous_state_dim * 100:.1f}%")
+    print(f"\nPrevious architecture (with market_index_state):")
+    print(f"  state_dim = K + D_idx + 1 + risk_dim")
+    print(f"  state_dim = {k} + {d_idx} + 1 + {risk_dim}")
+    print(f"  state_dim = {previous_state_dim}")
+    
+    print(f"\nNew architecture (Top-K only, no market_index_state):")
+    print(f"  state_dim = K + 1 + risk_dim")
+    print(f"  state_dim = {k} + 1 + {risk_dim}")
+    print(f"  state_dim = {expected_state_dim}")
+    
+    print(f"\n✅ State dimension REDUCED by: {previous_state_dim - expected_state_dim} dims ({d_idx} market_index features removed)")
+    print(f"✅ Reduction percentage: {(previous_state_dim - expected_state_dim) / previous_state_dim * 100:.1f}%")
     
     # Test with actual MAFIA Observer
     print("\n" + "="*80)
@@ -135,7 +99,7 @@ def test_state_dimensions():
     
     (
         market_vector,
-        boundary_risk,
+        risk_eta,
         market_scores_full,
         gate_weights,
         _market_context,
@@ -149,23 +113,20 @@ def test_state_dimensions():
     
     print(f"\n✅ MAFIA Observer.predict() successful")
     print(f"   - market_vector shape: {market_vector.shape}")
-    print(f"   - boundary_risk shape: {boundary_risk.shape}")
+    print(f"   - risk_eta shape: {risk_eta.shape}")
     print(f"   - market_scores_full shape: {market_scores_full.shape}")
     print(f"   - gate_weights shape: {gate_weights.shape}")
     
-    if config.mafia_state_mode == 'compact':
-        mv = market_vector[0]
-        k = min(config.mafia_top_k, len(mv))
-        topk_idx = np.argpartition(mv, -k)[-k:]
-        topk_sorted = topk_idx[np.argsort(mv[topk_idx])[::-1]]
-        market_vector_state = mv[topk_sorted].astype(np.float32)
-    else:
-        market_vector_state = market_scores_full[0]
+    mv = market_vector[0]
+    k = min(config.mafia_top_k, len(mv))
+    topk_idx = np.argpartition(mv, -k)[-k:]
+    topk_sorted = topk_idx[np.argsort(mv[topk_idx])[::-1]]
+    market_vector_state = mv[topk_sorted].astype(np.float32)
     
     pv = np.array([0.0], dtype=np.float32)
     state_parts = [market_vector_state, pv]
     if config.mafia_include_risk_boundary_in_state:
-        state_parts.append(boundary_risk)
+        state_parts.append(risk_eta)
     
     state = np.concatenate(state_parts, axis=0).astype(np.float32)
     

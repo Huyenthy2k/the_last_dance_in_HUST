@@ -30,6 +30,11 @@ def _build_mafia_observer(action_dim: int = 10):
     config = Config(seed_num=2022, current_date=current_date)
     config.benchmark_algo = "MASA-mafia"
     config.enable_market_observer = True
+    # Eta scaling defaults for observer output
+    config.mafia_eta_base = 1.0
+    config.mafia_eta_amplitude = 0.3
+    config.mafia_eta_min = 0.7
+    config.mafia_eta_max = 1.3
     # Re-init to apply settings to paths
     config.__init__(seed_num=2022, current_date=current_date)
     config.benchmark_algo = "MASA-mafia"
@@ -62,25 +67,24 @@ def test_mafia_observer_predict():
 
     (
         market_vector,
-        boundary_risk,
+        risk_eta,
         _market_scores_full,
-        _gate_weights,
         _market_context,
-        _stock_embedding,
-        sigma_val,
-        sigma_log_p,
+        direction_logits,
+        _topk_indices,
+        _topk_embeddings,
+        _topk_scores,
     ) = observer.predict(raw_ochlv_data=raw_ochlv_data, mode="test")
 
     assert market_vector.shape == (1, N)
-    assert boundary_risk.shape == (1,)
-    assert sigma_val.shape[0] == 1
-    assert sigma_log_p.shape[1] == 3
-    assert (boundary_risk > 0).all()
+    assert risk_eta.shape == (1,)
+    assert direction_logits.shape[1] == 3
+    assert (risk_eta > 0).all()
 
     print(f"✓ market_vector shape: {market_vector.shape}")
-    print(f"✓ boundary_risk shape: {boundary_risk.shape}")
+    print(f"✓ risk_eta shape: {risk_eta.shape}")
     print(f"✓ market_vector range: [{market_vector.min():.4f}, {market_vector.max():.4f}]")
-    print(f"✓ boundary_risk value: {boundary_risk[0]:.4f}")
+    print(f"✓ risk_eta value: {risk_eta[0]:.4f}")
     print("✓ MAFIAObserver predict: PASSED\n")
 
 
@@ -138,19 +142,19 @@ def test_mafia_with_real_data():
 
         (
             market_vector,
-            boundary_risk,
+            risk_eta,
             _market_scores_full,
-            _gate_weights,
             _market_context,
-            _stock_embedding,
-            _sigma_val,
-            _sigma_log_p,
+            _topk_indices,
+            _topk_embeddings,
+            _topk_scores,
+            _direction_logits,
         ) = observer.predict(raw_ochlv_data=ochlv_array, mode="test")
 
         assert market_vector.shape[1] == N, f"market_vector size mismatch: {market_vector.shape[1]} != {N}"
-        assert boundary_risk.shape[0] == 1
-        assert (boundary_risk > 0).all()
-        print(f"  ✓ {date}: market_vector shape {market_vector.shape}, boundary_risk={boundary_risk[0]:.4f}")
+        assert risk_eta.shape[0] == 1
+        assert (risk_eta > 0).all()
+        print(f"  ✓ {date}: market_vector shape {market_vector.shape}, risk_eta={risk_eta[0]:.4f}")
 
     print("✓ MAFIA with real data: PASSED\n")
 

@@ -20,7 +20,7 @@ from RL_controller.mafia_feature_processor import MAFIAFeatureProcessor
 from RL_controller.mafia_modules import (
     CSAModule, TAModule, STFusionModule, DenseMoESignalGenerator, MAFIAModel,
     PositionalEncoding, EventDetector,
-    AttentionBasedTemporalEncoder, TemporalConvolutionEncoder, BidirectionalLSTMEncoder
+    AttentionBasedTemporalEncoder, TemporalConvolutionEncoder, UnidirectionalLSTMEncoder
 )
 
 
@@ -48,6 +48,11 @@ class MockConfig:
         self.mafia_gating_dropout = 0.1
         self.mafia_gating_lstm_layers = 2
         self.mafia_gating_conv_kernels = [3, 5, 7]
+        # Eta scaling defaults
+        self.mafia_eta_base = 1.0
+        self.mafia_eta_amplitude = 0.3
+        self.mafia_eta_min = 0.7
+        self.mafia_eta_max = 1.3
 
 
 def test_feature_processor_technical():
@@ -223,8 +228,9 @@ def test_signal_generator():
     O_mkt_TA = th.randn(batch_size, T_w, D).to(device)
     
     # Forward pass
-    market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding, sigma_logits = signal_gen(
-        expert_outputs, expert_ta_outputs, O_mkt_TA, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)]
+    explicit_signals = th.randn(batch_size, 4).to(device) # Assuming 4 experts for now
+    market_vector, risk_eta, market_scores_full, sigma_logits, market_context, topk_indices, topk_embeddings, topk_scores = signal_gen(
+        expert_outputs, expert_ta_outputs, x_mkt_seq=O_mkt_TA, O_mkt_TA=None, expert_st_embeddings=[th.randn(batch_size, N, D).to(device) for _ in range(4)], explicit_signals=explicit_signals
     )
     
     # Assertions
@@ -233,34 +239,26 @@ def test_signal_generator():
     
     assert market_vector.shape == (batch_size, N), \
         f"Expected market_vector shape ({batch_size}, {N}), got {market_vector.shape}"
-    assert boundary_risk.shape == (batch_size,), \
-        f"Expected boundary_risk shape ({batch_size},), got {boundary_risk.shape}"
-    assert (boundary_risk > 0).all(), "boundary_risk should be positive (Softplus ensures this)"
+    assert risk_eta.shape == (batch_size,), \
+        f"Expected risk_eta shape ({batch_size},), got {risk_eta.shape}"
+    assert (risk_eta > 0).all(), "risk_eta should be positive"
     
     assert market_scores_full.shape == (batch_size, N), \
         f"Expected market_scores_full shape ({batch_size}, {N}), got {market_scores_full.shape}"
     
-    # New: Test gate_weights
-    assert gate_weights.shape == (batch_size, 4), \
-        f"Expected gate_weights shape ({batch_size}, 4), got {gate_weights.shape}"
-    assert th.allclose(gate_weights.sum(dim=-1), th.ones(batch_size)), \
-        "Gate weights should sum to 1 (softmax output)"
-    assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
-        "Gate weights should be in [0, 1]"
+    # New: Test topk_scores
+    assert topk_scores.shape == (batch_size, config.mafia_top_k), \
+        f"Expected topk_scores shape ({batch_size}, {config.mafia_top_k}), got {topk_scores.shape}"
     
     print(f"✓ market_vector shape: {market_vector.shape}")
-    print(f"✓ boundary_risk shape: {boundary_risk.shape}")
-    print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
-    print(f"✓ gate_weights shape: {gate_weights.shape}")
+    print(f"✓ risk_eta shape: {risk_eta.shape}")
+    print(f"✓ risk_eta range: [{risk_eta.min():.4f}, {risk_eta.max():.4f}]")
     print(f"✓ market_context shape: {market_context.shape}")
-    if fused_stock_embedding is not None:
-        assert fused_stock_embedding.shape == (batch_size, N, D), \
-            f"Expected fused stock embedding shape ({batch_size}, {N}, {D}), got {fused_stock_embedding.shape}"
-        print(f"✓ fused_stock_embedding shape: {fused_stock_embedding.shape}")
     assert sigma_logits.shape == (batch_size, 3), \
         f"Expected sigma_logits shape ({batch_size}, 3), got {sigma_logits.shape}"
-    print(f"✓ gate_weights sum: {gate_weights.sum(dim=-1).item():.4f}")
-    print(f"✓ gate_weights values: {gate_weights[0].tolist()}")
+    if topk_embeddings is not None:
+        assert topk_embeddings.shape[1] == config.mafia_top_k
+    print(f"✓ topk_scores: {topk_scores[0].tolist()}")
     print("✓ Dense MoE Signal Generator: PASSED\n")
 
 
@@ -282,42 +280,39 @@ def test_mafia_model():
     market_index_ochlv_data = th.randn(batch_size, 1, M, T_w).to(device) * 50 + 1000  # VNINDEX prices
     
     with th.no_grad():
-        market_vector, boundary_risk, topk_indices, market_scores_full, gate_weights, market_context, fused_stock_embedding, sigma_logits = mafia_model(
-            ochlv_data, market_index_ochlv_data=market_index_ochlv_data
+        market_vector, risk_eta, market_scores_full, sigma_logits, market_context, topk_indices, topk_embeddings, topk_scores = mafia_model(
+            ochlv_data, market_index_ochlv_data=market_index_ochlv_data, explicit_signals=th.randn(batch_size, 4).to(device)
         )
     
     # Original assertions
     assert market_vector.shape == (batch_size, N), \
         f"Expected market_vector shape ({batch_size}, {N}), got {market_vector.shape}"
-    assert boundary_risk.shape == (batch_size,), \
-        f"Expected boundary_risk shape ({batch_size},), got {boundary_risk.shape}"
-    assert (boundary_risk > 0).all(), "boundary_risk should be positive"
+    assert risk_eta.shape == (batch_size,), \
+        f"Expected risk_eta shape ({batch_size},), got {risk_eta.shape}"
+    assert (risk_eta > 0).all(), "risk_eta should be positive"
     assert topk_indices.shape == (batch_size, config.mafia_top_k), \
         f"Expected topk_indices shape ({batch_size}, {config.mafia_top_k}), got {topk_indices.shape}"
     
     # New assertions for Dense MoE
     assert market_scores_full.shape == (batch_size, N), \
         f"Expected market_scores_full shape ({batch_size}, {N}), got {market_scores_full.shape}"
-    assert gate_weights.shape == (batch_size, 4), \
-        f"Expected gate_weights shape ({batch_size}, 4), got {gate_weights.shape}"
     assert market_context.shape == (batch_size, config.mafia_D), \
         f"Expected market_context shape ({batch_size}, {config.mafia_D}), got {market_context.shape}"
-    assert fused_stock_embedding.shape == (batch_size, N, config.mafia_D), \
-        f"Expected fused_stock_embedding shape ({batch_size}, {N}, {config.mafia_D}), got {fused_stock_embedding.shape}"
-    assert th.allclose(gate_weights.sum(dim=-1), th.ones(batch_size)), \
-        "Gate weights should sum to 1"
-    assert (gate_weights >= 0).all() and (gate_weights <= 1).all(), \
-        "Gate weights should be in [0, 1]"
+    assert topk_embeddings is None or topk_embeddings.shape[1] == config.mafia_top_k
+    assert topk_scores is None or topk_scores.shape[1] == config.mafia_top_k
     assert sigma_logits.shape == (batch_size, 3), \
         f"Expected sigma_logits shape ({batch_size}, 3), got {sigma_logits.shape}"
+    if topk_embeddings is not None:
+        assert topk_embeddings.shape[1] == config.mafia_top_k
     
     print(f"✓ market_vector shape: {market_vector.shape}")
-    print(f"✓ boundary_risk shape: {boundary_risk.shape}")
+    print(f"✓ risk_eta shape: {risk_eta.shape}")
     print(f"✓ market_vector range: [{market_vector.min():.4f}, {market_vector.max():.4f}]")
-    print(f"✓ boundary_risk range: [{boundary_risk.min():.4f}, {boundary_risk.max():.4f}]")
-    print(f"✓ gate_weights: {gate_weights[0].tolist()}")
+    print(f"✓ risk_eta range: [{risk_eta.min():.4f}, {risk_eta.max():.4f}]")
+    print(f"✓ topk_scores: {topk_scores[0].tolist()}")
     print(f"✓ market_context shape: {market_context.shape}")
-    print(f"✓ fused_stock_embedding shape: {fused_stock_embedding.shape}")
+    if topk_embeddings is not None:
+        print(f"✓ topk_embeddings shape: {topk_embeddings.shape}")
     print("✓ MAFIA Model with Dense MoE: PASSED\n")
 
 
@@ -333,7 +328,7 @@ def test_temporal_encoders():
     encoder_types = [
         ('attention_based_aggregation', AttentionBasedTemporalEncoder),
         ('temporal_convolution', TemporalConvolutionEncoder),
-        ('bidirectional_lstm', BidirectionalLSTMEncoder)
+        ('lstm', UnidirectionalLSTMEncoder)
     ]
     
     for encoder_name, EncoderClass in encoder_types:
@@ -356,6 +351,47 @@ def test_temporal_encoders():
     print("✓ All Temporal Encoders: PASSED\n")
 
 
+def test_stateful_lstm_encoder_continuity():
+    """Spec 3.6.2: LSTM encoder should carry and reset hidden state cleanly."""
+    config = MockConfig()
+    encoder = UnidirectionalLSTMEncoder(config)
+
+    batch_size, T_w, D = 1, 8, config.mafia_D
+    # First pass seeds cached state (detach from graph)
+    O_mkt_TA = th.randn(batch_size, T_w, D, requires_grad=True)
+    assert encoder._cached_state is None
+    _ctx1, _ = encoder(O_mkt_TA)
+    assert encoder._cached_state is not None
+    h1, c1 = encoder._cached_state
+    assert h1.requires_grad is False and c1.requires_grad is False
+
+    # Detach API should keep state but truncate graph
+    encoder.detach_state()
+    h1_det, c1_det = encoder._cached_state
+    assert h1_det.requires_grad is False and c1_det.requires_grad is False
+    assert th.allclose(h1, h1_det) and th.allclose(c1, c1_det)
+
+    # Cached state should be reusable for the next timestep (continuous propagation)
+    prepared_state = encoder._prepare_state(batch_size, O_mkt_TA.device)
+    assert prepared_state is not None
+    h1_clone = h1.clone()
+    O_mkt_TA_2 = th.randn(batch_size, T_w, D, requires_grad=True)
+    _ctx2, _ = encoder(O_mkt_TA_2)
+    h2, c2 = encoder._cached_state
+    assert encoder._cached_state is not None
+    # New state should reflect latest input (not identical to previous cached state)
+    assert not th.equal(h1_clone, h2) or not th.equal(c1, c2)
+
+    # Reset should drop cached state (episode boundary)
+    encoder.reset_state(batch_size=batch_size, device=O_mkt_TA.device)
+    assert encoder._cached_state is not None  # materialized zero state
+    h0, c0 = encoder._cached_state
+    assert th.count_nonzero(h0).item() == 0 and th.count_nonzero(c0).item() == 0
+    encoder.reset_state()  # defer zero-init to next forward
+    assert encoder._cached_state is None
+    print("✓ Stateful LSTM encoder propagates/clears state per Spec 3.6.2\n")
+
+
 def run_all_tests():
     """Run all unit tests."""
     print("=" * 60)
@@ -369,6 +405,7 @@ def run_all_tests():
         test_ta_module()
         test_st_fusion()
         test_temporal_encoders()
+        test_stateful_lstm_encoder_continuity()
         test_signal_generator()
         test_mafia_model()
         

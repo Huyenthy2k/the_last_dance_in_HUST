@@ -20,7 +20,10 @@ try:
     import numpy as np
     import pandas as pd
     import torch as th
-    import gym
+    try:
+        import gymnasium as gym
+    except ImportError:
+        import gym
     import stable_baselines3
     import cvxopt
     import cvxpy

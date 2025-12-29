@@ -5,6 +5,7 @@ Utilities for tracking run/checkpoint metadata outside TensorBoard.
 Creates and maintains a manifest JSON per run so resume/metrics status
 can be inspected even when training restarts multiple times.
 """
+
 import json
 import os
 import time
@@ -42,7 +43,9 @@ def _save_manifest(manifest_path: str, manifest: Dict) -> None:
     os.replace(tmp_path, manifest_path)
 
 
-def ensure_manifest(manifest_path: str, run_id: Optional[str], total_epochs: Optional[int]) -> Dict:
+def ensure_manifest(
+    manifest_path: str, run_id: Optional[str], total_epochs: Optional[int]
+) -> Dict:
     """
     Ensure a manifest file exists and basic keys are populated.
     Returns the manifest dictionary (freshly written if needed).
@@ -73,7 +76,12 @@ def _trim_list(items: List[Dict]) -> List[Dict]:
     return items[-MAX_HISTORY:]
 
 
-def record_resume_event(manifest_path: str, checkpoint_info_path: str, checkpoint_info: Dict, reason: str = "auto") -> None:
+def record_resume_event(
+    manifest_path: str,
+    checkpoint_info_path: str,
+    checkpoint_info: Dict,
+    reason: str = "auto",
+) -> None:
     if not manifest_path:
         return
     manifest = ensure_manifest(
@@ -95,7 +103,9 @@ def record_resume_event(manifest_path: str, checkpoint_info_path: str, checkpoin
     _save_manifest(manifest_path, manifest)
 
 
-def record_checkpoint_save(manifest_path: str, checkpoint_name: str, checkpoint_info: Dict) -> None:
+def record_checkpoint_save(
+    manifest_path: str, checkpoint_name: str, checkpoint_info: Dict
+) -> None:
     if not manifest_path:
         return
     manifest = ensure_manifest(
@@ -115,7 +125,9 @@ def record_checkpoint_save(manifest_path: str, checkpoint_name: str, checkpoint_
     manifest["checkpoint_history"] = _trim_list(manifest["checkpoint_history"])
     epoch_val = checkpoint_info.get("epoch")
     if isinstance(epoch_val, int):
-        manifest["completed_epochs"] = max(manifest.get("completed_epochs", 0), epoch_val)
+        manifest["completed_epochs"] = max(
+            manifest.get("completed_epochs", 0), epoch_val
+        )
     _save_manifest(manifest_path, manifest)
 
 
@@ -141,27 +153,48 @@ def record_metrics_update(manifest_path: str, epoch: int, phases: List[str]) -> 
     _save_manifest(manifest_path, manifest)
 
 
-def print_manifest_summary(manifest_path: str, heading: Optional[str] = None) -> None:
+def print_manifest_summary(
+    manifest_path: str, heading: Optional[str] = None, quiet: bool = False
+) -> None:
+    """Print manifest summary. If quiet=True, skip printing."""
+    # Check env var for quiet mode
+    import os
+
+    if quiet or os.environ.get("MAFIA_NO_LIVE_DISPLAY", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
     if not manifest_path:
         return
     manifest = _load_manifest(manifest_path)
     if manifest is None:
         return
     if heading:
-        print(f"\n{'='*100}", flush=True)
+        print(f"\n{'=' * 100}", flush=True)
         print(f"{heading:^100}", flush=True)
-        print(f"{'='*100}", flush=True)
+        print(f"{'=' * 100}", flush=True)
     run_id = manifest.get("run_id", os.path.basename(os.path.dirname(manifest_path)))
     total_epochs = manifest.get("total_epochs", "?")
     completed = manifest.get("completed_epochs", 0)
     last_metrics = manifest.get("last_metrics_epoch")
     last_checkpoint = manifest.get("last_checkpoint")
     last_resume = manifest.get("last_resume")
-    print(f"[RUN] ID: {run_id} | Total epochs: {total_epochs} | Completed: {completed}", flush=True)
+    print(
+        f"[RUN] ID: {run_id} | Total epochs: {total_epochs} | Completed: {completed}",
+        flush=True,
+    )
     if last_metrics is not None:
         print(f"[RUN] Last metrics epoch: {last_metrics}", flush=True)
     if last_checkpoint:
-        print(f"[RUN] Last checkpoint: {last_checkpoint.get('name')} (epoch {last_checkpoint.get('epoch')}, type={last_checkpoint.get('type')})", flush=True)
+        print(
+            f"[RUN] Last checkpoint: {last_checkpoint.get('name')} (epoch {last_checkpoint.get('epoch')}, type={last_checkpoint.get('type')})",
+            flush=True,
+        )
     if last_resume:
-        print(f"[RUN] Last resume: epoch {last_resume.get('epoch')} via {last_resume.get('checkpoint_type')} ({last_resume.get('reason')})", flush=True)
-    print(f"{'-'*100}", flush=True)
+        print(
+            f"[RUN] Last resume: epoch {last_resume.get('epoch')} via {last_resume.get('checkpoint_type')} ({last_resume.get('reason')})",
+            flush=True,
+        )
+    print(f"{'-' * 100}", flush=True)

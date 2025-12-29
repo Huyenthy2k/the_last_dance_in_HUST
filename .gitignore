@@ -217,6 +217,13 @@ __marimo__/
 
 venv_vnstock/
 # Data directories
-MAFIA/data/
 MAFIA/res/
 MAFIA/tb_logs/
+MAFIA/data/
+MAFIA/observer_offline_4/
+MAFIA/observer_online_3/
+MAFIA/observer_offline_2/
+MAFIA/observer_online/
+MAFIA/observer_offline_5/
+MAFIA/tests/
+MAFIA/test/

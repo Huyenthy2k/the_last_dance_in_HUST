@@ -1,0 +1,523 @@
+/*
+ * MAFIA Training Dashboard Styles
+ * Dark theme matching terminal LiveDisplay aesthetic
+ */
+
+:root {
+    --bg-dark: #1a1a2e;
+    --bg-section: #16213e;
+    --bg-hover: #1f2940;
+    --border: #0f3460;
+    --border-light: #2a4a7a;
+    --text: #e8e8e8;
+    --text-dim: #6a7a8a;
+    --green: #00ff88;
+    --green-dim: #00aa5a;
+    --red: #ff4444;
+    --red-dim: #aa3333;
+    --yellow: #ffcc00;
+    --yellow-dim: #aa8800;
+    --cyan: #00ccff;
+    --magenta: #ff66cc;
+    --blue: #4488ff;
+    --orange: #ff8844;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', monospace;
+    font-size: 13px;
+    background: var(--bg-dark);
+    color: var(--text);
+    line-height: 1.4;
+    min-height: 100vh;
+}
+
+#dashboard {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 10px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   HEADER
+   ═══════════════════════════════════════════════════════════════ */
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: linear-gradient(135deg, var(--magenta), var(--blue));
+    padding: 12px 20px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+header .title {
+    font-size: 16px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+header .meta {
+    font-size: 11px;
+    opacity: 0.9;
+}
+
+header .meta span {
+    margin-left: 15px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SECTIONS
+   ═══════════════════════════════════════════════════════════════ */
+section {
+    background: var(--bg-section);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 15px;
+    margin-bottom: 8px;
+    transition: border-color 0.2s;
+}
+
+section:hover {
+    border-color: var(--border-light);
+}
+
+section h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--cyan);
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TWO COLUMN LAYOUT
+   ═══════════════════════════════════════════════════════════════ */
+.two-column {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+@media (max-width: 768px) {
+    .two-column {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   METRIC ROWS
+   ═══════════════════════════════════════════════════════════════ */
+.metric-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.metric-row span {
+    white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   UTILITY CLASSES
+   ═══════════════════════════════════════════════════════════════ */
+.hidden {
+    display: none !important;
+}
+
+.badge {
+    font-size: 10px;
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 8px;
+    text-transform: uppercase;
+}
+
+.split-row {
+    gap: 20px;
+}
+
+.progress-row, .timing-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PROGRESS BAR
+   ═══════════════════════════════════════════════════════════════ */
+.progress-bar-container {
+    background: #0a0a1a;
+    height: 18px;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0;
+    border: 1px solid var(--border);
+}
+
+.progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--green), var(--cyan));
+    transition: width 0.3s ease;
+    box-shadow: 0 0 10px rgba(0, 255, 136, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STATUS BADGES
+   ═══════════════════════════════════════════════════════════════ */
+.status-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.status-badge.training {
+    background: var(--green);
+    color: #000;
+    animation: pulse-green 2s infinite;
+}
+
+.status-badge.frozen {
+    background: var(--cyan);
+    color: #000;
+}
+
+.status-badge.enabled {
+    background: var(--yellow);
+    color: #000;
+}
+
+.status-badge.warmup {
+    background: var(--orange);
+    color: #000;
+    animation: pulse-orange 1s infinite;
+}
+
+@keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(0, 255, 136, 0); }
+}
+
+@keyframes pulse-orange {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 136, 68, 0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(255, 136, 68, 0); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   COLORS
+   ═══════════════════════════════════════════════════════════════ */
+.green { color: var(--green); }
+.red { color: var(--red); }
+.yellow { color: var(--yellow); }
+.cyan { color: var(--cyan); }
+.magenta { color: var(--magenta); }
+.blue { color: var(--blue); }
+.orange { color: var(--orange); }
+.dim { color: var(--text-dim); }
+
+.bull { color: var(--green); font-weight: 600; }
+.bear { color: var(--red); font-weight: 600; }
+.flat { color: var(--yellow); font-weight: 600; }
+
+/* Positive/negative values */
+.positive { color: var(--green); }
+.negative { color: var(--red); }
+
+/* ═══════════════════════════════════════════════════════════════
+   PIPELINE SECTION (2-Phase Overview)
+   ═══════════════════════════════════════════════════════════════ */
+#pipeline-section {
+    padding: 12px 15px;
+}
+
+.pipeline-phases {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.phase-indicator {
+    flex: 1;
+    max-width: 300px;
+    padding: 10px 15px;
+    border-radius: 6px;
+    border: 2px solid var(--border);
+    background: var(--bg-dark);
+    transition: all 0.3s ease;
+}
+
+.phase-indicator.active {
+    border-color: var(--green);
+    background: rgba(0, 255, 136, 0.1);
+    box-shadow: 0 0 15px rgba(0, 255, 136, 0.2);
+}
+
+.phase-indicator.pending {
+    border-color: var(--text-dim);
+    opacity: 0.6;
+}
+
+.phase-indicator.completed {
+    border-color: var(--cyan);
+    background: rgba(0, 204, 255, 0.05);
+}
+
+.phase-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.phase-icon {
+    font-size: 18px;
+}
+
+.phase-name {
+    font-weight: 700;
+    font-size: 13px;
+}
+
+.phase-status {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-left: auto;
+}
+
+.phase-status.active {
+    background: var(--green);
+    color: #000;
+    animation: pulse-green 2s infinite;
+}
+
+.phase-status.pending {
+    background: var(--text-dim);
+    color: #000;
+}
+
+.phase-status.completed {
+    background: var(--cyan);
+    color: #000;
+}
+
+.phase-desc {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 2px;
+}
+
+.phase-detail {
+    font-size: 10px;
+    color: var(--text-dim);
+    opacity: 0.8;
+}
+
+.phase-arrow {
+    font-size: 20px;
+    color: var(--text-dim);
+    font-weight: bold;
+}
+
+.status {
+    text-align: center;
+    font-size: 12px;
+    color: var(--text);
+    padding: 6px;
+    background: var(--bg-dark);
+    border-radius: 4px;
+    border: 1px solid var(--border);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SECTION STATES (Pending/Completed)
+   ═══════════════════════════════════════════════════════════════ */
+.section-pending {
+    opacity: 0.5;
+    border-style: dashed;
+}
+
+.section-pending h3 {
+    color: var(--text-dim);
+}
+
+.section-completed {
+    border-color: var(--cyan);
+    border-left: 3px solid var(--cyan);
+}
+
+.pending-info {
+    color: var(--yellow);
+    font-style: italic;
+}
+
+.completed-info {
+    color: var(--cyan);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STATUS BADGE - Pending & Completed
+   ═══════════════════════════════════════════════════════════════ */
+.status-badge.pending {
+    background: var(--text-dim);
+    color: #000;
+}
+
+.status-badge.completed {
+    background: var(--cyan);
+    color: #000;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EVENT LOG
+   ═══════════════════════════════════════════════════════════════ */
+#event-log {
+    font-size: 11px;
+    max-height: 200px;  /* Increased to show 20 events */
+    overflow-y: auto;
+    background: #0a0a1a;
+    border-radius: 4px;
+    padding: 5px 10px;
+}
+
+#event-log div {
+    padding: 3px 0;
+    border-bottom: 1px solid #1a1a2e;
+}
+
+#event-log div:last-child {
+    border-bottom: none;
+}
+
+#event-log .event-regime { color: var(--orange); }
+#event-log .event-rebalance { color: var(--cyan); }
+#event-log .event-checkpoint { color: var(--yellow); }
+#event-log .event-error { color: var(--red); }
+
+/* ═══════════════════════════════════════════════════════════════
+   CONNECTION STATUS
+   ═══════════════════════════════════════════════════════════════ */
+#connection-status {
+    position: fixed;
+    bottom: 10px;
+    right: 10px;
+    background: var(--bg-section);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 1000;
+}
+
+#connection-indicator {
+    font-size: 8px;
+}
+
+#connection-indicator.connected {
+    color: var(--green);
+    animation: blink 1s infinite;
+}
+
+#connection-indicator.disconnected {
+    color: var(--red);
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+#last-update {
+    color: var(--text-dim);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCROLLBAR
+   ═══════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-dark);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--border-light);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   WARMUP PROGRESS BAR
+   ═══════════════════════════════════════════════════════════════ */
+.warmup-bar-container {
+    background: #0a0a1a;
+    height: 14px;
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 5px 0;
+    border: 1px solid var(--border);
+    width: 200px;
+    display: inline-block;
+}
+
+.warmup-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--orange), var(--yellow));
+    transition: width 0.3s ease;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════════════════════════ */
+@media (max-width: 600px) {
+    body {
+        font-size: 12px;
+    }
+
+    header .title {
+        font-size: 14px;
+    }
+
+    #dashboard {
+        padding: 5px;
+    }
+
+    section {
+        padding: 8px 10px;
+    }
+
+    .metric-row {
+        gap: 10px;
+    }
+}
