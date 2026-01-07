@@ -190,7 +190,8 @@ def run_training_cycle(args):
             train_res = trainer.train_epoch(
                 data_tensors=train_tensors,
                 verbose=True,
-                limit_batches=limit_batches
+                limit_batches=limit_batches,
+                epoch=epoch,  # Sync epoch display
             )
             
             # Valid

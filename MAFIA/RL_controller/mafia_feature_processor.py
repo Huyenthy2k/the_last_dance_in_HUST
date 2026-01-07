@@ -15,7 +15,7 @@ See: Đặc Tả Kỹ Thuật (Technical Specification) - MAFIA.md
 import numpy as np
 import pandas as pd
 import torch as th
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 
 # Try to import talib for technical indicators
 try:
@@ -361,20 +361,18 @@ class MAFIAFeatureProcessor:
         # Get cached ATR for all stocks (computed once, used by both tech and DC features)
         atr_all = self._get_cached_atr(high_prices, low_prices, close_prices, period=14)
 
-        # Compute technical indicators for each asset
-        for n in range(N):
-            # SMA(20) -> (Close - SMA) / Close (Scale invariant distance)
-            sma_20 = self._compute_sma(close_prices[n, :], window=20)
-            # Avoid div by zero
-            safe_close = np.where(close_prices[n, :] == 0, 1.0, close_prices[n, :])
-            P_Tech[n, :, 5] = (close_prices[n, :] - sma_20) / safe_close
+        # [PERF-FIX] Vectorized computation for all N stocks at once (no loop)
+        # SMA(20) -> (Close - SMA) / Close (Scale invariant distance)
+        sma_20_all = self._compute_sma_vectorized(close_prices, window=20)  # (N, T_w)
+        safe_close = np.where(close_prices == 0, 1.0, close_prices)  # (N, T_w)
+        P_Tech[:, :, 5] = (close_prices - sma_20_all) / safe_close
 
-            # RSI(14) -> Scale to [0, 1]
-            rsi_14 = self._compute_rsi(close_prices[n, :], period=14)
-            P_Tech[n, :, 6] = rsi_14 / 100.0
+        # RSI(14) -> Scale to [0, 1]
+        rsi_14_all = self._compute_rsi_vectorized(close_prices, period=14)  # (N, T_w)
+        P_Tech[:, :, 6] = rsi_14_all / 100.0
 
-            # ATR(14) -> Scale by Close (Volatility %) - use cached value
-            P_Tech[n, :, 7] = atr_all[n, :] / safe_close
+        # ATR(14) -> Scale by Close (Volatility %)
+        P_Tech[:, :, 7] = atr_all / safe_close
 
         return P_Tech.astype(np.float32)
 
@@ -564,6 +562,79 @@ class MAFIAFeatureProcessor:
                 result = np.pad(result, (0, len(prices) - len(result)), mode="edge")
 
         return result
+
+    def _compute_sma_vectorized(self, prices: np.ndarray, window: int) -> np.ndarray:
+        """
+        Compute SMA for all stocks at once using cumsum trick.
+
+        Args:
+            prices: (N, T) array of close prices
+            window: SMA window size
+
+        Returns:
+            sma: (N, T) array of SMA values
+        """
+        N, T = prices.shape
+        prices = prices.astype(np.float64)
+
+        # Cumsum trick for efficient rolling mean
+        cumsum = np.cumsum(prices, axis=1)
+        cumsum = np.concatenate([np.zeros((N, 1)), cumsum], axis=1)
+
+        sma = np.zeros_like(prices)
+        for t in range(T):
+            start = max(0, t - window + 1)
+            count = t - start + 1
+            sma[:, t] = (cumsum[:, t + 1] - cumsum[:, start]) / count
+
+        return sma
+
+    def _compute_rsi_vectorized(self, prices: np.ndarray, period: int) -> np.ndarray:
+        """
+        Compute RSI for all stocks at once.
+
+        Args:
+            prices: (N, T) array of close prices
+            period: RSI period
+
+        Returns:
+            rsi: (N, T) array of RSI values [0-100]
+        """
+        N, T = prices.shape
+        prices = prices.astype(np.float64)
+
+        # Compute price changes
+        delta = np.diff(prices, axis=1)  # (N, T-1)
+
+        # Separate gains and losses
+        gains = np.maximum(delta, 0)
+        losses = np.maximum(-delta, 0)
+
+        # EMA smoothing factor
+        alpha = 1.0 / period
+
+        # Initialize
+        rsi = np.full((N, T), 50.0, dtype=np.float64)
+        avg_gain = np.zeros(N)
+        avg_loss = np.zeros(N)
+
+        # First period: simple average
+        if T > period:
+            avg_gain = gains[:, :period].mean(axis=1)
+            avg_loss = losses[:, :period].mean(axis=1)
+
+            # RSI for first period
+            rs = np.divide(avg_gain, avg_loss, out=np.ones(N), where=avg_loss > 0)
+            rsi[:, period] = 100 - (100 / (1 + rs))
+
+            # Subsequent periods: EMA
+            for t in range(period, T - 1):
+                avg_gain = alpha * gains[:, t] + (1 - alpha) * avg_gain
+                avg_loss = alpha * losses[:, t] + (1 - alpha) * avg_loss
+                rs = np.divide(avg_gain, avg_loss, out=np.ones(N), where=avg_loss > 0)
+                rsi[:, t + 1] = 100 - (100 / (1 + rs))
+
+        return rsi
 
     def _compute_atr(
         self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int
@@ -811,3 +882,221 @@ class MAFIAFeatureProcessor:
         P_Mkt[0, :, 18] = regime
 
         return P_Mkt.astype(np.float32)
+
+    # ============================================================
+    # Watchlist System: Technical Score Computation
+    # ============================================================
+
+    def compute_technical_score(
+        self,
+        close_prices: np.ndarray,
+        volumes: np.ndarray,
+        market_close: np.ndarray,
+        momentum_window: int = 60,
+        volume_short_window: int = 20,
+        volume_long_window: int = 60,
+        ma_window: int = 20,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        Compute Technical Score for Watchlist screening.
+
+        Technical Score = (momentum_score + volume_score + ma20_score) / 3
+        Where:
+        - momentum_score: Percentile rank of excess return (stock - market) over 60 days
+        - volume_score: Clip((vol_20d / vol_60d - 1.0) / 0.4, 0, 1)
+        - ma20_score: 1.0 if close > SMA(20), else 0.0
+
+        Args:
+            close_prices: (N, T) array of stock close prices
+            volumes: (N, T) array of stock volumes
+            market_close: (T,) array of market index close prices
+            momentum_window: Window for momentum calculation (default 60)
+            volume_short_window: Short window for volume ratio (default 20)
+            volume_long_window: Long window for volume ratio (default 60)
+            ma_window: SMA window for trend filter (default 20)
+
+        Returns:
+            technical_scores: (N,) array of Technical Scores in [0, 1]
+            components: Dict with individual score components for debugging
+        """
+        N, T = close_prices.shape
+
+        # Ensure we have enough data
+        min_lookback = max(momentum_window, volume_long_window, ma_window) + 1
+        if T < min_lookback:
+            # Not enough data - return neutral scores
+            return np.full(N, 0.5), {
+                'momentum_score': np.full(N, 0.5),
+                'volume_score': np.full(N, 0.5),
+                'ma20_score': np.full(N, 0.5),
+            }
+
+        # 1. Momentum Score (percentile rank of excess return)
+        # Stock return over momentum_window
+        stock_returns = (close_prices[:, -1] / close_prices[:, -momentum_window] - 1.0)
+        # Market return over momentum_window
+        market_return = (market_close[-1] / market_close[-momentum_window] - 1.0)
+        # Excess return
+        excess_returns = stock_returns - market_return
+
+        # Percentile rank: convert to [0, 1]
+        # Using argsort twice trick for percentile rank
+        sorted_indices = np.argsort(np.argsort(excess_returns))
+        momentum_score = sorted_indices / (N - 1) if N > 1 else np.full(N, 0.5)
+
+        # 2. Volume Score
+        # Volume ratio = mean_vol_20d / mean_vol_60d
+        mean_vol_short = np.mean(volumes[:, -volume_short_window:], axis=1)
+        mean_vol_long = np.mean(volumes[:, -volume_long_window:], axis=1)
+        # Avoid division by zero
+        vol_ratio = np.divide(
+            mean_vol_short,
+            mean_vol_long,
+            out=np.ones(N),
+            where=mean_vol_long > 0
+        )
+        # Scale: (ratio - 1.0) / 0.4, clipped to [0, 1]
+        # If ratio=1.0, score=0; if ratio=1.4, score=1
+        volume_score = np.clip((vol_ratio - 1.0) / 0.4, 0.0, 1.0)
+
+        # 3. MA20 Score (binary)
+        # Compute SMA(20) for current day
+        sma_20 = np.mean(close_prices[:, -ma_window:], axis=1)
+        current_close = close_prices[:, -1]
+        ma20_score = (current_close > sma_20).astype(np.float32)
+
+        # Composite Technical Score = average of 3 components
+        technical_scores = (momentum_score + volume_score + ma20_score) / 3.0
+
+        return technical_scores.astype(np.float32), {
+            'momentum_score': momentum_score.astype(np.float32),
+            'volume_score': volume_score.astype(np.float32),
+            'ma20_score': ma20_score.astype(np.float32),
+            'excess_returns': excess_returns.astype(np.float32),
+            'vol_ratio': vol_ratio.astype(np.float32),
+            'sma_20': sma_20.astype(np.float32),
+        }
+
+    def compute_model_score_percentile(
+        self,
+        model_scores: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Convert model scores to percentile ranks for Watchlist screening.
+
+        Args:
+            model_scores: (N,) array of market_scores_full from model
+                          This is softmax(expert_logits), representing model's
+                          allocation preference for each stock (higher = model prefers more)
+
+        Returns:
+            model_percentiles: (N,) array of percentile ranks in [0, 100]
+                - 100 = top 1 stock (best)
+                - 0 = bottom 1 stock (worst)
+        """
+        N = len(model_scores)
+        if N <= 1:
+            return np.full(N, 50.0)
+
+        # Percentile rank using argsort twice trick
+        # Higher score = higher rank = higher percentile
+        sorted_indices = np.argsort(np.argsort(model_scores))
+        percentiles = (sorted_indices / (N - 1)) * 100.0
+
+        return percentiles.astype(np.float32)
+
+    def compute_screening_decision(
+        self,
+        technical_scores: np.ndarray,
+        model_percentiles: np.ndarray,
+        current_watchlist: Optional[np.ndarray] = None,
+        holdings_mask: Optional[np.ndarray] = None,
+        holdings_returns: Optional[np.ndarray] = None,
+        tech_add_threshold: float = 0.7,
+        tech_remove_threshold: float = 0.3,
+        model_add_percentile: float = 50.0,
+        model_remove_percentile: float = 30.0,
+        holdings_tech_floor: float = 0.3,
+        holdings_loss_threshold: float = -0.10,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute ADD/REMOVE decisions for Watchlist screening.
+
+        ADD conditions (must satisfy BOTH):
+        - Technical Score > tech_add_threshold (e.g., 0.7)
+        - Model percentile > model_add_percentile (e.g., 50%)
+
+        REMOVE conditions (satisfy ANY):
+        - Technical Score < tech_remove_threshold (e.g., 0.3)
+        - Model percentile < model_remove_percentile (e.g., 30%)
+
+        Holdings Protection:
+        - Holdings are NOT removed unless:
+          - Technical < holdings_tech_floor AND
+          - r_hold < holdings_loss_threshold
+
+        Args:
+            technical_scores: (N,) Technical Scores in [0, 1]
+            model_percentiles: (N,) Model percentiles in [0, 100]
+            current_watchlist: (N,) boolean mask of stocks currently in Watchlist
+            holdings_mask: (N,) boolean mask of stocks currently held
+            holdings_returns: (N,) returns since entry for held stocks
+            tech_add_threshold: Technical Score threshold for ADD
+            tech_remove_threshold: Technical Score threshold for REMOVE
+            model_add_percentile: Model percentile threshold for ADD
+            model_remove_percentile: Model percentile threshold for REMOVE
+            holdings_tech_floor: Technical floor for holdings protection
+            holdings_loss_threshold: Loss threshold for holdings removal
+
+        Returns:
+            Dict with:
+                - 'add_mask': (N,) boolean - stocks to ADD
+                - 'remove_mask': (N,) boolean - stocks to REMOVE
+                - 'keep_mask': (N,) boolean - stocks to KEEP unchanged
+        """
+        N = len(technical_scores)
+
+        # Initialize masks
+        add_mask = np.zeros(N, dtype=bool)
+        remove_mask = np.zeros(N, dtype=bool)
+
+        # If no current watchlist, use empty mask
+        if current_watchlist is None:
+            current_watchlist = np.zeros(N, dtype=bool)
+        if holdings_mask is None:
+            holdings_mask = np.zeros(N, dtype=bool)
+        if holdings_returns is None:
+            holdings_returns = np.zeros(N, dtype=np.float32)
+
+        # ADD: Technical > threshold AND Model in top percentile
+        tech_pass_add = technical_scores > tech_add_threshold
+        model_pass_add = model_percentiles > model_add_percentile
+        # Only ADD if not already in Watchlist
+        add_mask = tech_pass_add & model_pass_add & (~current_watchlist)
+
+        # REMOVE: Technical < threshold OR Model in bottom percentile
+        tech_fail = technical_scores < tech_remove_threshold
+        model_fail = model_percentiles < model_remove_percentile
+        # Only REMOVE if currently in Watchlist
+        base_remove = (tech_fail | model_fail) & current_watchlist
+
+        # Holdings Protection: Override REMOVE for holdings with good P&L
+        # Remove holding only if: tech < floor AND r_hold < loss_threshold
+        holdings_protected = holdings_mask & (
+            (technical_scores >= holdings_tech_floor) |  # Tech not terrible
+            (holdings_returns >= holdings_loss_threshold)  # Still profitable or small loss
+        )
+        # Protected holdings cannot be removed
+        remove_mask = base_remove & (~holdings_protected)
+
+        # Keep: In Watchlist but neither ADD nor REMOVE
+        keep_mask = current_watchlist & (~remove_mask)
+
+        return {
+            'add_mask': add_mask,
+            'remove_mask': remove_mask,
+            'keep_mask': keep_mask,
+            'tech_pass_add': tech_pass_add,
+            'model_pass_add': model_pass_add,
+            'holdings_protected': holdings_protected,
+        }

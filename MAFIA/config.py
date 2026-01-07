@@ -70,7 +70,7 @@ class Config:
     # Walk-Forward Training Configuration (Class Level for Patching)
     walkforward_base_lr = 1e-4  # LR for Iter 0 (Warmup/Scratch)
     walkforward_finetune_lr = 5e-5  # LR for Iter > 0 (Fine-tune)
-    walkforward_base_epochs = 50  # Epochs for Iter 0
+    walkforward_base_epochs = 100  # Epochs for Iter 0
     walkforward_finetune_epochs = 20  # Epochs for Iter > 0
 
     def __init__(self, seed_num=2022, current_date=None, create_dirs=True):
@@ -169,6 +169,29 @@ class Config:
         # Top-K only: Observer chọn Top-K → State có Top-K → RL tối ưu trên Top-K (full-universe mode bị vô hiệu hóa)
         self.mafia_state_mode = "compact"
 
+        # ============================================================
+        # Sequential Stateful Training Mode (Memory Preservation)
+        # ============================================================
+        # When enabled, training iterates through data SEQUENTIALLY instead of random sampling.
+        # Hidden states and context buffers carry over between segments:
+        # - LSTM hidden states preserve long-term temporal patterns
+        # - Context buffer maintains router memory across rebalance cycles
+        # - Gradients are still truncated at segment boundaries (detach)
+        #
+        # Recommended for SELECTION training to learn cumulative stock performance.
+        # MACRO training can use random sampling (patterns are more local).
+        self.mafia_stateful_training = False  # Enable sequential stateful mode
+        self.mafia_stateful_stride = 0  # Stride=0 means no overlap (stride=T_m)
+        self.mafia_stateful_carry_across_epochs = (
+            False  # Carry hidden state across epochs
+        )
+
+        # TBPTT (Truncated Backpropagation Through Time) for LSTM training
+        # Controls how many timesteps gradient flows back before detaching
+        # Higher = better long-term learning, but more memory usage
+        # Recommended: 32 for 128-step trajectories (detach at t=30,60,90,120)
+        self.tbptt_len = 32
+
         # RL Top-K selection method (only used in 'full-score' mode)
         # In 'compact' mode: RL automatically uses Top-K from Observer (no selection needed)
         # In 'full-score' mode: RL automatically self-selects Top-K from market_scores_full
@@ -226,21 +249,57 @@ class Config:
         # Nếu True: bỏ phạt turnover/change khỏi reward (chỉ dùng khi muốn RL thuần lợi nhuận + JS)
         self.rl_reward_disable_turnover_change = True
         # Encourage diversified actions (entropy regularizer on policy output)
-        self.entropy_coef = 0.2  # loss_actor = − E_s [ Q(s, π(s)) ] − entropy_coef * entropy -> entropy_coef * entropy: thưởng entropy để hành động đa dạng/khám phá; entropy_coef càng lớn, actor càng “spread” phân phối hành động.
+        self.entropy_coef = 0.15  # [TUNED 2026-01-02] Reduced from 0.2 to focus more on exploitation vs exploration
         # Policy Gradient horizon for observer PG loss (Top-K compounding window)
         self.mafia_pg_reward_horizon = (
             21  # h: lookahead horizon aligned with rebalance_interval
         )
         # PG reward shaping penalties (Top-K turnover & membership change)
-        # Penalty coefficients (stronger to stand against reward scaling=100)
-        self.mafia_pg_alpha_turnover = 3.0  # Turnover penalty coefficient
-        self.mafia_pg_alpha_change = 3.0  # Membership change penalty coefficient
+        # [RE-TUNED 2026-01-02] 2-batch quantitative analysis (1000 simulations):
+        # Random selection: R_select ≈ 1.6 → optimal α = 0.35 for 50% penalty ratio
+        # Trained model: R_select ≈ 6-8 (4-5x higher) + SmartRot discount 0.56x
+        # Adjustment: α = 0.35 × (R_trained/R_random) / SmartRot = 0.35 × 4.2 / 0.56 ≈ 2.6
+        # BUT: α=2.5 gives Advantage < 0 in simulation → too harsh for early training
+        # SOLUTION: Start with α=1.0 (moderate), increase if model churns too much
+        # At 40% churn with trained R_select=6.8 and SmartRot=0.56x:
+        #   penalty = 1.0 × (0.46 + 1.84) × 0.56 = 1.29
+        #   ratio = 1.29 / 6.8 = 19% (meaningful signal without crushing advantage)
+        # [FIX 2026-01-02] Reduced from 1.0 based on reward_analysis_results.txt
+        # Optimal alpha=0.33 gives Penalty/|R_select| ≈ 50% (target: 40-60%)
+        # Previous α=1.0 gave 153.1% ratio → too harsh, crushing advantage
+        self.mafia_pg_alpha_turnover = 0.05  # Balanced transaction cost penalty
+        self.mafia_pg_alpha_change = 0.05  # Same as turnover for symmetry
         self.mafia_reward_alpha_hold = (
-            5.0  # Trend Holding Bonus (Reward for holding profitable stocks)
+            11.5  # Increased from 2.0 to improve r_hold variance/signal strength
         )
+
+        # ============================================================
+        # REFACTORED REWARD SYSTEM (Option A: Rebalance-Only)
+        # Principle: "Reward only at action points"
+        # R_net = R_select + α_hold × r_hold - C_turnover - C_rotation
+        # ============================================================
+        # r_hold (Retrospective): Cumulative profit × duration for held stocks
+        # Replaces old R_cumulative (now only computed at rebalance points)
+        # [RE-TUNED 2026-01-02] Adjusted for realistic triggered rebalances
+        # With 40% DC/regime/vol triggered rebalances (duration 5-15 days):
+        # - Average duration ≈ 16.6 days (vs 21 fixed)
+        # - r_hold reduced by ~3x due to shorter duration + cumulative profit
+        # To achieve 40% r_hold contribution: α = 0.20 × 2.9 = 0.58
+        # Formula: r_hold = α × cumulative_profit × log1p(actual_duration) × scale
+        self.mafia_reward_alpha_exit = 0.55  # Compensated for triggered rebalances
+
+        # Legacy parameters (kept for backwards compatibility)
+        self.mafia_reward_alpha_cumulative = 0.0  # DEPRECATED - use alpha_exit instead
+        self.mafia_reward_alpha_momentum = 0.0  # Disabled
+        # NOTE: mafia_reward_alpha_hold is defined above (line 257) = 11.5
+        # DO NOT override here!
+
+        # Smart rotation: Phạt ít khi bán loser, phạt nhiều khi bán winner
+        self.mafia_smart_rotation_enabled = True  # Enable smart rotation penalty
+
         # Direction label generation (future-based)
         self.direction_label_lookahead = (
-            21  # k days ahead for R_fut (aligned with rebalance_interval)
+            5  # [UPDATED] 5 days (was 21) to match short-term swing trading
         )
         self.direction_label_delta = (
             0.025  # symmetric threshold δ (default 2.5%) - used in online mode
@@ -251,7 +310,7 @@ class Config:
         # δ_t = max(δ_min, k_atr * ATR_14 / P_t)
         # Optimized based on VNINDEX analysis: ATR/Price mean=1.4%, IntraDD P10=-8.5%
         self.direction_label_atr_period = (
-            21  # ATR window (days) - aligned with 21-day lookahead
+            14  # [UPDATED] 14 days (Standard) - aligned with 5-day swing
         )
         self.direction_label_atr_multiplier = (
             1.5  # [FIX] Reduced from 2.0 to 1.5 to capture steady bull runs
@@ -259,7 +318,9 @@ class Config:
         self.direction_label_delta_min = (
             0.015  # [UPDATED] Floor set to 1.5% for 21-day horizon (Annualized ~18%)
         )
-        self.direction_label_stop_loss = -0.07  # IntraDD threshold (-7%, P10)
+        self.direction_label_stop_loss = (
+            -0.04
+        )  # [UPDATED] -4% (was -7%) for tight swing risk
 
         # ============================================================
         # Regime Shift Detection Thresholds (Spec Section 8)
@@ -324,6 +385,10 @@ class Config:
 
         # S_reward: Scaling factor for PG Reward (amplify Advantage gradient)
         # Raw compounding returns ~0.01, scale to ~1.0 for stable gradients
+        # [FIX] Reduced from 100.0 to 10.0 to prevent gradient explosion in SELECTION_ONLY mode
+        # [TUNING] Scale=100 to match penalty coefficients (alpha=3.0)
+        # R_raw ~1.0-2.0 vs penalties ~3.0-6.0 (balanced ratio)
+        # Gradient clip increased to 250.0 proportionally
         self.scale_factor_reward = 100.0
         # Continuous eta mapping (tanh over market index z-score)
         self.risk_eta_window = 30
@@ -460,7 +525,7 @@ class Config:
         self.walkforward_infer_year = None  # Inference year (train_end + 1)
 
         # Epoch schedule (varies by iteration)
-        self.walkforward_base_epochs = 50  # Iteration 0: train from scratch
+        self.walkforward_base_epochs = 100  # Iteration 0: train from scratch
         self.walkforward_finetune_epochs = 5  # Iteration 1+: finetune
         self.walkforward_base_lr = 1e-4  # Base learning rate
         self.walkforward_finetune_lr = 1e-5  # Finetune learning rate
@@ -565,6 +630,84 @@ class Config:
                 "MAFIA_TOPK_REBALANCE_INTERVAL", 21
             )  # Changed from 15 to 21 days (Monthly)
         )
+
+        # ============================================================
+        # Watchlist System Configuration (Spec: cozy-whistling-nova.md)
+        # ============================================================
+        # Watchlist reduces noise by filtering universe (122 stocks) to 40 high-quality stocks
+        # Selection then picks Top-K (10) from Watchlist instead of full universe
+
+        self.watchlist_enabled = True  # Enable Watchlist System
+        self.watchlist_size = 40  # Target number of stocks in Watchlist
+        self.watchlist_min_size = 35  # Minimum size before relaxing ADD threshold
+        self.watchlist_max_size = 45  # Maximum size before tightening REMOVE threshold
+
+        # Screening thresholds (Technical Score + Model Logits)
+        # ADD: Technical > add_threshold AND Model in top model_add_percentile
+        # REMOVE: Technical < remove_threshold OR Model in bottom model_remove_percentile
+        self.watchlist_tech_add_threshold = 0.7  # Technical Score > 0.7 to ADD
+        self.watchlist_tech_remove_threshold = 0.3  # Technical Score < 0.3 to REMOVE
+        self.watchlist_model_add_percentile = 50  # Model must be in top 50% to ADD
+        self.watchlist_model_remove_percentile = (
+            30  # Model in bottom 30% triggers REMOVE
+        )
+
+        # Screening schedule
+        self.watchlist_screening_period_days = 10  # Force review every 10 trading days
+        self.watchlist_daily_screening = True  # Run screening check daily (ADD/REMOVE)
+
+        # Technical Score components (Momentum, Volume, MA20)
+        self.watchlist_momentum_window = 60  # 60-day return for momentum score
+        self.watchlist_volume_short_window = 20  # 20-day volume for confirmation
+        self.watchlist_volume_long_window = 60  # 60-day volume baseline
+        self.watchlist_ma_window = 20  # SMA(20) for trend filter
+
+        # Holdings Protection (support "gồng lời" philosophy)
+        # Holdings are NOT removed unless both conditions are met:
+        # - Technical < holdings_tech_floor AND
+        # - r_hold < holdings_loss_threshold (e.g., -10%)
+        self.watchlist_holdings_tech_floor = 0.3  # Technical floor for holdings
+        self.watchlist_holdings_loss_threshold = -0.10  # -10% loss threshold
+
+        # Watchlist Embeddings Buffer
+        self.watchlist_context_window = 30  # Store 30 days of embeddings
+
+        # Emergency removal (optional: immediate removal on severe breakdown)
+        self.watchlist_emergency_removal_enabled = False
+        self.watchlist_emergency_ma_window = 50  # Price < SMA(50)
+        self.watchlist_emergency_return_threshold = -0.20  # 20-day return < -20%
+
+        # Model Trust: Only use model_scores for screening after model is trained
+        # Iteration 0: Use Technical Score only (model is random)
+        # Iteration 1+: Use Technical + Model combined score
+        self.watchlist_use_model_after_iter = (
+            1  # Start using model after this iteration
+        )
+
+        # Combined Score Weights (Phương án C - Configurable)
+        # Score = w_mom × Momentum + w_vol × Volume + w_ma20 × MA20 + w_model × Model
+        # Default: Phương án B (Technical 60% + Model 40%)
+        # Note: Weights should sum to 1.0 when model is used
+        #       For Iteration 0 (no model), technical weights are normalized automatically
+        self.watchlist_weight_momentum = 0.20  # Momentum component weight
+        self.watchlist_weight_volume = 0.20  # Volume component weight
+        self.watchlist_weight_ma20 = 0.20  # MA20 (trend) component weight
+        self.watchlist_weight_model = (
+            0.40  # Model score weight (only used after iter 0)
+        )
+
+        # ============================================================
+        # Smart Holding Bias (Rebalance-based Alpha)
+        # ============================================================
+        # Bias logits based on stock's alpha (outperformance vs market)
+        # since last rebalance. Winners get +bias, losers get -bias.
+        self.mafia_use_alpha_bias = True  # Enable alpha-based holding bias
+        self.mafia_alpha_sensitivity = 1.0  # Multiplier: alpha × sensitivity = bias
+        self.mafia_alpha_max = 0.30  # Clip |alpha| to avoid extreme bias
+        # Apply rule-based holding bias to logits (can disable to use only learned Portfolio Branch)
+        # True: Both rule-based (alpha since rebalance) + learned (Portfolio Encoder) affect logits
+        # False: Only learned Portfolio Branch affects holding decisions
+        self.mafia_apply_holding_alpha_bias = True
 
         # Training Mode (Phase 1 Split Strategy)
         # FULL: Default joint training
@@ -917,7 +1060,7 @@ class Config:
         self.mafia_DC_multipliers = [
             0.5,
             1.0,
-            2.0,
+            1.5,
         ]  # DC adaptive multipliers (k * ATR) for 3 DC agents
         self.mafia_D = 64  # Embedding dimension
         self.mafia_D_h = 128  # Hidden layer dimension
@@ -949,24 +1092,39 @@ class Config:
             3e-4  # Higher LR to compensate for High Dropout (0.3)
         )
         self.mafia_lr_risk_head = (
-            3e-4  # [LONG-TERM] Reduced to 1e-4 for stable 50-epoch run
+            1e-4  # [LONG-TERM] Reduced to 1e-4 for stable 50-epoch run
         )
+        # [TUNING] Reduced from 1e-4 to 5e-5 to compensate for higher effective gradient (clip=5.0)
         self.mafia_lr_backbone = 1e-4  # Moderate LR for backbone (Stable)
 
         # Warmup configuration for stable training
         self.mafia_lr_warmup_epochs = 2  # Linear warmup for first N epochs
         self.mafia_lr_min = 1e-6  # Minimum LR at end of cosine decay
 
-        self.mafia_weight_decay = 0.003  # Weight decay for optimizer
-        self.mafia_weight_decay_risk_head = (
-            0.001  # [LONG-TERM] Increased to 0.01 to prevent Overfitting
+        self.mafia_weight_decay = (
+            0.001  # Weight decay for optimizer (reduced to balance with dropout=0.2)
         )
+        self.mafia_weight_decay_risk_head = 0.001  # Same as general weight decay
 
         # L1 Regularization (Lasso) coefficient
         # Adds term: lambda * sum(|weights|) to loss to encourage sparsity
         self.mafia_l1_lambda = (
-            1e-6  # [LONG-TERM] Increased to 3e-6 (Elastic Net Balance)
+            1e-5  # [LONG-TERM] Increased to 3e-6 (Elastic Net Balance)
         )
+
+        # ===== REGULARIZATION ENABLE/DISABLE FLAGS (Macro Training) =====
+        # These flags allow toggling L1/L2 regularization for macro-only training
+        # Useful for ablation studies and comparing regularized vs non-regularized models
+
+        # Enable/Disable L1 Regularization (Sparsity penalty in loss)
+        # When False: mafia_l1_lambda is ignored, no L1 penalty applied
+        self.macro_enable_l1_regularization = (
+            False  # [PERF-TEST] Disabled to test timing
+        )
+
+        # Enable/Disable L2 Regularization (Weight decay in optimizer)
+        # When False: weight_decay is set to 0 for all parameter groups
+        self.macro_enable_l2_regularization = False  # ENABLED (weight_decay=0.003)
 
         self.hidden_vec_loss_weight = (
             1.0  # Weight for market_vector loss in Policy Gradient training
@@ -977,7 +1135,7 @@ class Config:
 
         # ===== Offline Batch Training Configuration (Spec §6) =====
         # Training Duration per Iteration
-        self.mafia_observer_base_epochs = 50  # Base training (iter 0) epochs
+        self.mafia_observer_base_epochs = 100  # Base training (iter 0) epochs
         self.mafia_observer_finetune_epochs = 5  # Finetune (iter > 0) epochs
         # Steps per epoch: auto-computed as ceil((Len(Data) - T_m - h) / Batch_Size)
         # No manual override needed; calculated dynamically per dataset
@@ -1049,17 +1207,17 @@ class Config:
         # Stronger portfolio churn penalties (penalty ~25–30% reward at λ=1 with typical turnover/symdiff)
         # Old override removed to respect lines 177-178
 
-        # SOFT LANDING for Resume:
-        # Warmup = 18 means Epoch 0-17 are purely old penalty.
-        # Epoch 18 (Index 18): Gap is 0 -> Penalty = Base (1.25).
-        # Epoch 19 (Index 19): Gap is 1 -> Penalty = 1.38 (Higher than 1.25).
-        self.curriculum_warmup_epochs = 18
-        self.curriculum_penalty_rampup = 10  # Rampup over 10 epochs (Smooth transition)
+        # Curriculum Learning for SELECTION_ONLY:
+        # λ starts at 0.4 and ramps up to 1.0 over rampup epochs
+        # Epoch 0: λ = 0.4
+        # Epoch 5: λ = 1.0 (full penalty)
+        self.curriculum_warmup_epochs = 0  # No warmup, start rampup immediately
+        self.curriculum_penalty_rampup = 5  # Rampup over 5 epochs (0.4 -> 1.0)
 
         # Risk/Direction Head Config
         self.mafia_explicit_dim = 6  # [Vol20, DC, Breadth, Div, VPI, DD60]
         self.direction_head_dropout = 0.1
-        self.risk_head_dropout = 0.2  # Added for Risk Head regularization
+        self.risk_head_dropout = 0.1  # Added for Risk Head regularization
         self.mafia_direction_threshold = 0.02  # [DEPRECATED] Used as fallback/base
         self.mafia_direction_delta_min = 0.02  # Minimum threshold (2%) even in low vol
         self.mafia_direction_k_atr = 1.0  # Dynamic scaler: Threshold = k * ATR
@@ -1072,7 +1230,7 @@ class Config:
         # Bear/Side are minorities → higher weights to boost gradient
         self.mafia_focal_alpha = [1.69, 1.56, 1.00]  # [Bear, Side, Bull]
         self.mafia_focal_gamma = (
-            1.0  # γ=1.0 Soft Focal (Optimization: Balance focus without chasing noise)
+            1.5  # γ=1.0 Soft Focal (Optimization: Balance focus without chasing noise)
         )
         # Label Smoothing (Spec 5.1.3): Converts [0,1,0] → [0.033, 0.933, 0.033]
         # Helps model converge stably, avoids overconfidence on noisy labels
@@ -1087,12 +1245,16 @@ class Config:
         # Minimum class count to avoid extreme weights (prevents division by zero)
         self.mafia_dynamic_weight_min_count = 1
         # Maximum weight cap to prevent extreme gradients
-        self.mafia_dynamic_weight_max = 2.0  # Conservative cap for stability
+        self.mafia_dynamic_weight_max = 2.5  # Conservative cap for stability
         # Smoothing factor: 0=pure inverse-freq, 1=uniform weights
-        self.mafia_dynamic_weight_smoothing = 0.0  # Pure inverse-freq (no smoothing)
+        self.mafia_dynamic_weight_smoothing = (
+            0.1  # Default: blend 90% inverse-freq + 10% uniform
+        )
 
         # Gradient Clipping
-        self.mafia_max_grad_norm = 1.0  # Max gradient norm for clipping
+        # [TUNING] Proportionally increased with scale_factor_reward=100
+        # scale: 10 → 100 (10x), so grad_norm: 25 → 250 (10x)
+        self.mafia_max_grad_norm = 250.0  # Max gradient norm for clipping
 
         # Top-K Selection
         self.mafia_top_k = 10  # Number of assets to select
@@ -1107,7 +1269,7 @@ class Config:
         )  # Options: 'attention_based_aggregation', 'temporal_convolution', 'lstm'
         self.mafia_gating_num_heads = 4  # For attention-based encoder
         self.mafia_gating_dropout = (
-            0.3  # Dropout for gating networks (Optimization: Increased to 0.3)
+            0.1  # Dropout for gating networks (Optimization: Increased to 0.3)
         )
         self.mafia_gating_lstm_layers = 2  # For lstm encoder
         self.mafia_gating_conv_kernels = [3, 5, 7]  # For temporal_convolution encoder
@@ -1116,8 +1278,8 @@ class Config:
         # Solves distribution shift: Router updated per rebalance, but market_context updated daily
         # Augmented input: C_aug = [C_mkt^(t), C_bar_mkt, Delta_C_mkt] ∈ R^{3D}
         self.router_context_window = int(
-            os.environ.get("ROUTER_CONTEXT_WINDOW", 14)
-        )  # Lookback window W for rolling mean/drift (align with topk_rebalance_interval)
+            os.environ.get("ROUTER_CONTEXT_WINDOW", 30)
+        )  # Lookback window W for rolling mean/drift (30 days for longer context)
         self.router_use_temporal_augmentation = (
             True  # Enable C_aug = [C, C_bar, Delta_C]
         )

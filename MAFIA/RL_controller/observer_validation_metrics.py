@@ -127,6 +127,7 @@ class ObserverValidationResult:
     net_reward: float = 0.0
     turnover_penalty: float = 0.0
     symdiff_penalty: float = 0.0
+    avg_churn: float = 0.0  # Average churn rate (% of portfolio changed per rebalance)
     
 
     
@@ -149,7 +150,7 @@ class ObserverValidationResult:
         "loss_total", "loss_pg", "loss_bal",  # NO loss_risk, NO loss_dir
         "topk_sharpe_ratio", "topk_hit_rate", "topk_mean_return", "topk_volatility", "topk_turnover",
         "topk_advantage", "topk_hold_reward",
-        "reward", "net_reward", "turnover_penalty", "symdiff_penalty",
+        "reward", "net_reward", "turnover_penalty", "symdiff_penalty", "avg_churn",
     }
 
     def to_dict(self, filter_by_phase: bool = True) -> Dict:

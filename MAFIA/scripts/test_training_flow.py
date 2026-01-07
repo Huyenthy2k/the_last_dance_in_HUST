@@ -152,6 +152,7 @@ def test_training_mode(mode: str, config: Config, stock_df: pd.DataFrame,
                     training_mode=mode,
                     steps_per_epoch=batches_per_epoch,
                     verbose=True,
+                    epoch=epoch,  # Sync epoch display
                 )
 
                 # Check result (can be dict or ObserverValidationResult)

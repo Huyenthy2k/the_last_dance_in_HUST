@@ -83,12 +83,13 @@ except ImportError:
 
 
 def build_expanding_schedule(
-    start_year: int, first_infer_year: int, last_infer_year: int
+    start_year: int, first_infer_year: int, last_infer_year: int,
+    valid_duration_years: int = 1
 ) -> List[Dict]:
     """
     Build YEARLY expanding-window schedule per training_strategy_proposal.md.
-    
-    Strategy (5 iterations for 2020-2024):
+
+    Strategy (5 iterations for 2020-2024, valid_duration_years=1):
     | Iter | Train Period | Valid/Infer Year |
     |------|--------------|------------------|
     | 0    | 2015-2019    | 2020             |
@@ -96,26 +97,42 @@ def build_expanding_schedule(
     | 2    | 2015-2021    | 2022             |
     | 3    | 2015-2022    | 2023             |
     | 4    | 2015-2023    | 2024             |
-    
+
+    With valid_duration_years=2, first_infer_year=2021:
+    | Iter | Train Period | Valid Period     |
+    |------|--------------|------------------|
+    | 0    | 2015-2020    | 2021-2022        |
+
     Args:
         start_year: Training start year (fixed, e.g., 2015)
         first_infer_year: First year to generate states for (e.g., 2020)
         last_infer_year: Last year to generate states for (e.g., 2024)
-    
+        valid_duration_years: Number of years for validation period (default: 1)
+
     Returns:
         List of schedule dicts with train/valid/infer periods
     """
     schedule = []
-    
+
     for iter_idx, valid_year in enumerate(range(first_infer_year, last_infer_year + 1)):
         # Training: start_year -> (valid_year - 1)
         train_end_year = valid_year - 1
-        
+
         train_start = pd.Timestamp(f"{start_year}-01-01 00:00:00")
         train_end = pd.Timestamp(f"{train_end_year}-12-31 23:59:59")
         valid_start = pd.Timestamp(f"{valid_year}-01-01 00:00:00")
-        valid_end = pd.Timestamp(f"{valid_year}-12-31 23:59:59")
-        
+        # Support multi-year validation
+        valid_end_year = valid_year + valid_duration_years - 1
+        valid_end = pd.Timestamp(f"{valid_end_year}-12-31 23:59:59")
+
+        # Build validation label
+        if valid_duration_years == 1:
+            valid_label = f"{valid_start.date()} -> {valid_end.date()} (Full Year)"
+            valid_year_label = str(valid_year)
+        else:
+            valid_label = f"{valid_start.date()} -> {valid_end.date()} ({valid_duration_years} Years)"
+            valid_year_label = f"{valid_year}-{valid_end_year}"
+
         schedule.append({
             "iter_index": iter_idx,
             "iter_display": iter_idx + 1,
@@ -123,17 +140,18 @@ def build_expanding_schedule(
             "train_end": train_end,
             "valid_start": valid_start,
             "valid_end": valid_end,
-            "valid_year": valid_year,
+            "valid_year": valid_year,  # Start year of validation
+            "valid_year_label": valid_year_label,  # e.g., "2021" or "2021-2022"
             "valid_quarter": None,  # YEARLY schedule, no quarters
             "infer_year": valid_year,
             "infer_quarter": None,  # YEARLY schedule, no quarters
             "infer_start": valid_start,
             "infer_end": valid_end,
-            "ckpt_name": f"Observer_Best_{valid_year}",
+            "ckpt_name": f"Observer_Best_{valid_year_label}",
             "train_label": f"{train_start.date()} -> {train_end.date()}",
-            "valid_label": f"{valid_start.date()} -> {valid_end.date()} (Full Year)",
+            "valid_label": valid_label,
         })
-    
+
     return schedule
 
 
@@ -177,6 +195,8 @@ def train_observer_offline_iteration(
     training_mode: str = "FULL",
     init_checkpoint: Optional[str] = None,  # MACRO checkpoint (frozen params for SELECTION_ONLY)
     prev_selection_checkpoint: Optional[str] = None,  # Prev SELECTION checkpoint (trainable params)
+    sampling_strategy: str = "auto",  # ADDED: 'auto', 'uniform', 'hybrid_weighted'
+    skip_recovery: bool = False,  # ADDED: Skip validation history recovery on resume
 ) -> str:
     """
     Train one iteration using offline batch mode with CES Validation.
@@ -217,6 +237,24 @@ def train_observer_offline_iteration(
     # This ensures lambda reaches 1.0 within the shorter training period
     is_finetune = (iteration > 0)
     trainer.scale_curriculum_for_finetune(num_epochs=num_epochs, is_finetune=is_finetune)
+
+    # === ITERATION-AWARE SAMPLING STRATEGY ===
+    # 'auto': Iteration 0 = uniform, Iteration 1+ = hybrid_weighted
+    # 'uniform': Force uniform sampling for all iterations
+    # 'hybrid_weighted': Force hybrid sampling for all iterations
+    if sampling_strategy == "auto":
+        if iteration == 0:
+            config.mafia_sampling_strategy = "uniform"
+            if verbose:
+                smart_print(f"[SAMPLING] Iteration 0: Using UNIFORM sampling (full data coverage)")
+        else:
+            config.mafia_sampling_strategy = "hybrid_weighted"
+            if verbose:
+                smart_print(f"[SAMPLING] Iteration {iteration}: Using HYBRID_WEIGHTED sampling (recency bias)")
+    else:
+        config.mafia_sampling_strategy = sampling_strategy
+        if verbose:
+            smart_print(f"[SAMPLING] Override: Using {sampling_strategy.upper()} sampling for all iterations")
 
     # Update Dashboard Header
     update_walkforward_iteration(
@@ -318,14 +356,23 @@ def train_observer_offline_iteration(
     
 
     # Auto-compute batches per epoch
+    # Auto-compute batches per epoch
     if batches_per_epoch is None:
-        T_train = train_tensors["T_total"]
-        T_m = trainer.T_m
-        h = trainer.horizon
-        T_w = trainer.T_w
-        batch_size = trainer.batch_size
-        available_starts = T_train - T_m - h - T_w
-        batches_per_epoch = max(1, int(np.ceil(available_starts / batch_size)))
+        # [FIX] For hybrid_weighted, use fixed budget (18) unless overridden
+        # User explicitly requested 18 batches/epoch to match previous iteration budget
+        if config.mafia_sampling_strategy == "hybrid_weighted":
+            batches_per_epoch = 18
+            if verbose:
+                smart_print(f"[SAMPLING] Hybrid Weighted active: Defaulting to fixed {batches_per_epoch} batches/epoch (Budget-based)")
+        else:
+            # Standard auto-compute for uniform/full coverage
+            T_train = train_tensors["T_total"]
+            T_m = trainer.T_m
+            h = trainer.horizon
+            T_w = trainer.T_w
+            batch_size = trainer.batch_size
+            available_starts = T_train - T_m - h - T_w
+            batches_per_epoch = max(1, int(np.ceil(available_starts / batch_size)))
 
     # [OPTIMIZATION] Include T_w days from TRAINING data as prefix for validation warm-up
     # This allows 100% validation utilization (no discarded days at start of validation year)
@@ -371,9 +418,15 @@ def train_observer_offline_iteration(
 
             # Resume logic: Check for existing checkpoints in temp dir
     # Priority: latest_checkpoint.pth > epoch_{N}.pth (best checkpoints)
+    # [FIX] Skip resume logic if init_checkpoint is explicitly provided (warm start from specific checkpoint)
     start_epoch = 0
+    skip_resume_for_init = init_checkpoint is not None and os.path.exists(init_checkpoint)
+    if skip_resume_for_init:
+        smart_print(f"[INIT] Skipping resume logic - using init_checkpoint: {init_checkpoint}")
+        smart_print(f"[INIT] Training will start from epoch 0 with warm-started weights")
+
     smart_print(f"[DEBUG] Checking for resume in: {temp_ckpt_dir}")
-    if os.path.exists(temp_ckpt_dir):
+    if os.path.exists(temp_ckpt_dir) and not skip_resume_for_init:
         # fast check contents
         dir_contents = os.listdir(temp_ckpt_dir)
         smart_print(f"[DEBUG] temp_ckpt_dir exists, contents: {dir_contents}")
@@ -473,10 +526,15 @@ def train_observer_offline_iteration(
                         epochs_to_recover.append(ep)
                 
                 if epochs_to_recover:
-                    smart_print(f"[RESUME-RECOVERY] Found {len(epochs_to_recover)} missing epochs with checkpoints: {epochs_to_recover}")
-                    smart_print(f"                  Starting Batch Recovery...")
-                    
-                    for recover_ep in epochs_to_recover:
+                    # DEBUG
+                    smart_print(f"[DEBUG] skip_recovery = {skip_recovery}")
+                    if skip_recovery:
+                        smart_print(f"[RESUME-RECOVERY] Found {len(epochs_to_recover)} missing epochs but --skip-recovery is set. Skipping...")
+                    else:
+                        smart_print(f"[RESUME-RECOVERY] Found {len(epochs_to_recover)} missing epochs with checkpoints: {epochs_to_recover}")
+                        smart_print(f"                  Starting Batch Recovery...")
+
+                    for recover_ep in ([] if skip_recovery else epochs_to_recover):
                         smart_print(f"\n[RECOVERY] ♻️ Recovering Epoch {recover_ep}...")
                         
                         try:
@@ -523,14 +581,15 @@ def train_observer_offline_iteration(
                             import traceback
                             traceback.print_exc()
                     
-                    # Restore state to `loaded_epoch` before continuing
-                    if epochs_to_recover[-1] != loaded_epoch:
+                    # Restore state to `loaded_epoch` before continuing (only if recovery happened)
+                    if not skip_recovery and epochs_to_recover[-1] != loaded_epoch:
                         smart_print(f"[RECOVERY] 🔄 Restoring observer state to Loaded Epoch {loaded_epoch}...")
                         ckpt_path_final = os.path.join(temp_ckpt_dir, f"epoch_{loaded_epoch}.pth")
                         trainer.observer.load_checkpoint(ckpt_path_final)
                         trainer._epoch = loaded_epoch
-                        
-                    smart_print("[RESUME-RECOVERY] ✅ All missing history recovered.")
+
+                    if not skip_recovery:
+                        smart_print("[RESUME-RECOVERY] ✅ All missing history recovered.")
                 else:
                     smart_print("[RESUME] History is consistent with checkpoints.")
 
@@ -552,35 +611,39 @@ def train_observer_offline_iteration(
                     smart_print(f"\n[RESUME-RECOVERY] 🚨 Checkpoint at Epoch {loaded_epoch} exists, but TRAIN metrics missing.")
                     smart_print(f"                  Executing IMMEDIATE metrics recovery on TRAINING SET for Epoch {loaded_epoch}...")
                     
-                    # Run evaluation on TRAIN set
-                    # Note: This gives 'inference' loss, not 'training' loss (with dropout/grad), 
-                    # but it's the best proxy we have for a lost log.
-                    # We use a subset of training data if it's too huge? Or full? 
-                    # train_epoch iterates all. validate_epoch can take full train_tensors.
-                    # Let's use full train_tensors.
-                    train_eval_res = trainer.validate_epoch(
-                         data_tensors=train_tensors,
-                         steps=batches_per_epoch, # Use same steps as training? Or just full? validate_epoch default iterates all if steps large?
-                         # Actually validate_epoch implementation:
-                         # It samples `steps` batches.
-                         # So yes, passing batches_per_epoch is correct to cover rough size of data or more.
-                         compute_loss=True  # Log training losses
-                    )
-                    
-                    # Convert to dict and save
-                    t_dict = asdict(train_eval_res)
-                    # Remove CES stuff
-                    keys_to_remove = [k for k in t_dict.keys() if "ces_score" in k or "ces_rank" in k]
-                    for k in keys_to_remove:
-                        del t_dict[k]
-                    
-                    df_t_new = pd.DataFrame([t_dict])
-                    if "epoch" in df_t_new.columns:
-                        df_t_new["epoch"] = df_t_new["epoch"].astype(int)
+                    try:
+                        # Run evaluation on TRAIN set
+                        # Note: This gives 'inference' loss, not 'training' loss (with dropout/grad), 
+                        # but it's the best proxy we have for a lost log.
+                        # We use a subset of training data if it's too huge? Or full? 
+                        # train_epoch iterates all. validate_epoch can take full train_tensors.
+                        # Let's use full train_tensors.
+                        train_eval_res = trainer.validate_epoch(
+                             data_tensors=train_tensors,
+                             steps=batches_per_epoch, # Use same steps as training? Or just full? validate_epoch default iterates all if steps large?
+                             # Actually validate_epoch implementation:
+                             # It samples `steps` batches.
+                             # So yes, passing batches_per_epoch is correct to cover rough size of data or more.
+                             compute_loss=True  # Log training losses
+                        )
                         
-                    header = not os.path.exists(train_csv_path)
-                    df_t_new.to_csv(train_csv_path, mode='a', header=header, index=False, float_format='%.5f')
-                    smart_print(f"[RESUME-RECOVERY] ✅ Recovered train_metrics.csv for Epoch {loaded_epoch}.")
+                        # Convert to dict and save
+                        t_dict = asdict(train_eval_res)
+                        # Remove CES stuff
+                        keys_to_remove = [k for k in t_dict.keys() if "ces_score" in k or "ces_rank" in k]
+                        for k in keys_to_remove:
+                            del t_dict[k]
+                        
+                        df_t_new = pd.DataFrame([t_dict])
+                        if "epoch" in df_t_new.columns:
+                            df_t_new["epoch"] = df_t_new["epoch"].astype(int)
+                            
+                        header = not os.path.exists(train_csv_path)
+                        df_t_new.to_csv(train_csv_path, mode='a', header=header, index=False, float_format='%.5f')
+                        smart_print(f"[RESUME-RECOVERY] ✅ Recovered train_metrics.csv for Epoch {loaded_epoch}.")
+                    except Exception as rec_err:
+                        smart_print(f"[RESUME-RECOVERY] ⚠️ Failed to recover train metrics: {rec_err}")
+                        smart_print(f"                  Skipping recovery and proceeding with training.")
 
 
                 # [RESUME-FIX] Truncate train_metrics.csv if exists
@@ -722,7 +785,8 @@ def train_observer_offline_iteration(
                 on_batch_done=on_batch_viz,  # Real-time chart updates
                 log_file=batch_log_path,      # Save batch-level dynamics
                 verbose=verbose,            # Pass verbose flag
-                training_mode=training_mode  # Pass training mode ("MACRO_ONLY", "SELECTION_ONLY")
+                training_mode=training_mode,  # Pass training mode ("MACRO_ONLY", "SELECTION_ONLY")
+                epoch=epoch,  # Sync epoch display with outer loop
             )
             current_global_step += batches_per_epoch
 
@@ -920,6 +984,7 @@ def run_offline_observer_training(
     start_year: int = 2015,
     first_infer_year: int = 2018,
     last_infer_year: int = 2024,
+    valid_duration_years: int = 1,  # ADDED: Multi-year validation support
     output_dir: str = "./observer_offline",
     num_epochs: Optional[int] = None,
     batches_per_epoch: Optional[int] = None,
@@ -934,6 +999,9 @@ def run_offline_observer_training(
     init_checkpoint: Optional[str] = None, # ADDED: Allow manual init checkpoint (e.g. for testing)
     mps_batch_size: int = 64,  # ADDED: MPS-specific batch size limit
     low_memory: bool = False,  # ADDED: Low memory mode for smaller Macs
+    sampling_strategy: str = "auto",  # ADDED: 'auto', 'uniform', 'hybrid_weighted'
+    debug_logging: bool = False,  # ADDED: Per-timestep terminal logging
+    skip_recovery: bool = False,  # ADDED: Skip validation history recovery on resume
 ) -> List[Dict]:
     """
     Run full walk-forward offline observer training.
@@ -963,8 +1031,22 @@ def run_offline_observer_training(
     if th.cuda.is_available():
         th.cuda.manual_seed(seed)
 
+    # Mode-dependent validation duration:
+    # - MACRO_ONLY: always 1 year validation
+    # - SELECTION_ONLY: 2 years validation (for stock selection robustness)
+    if mode == "SELECTION_ONLY":
+        effective_valid_duration = 2
+        if verbose and valid_duration_years != 2:
+            smart_print(f"[CONFIG] SELECTION_ONLY mode: Using 2-year validation (overriding {valid_duration_years})")
+    else:
+        effective_valid_duration = 1
+        if verbose and valid_duration_years != 1:
+            smart_print(f"[CONFIG] MACRO_ONLY mode: Using 1-year validation (overriding {valid_duration_years})")
+
     # Build schedule
-    schedule = build_expanding_schedule(start_year, first_infer_year, last_infer_year)
+    schedule = build_expanding_schedule(
+        start_year, first_infer_year, last_infer_year, effective_valid_duration
+    )
     num_iterations = len(schedule)
     if max_iterations is not None and max_iterations > 0:
         schedule = schedule[:max_iterations]
@@ -976,9 +1058,11 @@ def run_offline_observer_training(
         smart_print("\n" + "#" * 70)
         smart_print("# OFFLINE BATCH OBSERVER TRAINING (Spec §6/§7 Compliant)")
         smart_print("#" * 70)
+        smart_print(f"  Mode: {mode}")
         smart_print(f"  Start year: {start_year}")
         smart_print(f"  First infer year: {first_infer_year}")
         smart_print(f"  Last infer year: {last_infer_year}")
+        smart_print(f"  Valid duration: {effective_valid_duration} year(s) {'(auto: SELECTION_ONLY)' if mode == 'SELECTION_ONLY' else ''}")
         smart_print(f"  Total iterations: {num_iterations}")
         smart_print(f"  Epochs/iteration: {num_epochs}")
         smart_print(f"  Batches/epoch: {batches_per_epoch}")
@@ -1036,6 +1120,12 @@ def run_offline_observer_training(
         if verbose:
             smart_print("[CONFIG] Detailed trajectory logging ENABLED")
             smart_print(f"  Output: {results_dir}/trajectory_details.csv\n")
+
+    # Enable per-timestep debug logging on terminal
+    if debug_logging:
+        config.mafia_debug_logging = True
+        if verbose:
+            smart_print("[CONFIG] Per-timestep debug logging ENABLED (terminal output)")
 
     # Initialize TensorBoard Writer (inside phase results directory)
     log_dir = os.path.abspath(os.path.join(results_dir, "tb_logs"))
@@ -1192,17 +1282,20 @@ def run_offline_observer_training(
             macro_checkpoint_dir = os.path.join(output_dir, "checkpoints", "macro")
             macro_ckpt_path = os.path.join(macro_checkpoint_dir, macro_ckpt_name)
 
-            # [CRITICAL] MACRO checkpoint is REQUIRED for SELECTION_ONLY
-            if not os.path.exists(macro_ckpt_path):
+            # [FIX] Respect --init-checkpoint if passed and exists
+            if iter_init_ckpt and os.path.exists(iter_init_ckpt):
+                smart_print(f"[CONFIG] Phase 1B: Using manual init_checkpoint: {iter_init_ckpt}")
+            elif os.path.exists(macro_ckpt_path):
+                iter_init_ckpt = macro_ckpt_path
+                smart_print(f"[CONFIG] Phase 1B: Found MACRO checkpoint: {macro_ckpt_name}")
+            else:
+                # [CRITICAL] MACRO checkpoint is REQUIRED for SELECTION_ONLY
                 raise FileNotFoundError(
-                    f"[CRITICAL] SELECTION_ONLY requires MACRO checkpoint at:\n"
-                    f"  {macro_ckpt_path}\n"
+                    f"[CRITICAL] SELECTION_ONLY requires MACRO checkpoint.\n"
+                    f"  Expected at: {macro_ckpt_path}\n"
+                    f"  Or pass --init-checkpoint <path>\n"
                     f"Run MACRO_ONLY training first for year {infer_year}!"
                 )
-
-            if iter_init_ckpt is None:
-                iter_init_ckpt = macro_ckpt_path
-            smart_print(f"[CONFIG] Phase 1B: Found MACRO checkpoint: {macro_ckpt_name}")
 
             # Find previous SELECTION checkpoint for trainable params (knowledge transfer)
             if iteration > 0:
@@ -1269,6 +1362,8 @@ def run_offline_observer_training(
                 training_mode=mode,
                 init_checkpoint=iter_init_ckpt,  # MACRO checkpoint (frozen params)
                 prev_selection_checkpoint=iter_prev_selection_ckpt,  # Prev SELECTION (trainable params)
+                sampling_strategy=sampling_strategy,  # ADDED: Pass sampling strategy
+                skip_recovery=skip_recovery,  # ADDED: Skip validation history recovery
              )
              
              # Rename/Copy to Final Inference Name
@@ -1442,15 +1537,21 @@ def main():
     parser.add_argument(
         "--first-infer-year",
         type=int,
-        default=2020,
-        help="First inference/validation year (default: 2020, per training_strategy_proposal.md)",
+        default=2021,
+        help="First inference/validation year (default: 2021)",
     )
 
     parser.add_argument(
         "--last-infer-year",
         type=int,
-        default=2024,
-        help="Last inference year (default: 2024)",
+        default=2021,
+        help="Last inference year (default: 2021)",
+    )
+    parser.add_argument(
+        "--valid-duration-years",
+        type=int,
+        default=1,
+        help="Number of years for validation period (default: 1). Set to 2 for 2-year validation.",
     )
     parser.add_argument(
         "--output-dir",
@@ -1529,13 +1630,34 @@ def main():
         default=None,
         help="Path to initial checkpoint (required for SELECTION_ONLY to load Macro weights)",
     )
+    parser.add_argument(
+        "--sampling-strategy",
+        type=str,
+        default="auto",
+        choices=["auto", "uniform", "hybrid_weighted"],
+        help="Sampling strategy: 'auto' (iter 0=uniform, iter 1+=hybrid), 'uniform', or 'hybrid_weighted'",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable per-timestep detailed logging on terminal (verbose training output)",
+    )
+    parser.add_argument(
+        "--skip-recovery",
+        action="store_true",
+        help="Skip validation history recovery on resume (faster but incomplete metrics history)",
+    )
 
     args = parser.parse_args()
+
+    # DEBUG: Print skip_recovery value
+    print(f"[DEBUG] --skip-recovery flag = {args.skip_recovery}")
 
     results = run_offline_observer_training(
         start_year=args.start_year,
         first_infer_year=args.first_infer_year,
         last_infer_year=args.last_infer_year,
+        valid_duration_years=args.valid_duration_years,  # Multi-year validation
         output_dir=args.output_dir,
         num_epochs=args.epochs,
         batches_per_epoch=args.batches,
@@ -1549,6 +1671,9 @@ def main():
         init_checkpoint=args.init_checkpoint, # Pass init checkpoint
         mps_batch_size=args.mps_batch_size,  # [MPS-FIX] MPS batch size limit
         low_memory=args.low_memory,  # [MPS-FIX] Low memory mode
+        sampling_strategy=args.sampling_strategy,  # NEW: Sampling strategy
+        debug_logging=args.debug,  # NEW: Per-timestep terminal logging
+        skip_recovery=args.skip_recovery,  # NEW: Skip validation history recovery
     )
 
     # Exit with error if any iteration failed

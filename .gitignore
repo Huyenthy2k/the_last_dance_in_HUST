@@ -223,7 +223,12 @@ MAFIA/data/
 MAFIA/observer_offline_4/
 MAFIA/observer_online_3/
 MAFIA/observer_offline_2/
-MAFIA/observer_online/
+MAFIA/observer_offline/
 MAFIA/observer_offline_5/
+MAFIA/observer_offline_6/
+MAFIA/observer_offline_6_1/
+MAFIA/observer_offline_6_3_thesis/
+MAFIA/observer_offline_5lookahead/
+MAFIA/observer_offline_removeadapter/
 MAFIA/tests/
 MAFIA/test/

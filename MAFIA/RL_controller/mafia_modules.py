@@ -21,6 +21,40 @@ from typing import Tuple, Optional
 import math
 
 
+class StableLayerNorm(nn.Module):
+    """
+    LayerNorm with gradient clipping to prevent NaN gradients.
+
+    Standard LayerNorm can produce NaN gradients when:
+    - Input has near-zero variance
+    - Accumulated gradients over many timesteps cause overflow
+
+    This version registers gradient hooks to replace NaN/Inf with zeros.
+    """
+
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.norm = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+
+        # Register gradient hooks on parameters
+        if elementwise_affine:
+            self.norm.weight.register_hook(self._sanitize_grad)
+            self.norm.bias.register_hook(self._sanitize_grad)
+
+    def _sanitize_grad(self, grad):
+        """Replace NaN/Inf gradients with zeros and clip large values."""
+        if grad is None:
+            return grad
+        # Replace NaN/Inf with zeros
+        grad = th.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clip to prevent explosion
+        grad = th.clamp(grad, min=-10.0, max=10.0)
+        return grad
+
+    def forward(self, x):
+        return self.norm(x)
+
+
 class TransformerEncoderLayer(nn.Module):
     """Standard Transformer Encoder Layer."""
 
@@ -97,7 +131,7 @@ class CSAModule(nn.Module):
         # This is done in forward pass
 
         # Input LayerNorm before embedding (stabilizes early layers)
-        self.input_norm = nn.LayerNorm(self.token_dim)
+        self.input_norm = StableLayerNorm(self.token_dim)
 
         # Embedding MLP
         self.embedding = nn.Sequential(
@@ -133,7 +167,11 @@ class CSAModule(nn.Module):
         # Reshape: (batch, N, T_w, M) -> (batch, N, T_w*M)
         tokens = P_i.reshape(batch_size, N, self.token_dim)
 
-        # Input LayerNorm (stabilizes embedding layer)
+        # [NaN GUARD] Sanitize tokens before LayerNorm
+        if th.isnan(tokens).any() or th.isinf(tokens).any():
+            tokens = th.nan_to_num(tokens, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Input LayerNorm (uses StableLayerNorm with gradient sanitization)
         tokens = self.input_norm(tokens)
 
         # Embedding
@@ -193,7 +231,7 @@ class TAModule(nn.Module):
             self.token_dim = int(actual_N * self.M)  # N * M
 
         # Input LayerNorm before embedding (stabilizes early layers)
-        self.input_norm = nn.LayerNorm(self.token_dim)
+        self.input_norm = StableLayerNorm(self.token_dim)
 
         # Embedding MLP
         if shared_mlp is not None and agent_type == "dc":
@@ -252,15 +290,18 @@ class TAModule(nn.Module):
             batch_size, T_w, actual_token_dim
         )  # (batch, T_w, N*M)
 
+        # [NaN GUARD] Sanitize tokens before LayerNorm
+        if th.isnan(tokens).any() or th.isinf(tokens).any():
+            tokens = th.nan_to_num(tokens, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # If token_dim changed, we need to handle embedding differently
-        # For now, use a linear projection if needed
         if actual_token_dim != self.token_dim:
             # Create a temporary embedding layer and input_norm if dimensions don't match
             if (
                 not hasattr(self, "_temp_embedding")
                 or self._temp_embedding[0].in_features != actual_token_dim
             ):
-                self._temp_input_norm = nn.LayerNorm(actual_token_dim).to(tokens.device)
+                self._temp_input_norm = StableLayerNorm(actual_token_dim).to(tokens.device)
                 self._temp_embedding = nn.Sequential(
                     nn.Linear(actual_token_dim, self.D_h),
                     nn.GELU(),
@@ -270,7 +311,7 @@ class TAModule(nn.Module):
             tokens = self._temp_input_norm(tokens)
             embedded = self._temp_embedding(tokens)  # (batch, T_w, D)
         else:
-            # Apply input LayerNorm before embedding (stabilizes embedding layer)
+            # Apply input LayerNorm before embedding (uses StableLayerNorm)
             tokens = self.input_norm(tokens)
             embedded = self.embedding(tokens)  # (batch, T_w, D)
 
@@ -799,13 +840,9 @@ class DenseMoEGatingRouter(nn.Module):
         with th.no_grad():
              self.gate_network[-2].bias.zero_()
 
-        # Signal Decoupling Adapters (Task-Specific Views)
-        # Selection Adapter: Projects raw context for Gating (Selection Task)
-        self.selection_adapter = nn.Linear(self.D, self.D)
-
-        # Context Buffer Normalization (Spec 3.6 v2.1)
-        # Normalizes C_bar and Delta_C before adapter projection
-        # to ensure consistent scale for all components in C_aug
+        # Context Buffer Normalization (Spec 3.6 v2.4 - Unified Context)
+        # Normalizes C_bar and Delta_C for Selection path (gate_input)
+        # No adapter needed - uses raw_context directly
         self.context_norm = nn.LayerNorm(self.D)
 
     def reset_temporal_state(self):
@@ -828,9 +865,22 @@ class DenseMoEGatingRouter(nn.Module):
         if dim == self.mkt_input_dim:
             return self.mkt_proj.to(x.device)(x)
         # Fallback projection when runtime dim differs from configured dim
+        # [FIX] Use register_buffer or detach to prevent gradient issues
+        # Since this is a fallback for edge cases, we detach to prevent
+        # NaN gradients from an unregistered layer breaking training
         if self._temp_proj is None or self._temp_proj.in_features != dim:
             self._temp_proj = nn.Linear(dim, self.D).to(x.device)
-        return self._temp_proj(x)
+            nn.init.xavier_uniform_(self._temp_proj.weight)
+            nn.init.zeros_(self._temp_proj.bias)
+            # Register as buffer to track but mark requires_grad=False
+            # to prevent gradient accumulation in unmanaged layer
+            self._temp_proj.weight.requires_grad = False
+            self._temp_proj.bias.requires_grad = False
+        # Use no_grad for safety - this is a dimension fix, not learned
+        with th.no_grad():
+            projected = self._temp_proj(x.detach())
+        # Re-attach gradient for downstream operations
+        return projected.requires_grad_(x.requires_grad)
 
     def forward(
         self,
@@ -868,15 +918,21 @@ class DenseMoEGatingRouter(nn.Module):
         elif O_mkt_TA is not None:
             market_tokens = O_mkt_TA
 
+        # [NaN GUARD] Sanitize market_tokens before temporal encoding
+        if th.isnan(market_tokens).any() or th.isinf(market_tokens).any():
+            market_tokens = th.nan_to_num(market_tokens, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # Extract RAW market condition from temporal encoder
         # This is the shared latent state before task-specific projection
         raw_context, _ = self.temporal_encoder(market_tokens)  # (batch, D)
 
-        # Apply Selection Adapter to create "Selection View" of the context
-        context_selection = self.selection_adapter(raw_context)  # (batch, D)
+        # [NaN GUARD] Sanitize raw_context immediately after temporal encoding
+        if th.isnan(raw_context).any() or th.isinf(raw_context).any():
+            raw_context = th.nan_to_num(raw_context, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # ===== Temporal Context Augmentation (Spec 3.6) =====
-        # Augment gate input: C_aug = [C_sel^(t), C_bar_sel, Delta_C_sel]
+        # ===== Temporal Context Augmentation (Spec 3.6 v2.4 - Unified Context) =====
+        # Augment gate input: C_aug = [raw_context, C_bar, Delta_C]
+        # No adapter needed - uses raw_context directly
         if self.use_temporal_augmentation:
             if context_buffer is not None:
                 # Ensure buffer has batch dimension
@@ -889,38 +945,35 @@ class DenseMoEGatingRouter(nn.Module):
                     context_buffer = context_buffer.expand(batch_size, -1, -1)
 
                 # context_buffer stores RAW contexts (history)
-                # We need to project history to Selection View for consistency
                 # buffer shape: (batch, W, D)
                 history_raw = context_buffer[:, 1:, :]  # (batch, W-1, D)
                 current_raw = raw_context.unsqueeze(1)  # (batch, 1, D)
-                rolling_raw = th.cat([history_raw, current_raw], dim=1) # (batch, W, D)
+                rolling_raw = th.cat([history_raw, current_raw], dim=1)  # (batch, W, D)
 
-                # Compute statistics on RAW data first
+                # Compute statistics on RAW data
                 C_bar_raw = rolling_raw.mean(dim=1)  # (batch, D)
                 C_oldest_raw = rolling_raw[:, 0, :]  # (batch, D)
                 Delta_C_raw = raw_context - C_oldest_raw  # (batch, D)
 
-                # Normalize before projection to ensure consistent scale
-                C_bar_raw = self.context_norm(C_bar_raw)
-                Delta_C_raw = self.context_norm(Delta_C_raw)
+                # Normalize all 3 components to ensure consistent scale
+                raw_context_norm = self.context_norm(raw_context)
+                C_bar = self.context_norm(C_bar_raw)
+                Delta_C = self.context_norm(Delta_C_raw)
 
-                # Project statistics to Selection View
-                C_bar_sel = self.selection_adapter(C_bar_raw)
-                Delta_C_sel = self.selection_adapter(Delta_C_raw)
-
-                # Concatenate: C_aug = [C_sel, C_bar_sel, Delta_C_sel]
+                # Concatenate: C_aug = [raw_context_norm, C_bar, Delta_C]
                 gate_input = th.cat(
-                    [context_selection, C_bar_sel, Delta_C_sel], dim=-1
+                    [raw_context_norm, C_bar, Delta_C], dim=-1
                 )  # (batch, 3D)
             else:
-                # No buffer available (cold start)
-                zeros = th.zeros_like(context_selection)
+                # No buffer available (cold start) - still normalize raw_context
+                raw_context_norm = self.context_norm(raw_context)
+                zeros = th.zeros_like(raw_context_norm)
                 gate_input = th.cat(
-                    [context_selection, zeros, zeros], dim=-1
+                    [raw_context_norm, zeros, zeros], dim=-1
                 )  # (batch, 3D)
         else:
             # Augmentation disabled
-            gate_input = context_selection
+            gate_input = raw_context
 
         # Sanitize gate_input to prevent NaN propagation (defensive)
         # NaN can occur from edge-case data or numerical instability
@@ -930,6 +983,24 @@ class DenseMoEGatingRouter(nn.Module):
 
         # Generate gate weights from (augmented) selection context
         gate_weights = self.gate_network(gate_input)  # (batch, num_experts)
+
+        # [NaN GUARD] Sanitize gate_weights from softmax edge cases
+        # Softmax can produce NaN if input has extreme values or all -inf
+        if th.isnan(gate_weights).any() or th.isinf(gate_weights).any():
+            # Replace NaN with uniform distribution (0.25 for 4 experts)
+            gate_weights = th.nan_to_num(gate_weights, nan=0.25, posinf=0.25, neginf=0.25)
+            # Renormalize to ensure sum to 1
+            gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        # [GRADIENT STABILITY] Clamp gate weights to prevent extreme values
+        # Values very close to 0 cause gradient explosion through softmax backward
+        # Use label smoothing style: blend with uniform distribution
+        # gate_weights_stable = (1 - ε) × gate_weights + ε × uniform
+        # This ensures minimum weight of ε/num_experts = 0.01/4 = 0.0025
+        eps_smooth = 0.04  # 4% uniform smoothing
+        num_experts = gate_weights.size(-1)
+        uniform = 1.0 / num_experts
+        gate_weights = (1.0 - eps_smooth) * gate_weights + eps_smooth * uniform
 
         # Sanitize raw_context for downstream use
         if th.isnan(raw_context).any() or th.isinf(raw_context).any():
@@ -977,9 +1048,10 @@ class DirectionHead(nn.Module):
     Uses Late Fusion architecture to solve Information Bottleneck problem.
     Explicit signals bypass Deep Path and fuse directly at classification layer.
 
-    Architecture (Spec 3.5.2 v2.3 - Expand-then-Compress, No ResBlock):
-    - Deep Path: X_latent = [C_mkt, ΔC_mkt] → Expand(2D→3D) → GELU → Compress(3D→D) → h_deep
-      * Expansion learns richer C×Δ interactions (e.g., bullish + negative momentum = reversal)
+    Architecture (Spec 3.5.2 v2.4 - Unified Context Augmentation):
+    - Deep Path: X_latent = [raw_context, C_bar, Delta_C] → Expand(3D→4D) → GELU → Compress(4D→D) → h_deep
+      * Uses unified context representation (no separate macro adapter)
+      * Expansion learns richer interactions between current, mean, and momentum
       * No ResBlock for simplicity - Expand-Compress provides sufficient expressivity
     - Wide Path: X_explicit (6 signals) → CrossInteraction → bypass (direct anchoring)
     - Late Fusion: H_final = Concat(h_deep, X_wide) → Classifier(D+6 → 3)
@@ -1002,12 +1074,12 @@ class DirectionHead(nn.Module):
         # 6. Drawdown60: Rolling drawdown (Pain)
         self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
 
-        # Deep Path: Expand-then-Compress for richer C×Δ interaction (v2.3 - No ResBlock)
-        # [C_mkt, ΔC_mkt] (2D) → Expand(2D→3D) → GELU → Compress(3D→D)
-        # Expansion allows learning non-linear C×Δ interactions before compressing
+        # Deep Path: Expand-then-Compress for richer context interactions (v2.4 - Unified Context)
+        # [raw_context, C_bar, Delta_C] (3D) → Expand(3D→4D) → GELU → Compress(4D→D)
+        # Expansion allows learning non-linear interactions before compressing
         # Removed ResBlock for simplicity - Expand-Compress already provides sufficient expressivity
-        self.latent_dim = self.D * 2  # C_mkt(D) + Delta_C(D)
-        self.expand_dim = self.D * 3  # Expanded space for richer interaction
+        self.latent_dim = self.D * 3  # raw_context(D) + C_bar(D) + Delta_C(D)
+        self.expand_dim = self.D * 4  # Expanded space for richer interaction
         self.expand_proj = nn.Linear(self.latent_dim, self.expand_dim)
         self.compress_proj = nn.Linear(self.expand_dim, self.D)
         self.deep_norm = nn.LayerNorm(self.D)  # [FIX] Normalize Deep Path output to match Wide Path scale
@@ -1025,88 +1097,50 @@ class DirectionHead(nn.Module):
         # Dropout for regularization (prevent overfitting)
         self.dropout = nn.Dropout(self.dropout_rate)
 
-        # Initialize bias to log-priors and zero ALL weights
-        # This ensures initial predictions = softmax(bias) = ground truth distribution
-        self._init_classifier_bias()
-        # Enable smart-init for Wide Path explicit signals
-        self._init_explicit_signal_weights()
+        # Initialize for balanced start with neutral predictions (~33% each class)
+        # Uses standard Xavier weights (gain=1.0) + uniform bias (zeros)
+        self._init_classifier_balanced()
 
-    def _init_classifier_bias(self):
+    def _init_classifier_balanced(self):
         """
-        Initialize classifier with ZERO bias - uniform start, no class preference.
+        Initialize classifier with standard Xavier + uniform bias for neutral start.
 
         Strategy:
-        - Bias: All zeros → softmax([0,0,0]) = [33%, 33%, 33%]
-        - Model learns class distribution purely from data + dynamic class weights
-        - Weights: Keep PyTorch default (Kaiming uniform)
+        - Weights: Standard Xavier init (gain=1.0) - enough contribution to break symmetry
+        - Bias: Uniform (zeros) - no class preferred initially
+
+        This ensures:
+        1. Initial predictions ~33% each class (neutral, trainable)
+        2. Weights have sufficient magnitude to differentiate inputs
+        3. Model learns class distribution purely from data
+
+        Note: Previous log-prior bias caused 100% Side predictions because
+        Xavier gain=0.1 weights (~0.10 contribution) couldn't overcome
+        bias difference (~1.07 between Side and Bear/Bull).
         """
         with th.no_grad():
-            # Zero bias - uniform start, let dynamic weighting guide learning
-            self.classifier.bias.zero_()
-            # Weights: Keep default PyTorch init (Kaiming uniform)
+            # Standard Xavier init for weights (gain=1.0)
+            # Provides weight contribution ~1.0, enough to break symmetry
+            nn.init.xavier_uniform_(self.classifier.weight, gain=1.0)
 
-    def _init_explicit_signal_weights(self):
-        """
-        Smart-initialize Wide Path weights to respect signal logic.
-        SIGNAL ORDER (Input Tensor):
-        0: Vol_Std20
-        1: DC_Event_Flag
-        2: Breadth_Gap
-        3: Div_Signal
-        4: Signed_VPI_Zscore (only if D+4 exists)
-        5: Drawdown60 (only if D+5 exists)
-
-        Convention: -1 (Bearish), +1 (Bullish)
-
-        Weight logic:
-        - Bear Class (0): Negative weight (so -1 input -> + logit)
-        - Bull Class (2): Positive weight (so +1 input -> + logit)
-        """
-        with th.no_grad():
-            # Indices in the concatenated input (Deep=0..D-1, Wide=D..D+5)
-            # NOTE: Use VERY SMALL weights (0.01-0.05) to provide gentle hints
-            # without overwhelming the learning signal from data
-
-            # 0. Relative_Vol (Index D+0) - High Relative Vol -> Bearish Bias
-            self.classifier.weight[0, self.D + 0] = 0.02   # High Vol increases Bear prob
-            self.classifier.weight[2, self.D + 0] = -0.02  # High Vol decreases Bull prob
-
-            # 1. DC Event Flag (Index D+1) - Trend Break hint
-            self.classifier.weight[:, self.D + 1] = 0.01
-
-            # 2. Breadth_Gap (Index D+2) - "Xanh vỏ đỏ lòng"
-            self.classifier.weight[0, self.D + 2] = -0.03  # Neg Gap -> Bear
-            self.classifier.weight[2, self.D + 2] = 0.03   # Pos Gap -> Bull
-
-            # 3. Div_Signal (Index D+3) - Reversal
-            self.classifier.weight[0, self.D + 3] = -0.05
-            self.classifier.weight[2, self.D + 3] = 0.05
-
-            # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
-            if self.explicit_dim > 4:
-                self.classifier.weight[0, self.D + 4] = -0.03
-                self.classifier.weight[2, self.D + 4] = 0.03
-
-            # 5. Drawdown60 (Index D+5) - Trend Following
-            if self.explicit_dim > 5:
-                self.classifier.weight[0, self.D + 5] = -0.02
-                self.classifier.weight[2, self.D + 5] = 0.02
-
-            # Ensure Side Class (1) remains neutral to these signals initially
-            self.classifier.weight[1, self.D : self.D + self.explicit_dim] = 0.0
+            # Uniform bias - no class preferred
+            # softmax([0, 0, 0]) = [33.3%, 33.3%, 33.3%]
+            self.classifier.bias.fill_(0.0)
 
     def forward(
         self,
-        c_mkt: th.Tensor,
-        delta_c_mkt: th.Tensor,
+        raw_context: th.Tensor,
+        c_bar: th.Tensor,
+        delta_c: th.Tensor,
         explicit_signals: th.Tensor,
     ) -> th.Tensor:
         """
-        Wide & Deep Late Fusion forward pass (Spec 3.5.2 v2.1).
+        Wide & Deep Late Fusion forward pass (Spec 3.5.2 v2.4 - Unified Context).
 
         Args:
-            c_mkt: (B, D) - Current market context from Temporal Encoder
-            delta_c_mkt: (B, D) - Momentum/Velocity from Shared Buffer (Spec 3.6)
+            raw_context: (B, D) - Current market context from Temporal Encoder
+            c_bar: (B, D) - Rolling mean of context buffer
+            delta_c: (B, D) - Momentum (current - oldest) from context buffer
             explicit_signals: (B, 6) - Wide path signals:
                 [Vol_Std20, DC_Event_Flag, Breadth_Gap, Div_Signal, Signed_VPI_Zscore, Drawdown60]
 
@@ -1120,15 +1154,15 @@ class DirectionHead(nn.Module):
         # explicit_signals: (B, 6)
         signals_scaled = self.explicit_norm(explicit_signals)
 
-        # === 1. Deep Path: Expand-then-Compress (v2.3 - No ResBlock) ===
-        x_latent = th.cat([c_mkt, delta_c_mkt], dim=-1)  # (B, 2D)
+        # === 1. Deep Path: Expand-then-Compress (v2.4 - Unified Context) ===
+        x_latent = th.cat([raw_context, c_bar, delta_c], dim=-1)  # (B, 3D)
 
         # [ROBUSTNESS] Sanitize latent input
         if th.isnan(x_latent).any() or th.isinf(x_latent).any():
              x_latent = th.nan_to_num(x_latent, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Expand → GELU → Compress: Learn C×Δ interactions in expanded space
-        h_expanded = self.expand_proj(x_latent)  # (B, 3D)
+        # Expand → GELU → Compress: Learn context interactions in expanded space
+        h_expanded = self.expand_proj(x_latent)  # (B, 4D)
         h_expanded = F.gelu(h_expanded)
         h_deep = self.compress_proj(h_expanded)  # (B, D) - Direct output, no ResBlock
         h_deep = self.deep_norm(h_deep)  # [FIX] Normalize to match Wide Path scale
@@ -1159,11 +1193,12 @@ class DirectionHead(nn.Module):
 
 class RiskHead(nn.Module):
     """
-    Wide & Deep Risk Head (Spec v2.3 - Expand-then-Compress, No MLP)
+    Wide & Deep Risk Head (Spec v2.4 - Unified Context Augmentation)
 
     Architecture:
-    - Deep Path: [C_mkt_macro, ΔC_mkt] → Expand(2D→3D) → GELU → Compress(3D→D) → h_deep
-      * Expansion learns richer C×Δ interactions (e.g., high vol + negative momentum = defensive)
+    - Deep Path: [raw_context, C_bar, Delta_C] → Expand(3D→4D) → GELU → Compress(4D→D) → h_deep
+      * Uses unified context representation (no separate macro adapter)
+      * Expansion learns richer interactions (e.g., high vol + negative momentum = defensive)
       * No extra MLP for simplicity - Expand-Compress provides sufficient expressivity
     - Wide Path: Explicit Signals (6 dims) → CrossInteraction → Concat → Output
     """
@@ -1174,13 +1209,13 @@ class RiskHead(nn.Module):
         self.explicit_dim = getattr(config, "mafia_explicit_dim", 6)
         self.dropout_rate = getattr(config, "risk_head_dropout", 0.1)
 
-        # Deep Path: Expand-then-Compress for richer C×Δ interaction (v2.3 - No MLP)
-        # [C_mkt, ΔC_mkt] (2D) → Expand(2D→3D) → GELU → Compress(3D→D)
+        # Deep Path: Expand-then-Compress for richer context interactions (v2.4 - Unified Context)
+        # [raw_context, C_bar, Delta_C] (3D) → Expand(3D→4D) → GELU → Compress(4D→D)
         # Removed extra MLP for simplicity - aligned with DirectionHead
-        self.input_dim = self.D * 2  # C_mkt + Delta_C
-        self.expand_dim = self.D * 3  # Expanded space for richer interaction
-        self.expand_proj = nn.Linear(self.input_dim, self.expand_dim)  # Expand: 2D → 3D
-        self.compress_proj = nn.Linear(self.expand_dim, self.D)  # Compress: 3D → D
+        self.input_dim = self.D * 3  # raw_context(D) + C_bar(D) + Delta_C(D)
+        self.expand_dim = self.D * 4  # Expanded space for richer interaction
+        self.expand_proj = nn.Linear(self.input_dim, self.expand_dim)  # Expand: 3D → 4D
+        self.compress_proj = nn.Linear(self.expand_dim, self.D)  # Compress: 4D → D
         self.deep_norm = nn.LayerNorm(self.D)  # [FIX] Normalize Deep Path output to match Wide Path scale
 
         # Late Fusion
@@ -1196,58 +1231,41 @@ class RiskHead(nn.Module):
         self.wide_interaction = CrossInteractionLayer(self.explicit_dim)
         self.post_interaction_norm = nn.LayerNorm(self.explicit_dim)
 
-        # Smart Initalization for Wide Path (Spec 3.5.1 v2.1)
-        self._init_explicit_signal_weights()
+        # Initialize for balanced start (eta_raw ≈ 0 → eta = eta_base)
+        # Uses standard Xavier weights (gain=1.0) + zero bias (neutral)
+        self._init_fusion_net_balanced()
 
-    def _init_explicit_signal_weights(self):
+    def _init_fusion_net_balanced(self):
         """
-        Smart-initialize Wide Path weights for Risk Head.
-        Reflects inverse relationship between volatility/risk signals and eta (Risk Tolerance).
+        Initialize fusion_net with standard Xavier + zero bias for neutral start.
 
-        Target: High Risk Signal -> Low Eta (Defensive)
-        Weights should be NEGATIVE for Risk Factors.
+        Strategy:
+        - Weights: Standard Xavier init (gain=1.0) - sufficient contribution
+        - Bias: Zero → eta_raw starts near 0 → eta = eta_base (neutral)
+
+        This ensures:
+        1. Initial eta ≈ eta_base (neutral risk tolerance)
+        2. Weights have sufficient magnitude to differentiate inputs
+        3. Model learns to adjust eta based on input features
         """
         with th.no_grad():
-            # Fusion net input: [Deep(D), Wide(6)] -> Output(1)
-            # Wide signals start at index D.
-            # NOTE: Use VERY SMALL weights (0.02-0.05) to provide gentle hints
-            # without overwhelming the learning signal from data
-
-            # 0. Relative_Vol (Index D+0) - High Relative Vol -> Low Eta
-            self.fusion_net.weight[0, self.D + 0] = -0.05
-
-            # 1. DC_Event_Flag (Index D+1) - Trend Break -> Low Eta
-            self.fusion_net.weight[0, self.D + 1] = -0.03
-
-            # 2. Breadth_Gap (Index D+2) - Positive Gap -> High Eta
-            self.fusion_net.weight[0, self.D + 2] = 0.03
-
-            # 3. Div_Signal (Index D+3) - Bullish Div -> High Eta
-            self.fusion_net.weight[0, self.D + 3] = 0.03
-
-            # 4. Signed_VPI_Zscore (Index D+4) - Money Flow
-            if self.explicit_dim > 4:
-                 self.fusion_net.weight[0, self.D + 4] = 0.03
-
-            # 5. Drawdown60 (Index D+5) - Deep DD -> Low Eta
-            if self.explicit_dim > 5:
-                 self.fusion_net.weight[0, self.D + 5] = 0.05
-
-            # Initialize bias to 0.0 (Neutral start)
-            self.fusion_net.bias.fill_(0.0)
-
-            # Deep Path weights: Keep PyTorch default (Kaiming uniform)
+            # Standard Xavier init for weights (gain=1.0)
+            nn.init.xavier_uniform_(self.fusion_net.weight, gain=1.0)
+            # Zero bias for neutral start
+            self.fusion_net.bias.zero_()
 
     def forward(
         self,
-        c_mkt_macro: th.Tensor,
-        delta_c_mkt: th.Tensor,
+        raw_context: th.Tensor,
+        c_bar: th.Tensor,
+        delta_c: th.Tensor,
         explicit_signals: th.Tensor,
     ) -> th.Tensor:
         """
         Args:
-            c_mkt_macro: (B, D) - Macro-adapted context
-            delta_c_mkt: (B, D) - Momentum
+            raw_context: (B, D) - Current market context from Temporal Encoder
+            c_bar: (B, D) - Rolling mean of context buffer
+            delta_c: (B, D) - Momentum (current - oldest) from context buffer
             explicit_signals: (B, 6) - [Vol20, DC, Breadth, Div, VPI, DD60]
         """
         # === 0. Signal Scaling (Robustness) ===
@@ -1257,15 +1275,15 @@ class RiskHead(nn.Module):
         # explicit_signals: (B, 6)
         signals_scaled = self.explicit_norm(explicit_signals)
 
-        # === 1. Deep Path: Expand-then-Compress (v2.3 - No MLP) ===
-        x_latent = th.cat([c_mkt_macro, delta_c_mkt], dim=-1)  # (B, 2D)
+        # === 1. Deep Path: Expand-then-Compress (v2.4 - Unified Context) ===
+        x_latent = th.cat([raw_context, c_bar, delta_c], dim=-1)  # (B, 3D)
 
         # [ROBUSTNESS] Sanitize latent input
         if th.isnan(x_latent).any() or th.isinf(x_latent).any():
              x_latent = th.nan_to_num(x_latent, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Expand → GELU → Compress: Learn C×Δ interactions in expanded space
-        h_expanded = self.expand_proj(x_latent)  # (B, 3D)
+        # Expand → GELU → Compress: Learn context interactions in expanded space
+        h_expanded = self.expand_proj(x_latent)  # (B, 4D)
         h_expanded = F.gelu(h_expanded)
         h_deep = self.compress_proj(h_expanded)  # (B, D) - Direct output, no MLP
         h_deep = self.deep_norm(h_deep)  # [FIX] Normalize to match Wide Path scale
@@ -1286,6 +1304,77 @@ class RiskHead(nn.Module):
         eta_raw = self.fusion_net(h_final)
 
         return eta_raw.squeeze(-1)
+
+
+# ============================================================
+# PortfolioEncoder: Encode Portfolio State for Model Input
+# ============================================================
+
+class PortfolioEncoder(nn.Module):
+    """
+    Encodes portfolio state features (is_held, days_held, pnl, alpha) into
+    embeddings that can be fused with stock representations.
+
+    This enables the model to learn context-aware holding decisions:
+    - How long a stock has been held
+    - Current unrealized P&L
+    - Alpha since entry (outperformance vs market)
+
+    Architecture:
+    - Input: (batch, N, 4) portfolio state features
+    - Output: (batch, N, D) portfolio embeddings for fusion
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.D = config.mafia_D
+        self.portfolio_dim = 4  # [is_held, days_held_norm, unrealized_pnl, alpha]
+
+        # Two-layer MLP with GELU activation
+        hidden_dim = self.D // 2
+        self.encoder = nn.Sequential(
+            nn.Linear(self.portfolio_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.D),
+            nn.LayerNorm(self.D),
+        )
+
+        # Gating mechanism: learn how much to blend portfolio context
+        # This allows the model to adaptively weight portfolio information
+        self.gate = nn.Sequential(
+            nn.Linear(self.portfolio_dim, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, portfolio_state: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Encode portfolio state into embeddings.
+
+        Args:
+            portfolio_state: (batch, N, 4) containing:
+                - is_held: 1.0 if stock is currently held, 0.0 otherwise
+                - days_held_norm: days held / 21.0 (normalized by typical holding period)
+                - unrealized_pnl: (current_price - entry_price) / entry_price
+                - alpha: unrealized_pnl - market_return_since_entry
+
+        Returns:
+            portfolio_embedding: (batch, N, D) - portfolio context embeddings
+            gate_weights: (batch, N, 1) - gating weights for fusion
+        """
+        # Sanitize input
+        if th.isnan(portfolio_state).any() or th.isinf(portfolio_state).any():
+            portfolio_state = th.nan_to_num(
+                portfolio_state, nan=0.0, posinf=1.0, neginf=-1.0
+            )
+
+        # Encode portfolio state to D dimensions
+        portfolio_embedding = self.encoder(portfolio_state)  # (batch, N, D)
+
+        # Compute gating weights
+        gate_weights = self.gate(portfolio_state)  # (batch, N, 1)
+
+        return portfolio_embedding, gate_weights
 
 
 class DenseMoESignalGenerator(nn.Module):
@@ -1323,20 +1412,43 @@ class DenseMoESignalGenerator(nn.Module):
         self.risk_head = RiskHead(config)
 
         # Direction classification head (Spec 3.5: Context-Augmented Residual Architecture)
-        # Uses augmented input: X_dir = [C_mkt, Delta_C_mkt, Explicit_Signals]
+        # Uses augmented input: X_dir = [raw_context, C_bar, Delta_C, Explicit_Signals]
         self.direction_head = DirectionHead(config)
 
-        # Macro Adapter: Projects raw context for Direction/Risk (Macro Task)
-        self.macro_adapter = nn.Linear(self.D, self.D)
-
-        # Delta normalization for momentum signal (Spec 3.6 v2.1)
-        # Normalizes delta_c_mkt before passing to Direction/Risk Heads
-        self.delta_norm = nn.LayerNorm(self.D)
+        # Macro Context Norm: Separate LayerNorm for Macro path (Direction/Risk Heads)
+        # NOT shared with GatingRouter to ensure independent gradient flow
+        # This prevents issues when GatingRouter is frozen in MACRO_ONLY mode
+        self.macro_context_norm = nn.LayerNorm(self.D)
 
         # Holding Bias (Learnable Inertia) - Spec "Memory Injection"
         # Bias added to logits of currently held stocks to encourage retention
-        # Initialize to 0.01 (Smart Init) to encourage holding from start (helps convergence vs turnover penalty)
-        self.holding_bias = nn.Parameter(th.tensor([0.01]))
+        # [TUNED 2026-01-02] Initialize to 0.1 for faster learning with penalty system
+        # Combined with penalty/R_select=44%, this gives strong initial holding preference
+        # while still allowing rotation when stocks underperform
+        self.holding_bias = nn.Parameter(th.tensor([0.1]))
+
+        # Portfolio Encoder: Encode portfolio state for context-aware decisions
+        # Enables model to learn holding patterns based on:
+        # - is_held, days_held, unrealized_pnl, alpha_since_entry
+        self.portfolio_encoder = PortfolioEncoder(config)
+
+        # Portfolio Fusion Layer: Combine stock embeddings with portfolio context
+        # Input: stock_embedding (D) + portfolio_embedding (D) → fused (D)
+        self.portfolio_fusion = nn.Sequential(
+            nn.Linear(self.D * 2, self.D),
+            nn.LayerNorm(self.D),
+            nn.GELU(),
+            nn.Linear(self.D, self.D), # Output projection
+            nn.LayerNorm(self.D),
+        )
+
+        # [FIX] Initialize final fusion layer to zero
+        # This ensures that random initialization of PortfolioEncoder (when missing from checkpoint)
+        # produces ZERO adjustment initially, preventing random selection behavior.
+        with th.no_grad():
+            self.portfolio_fusion[-2].weight.fill_(0.0) # Linear is at -2 because of LayerNorm
+            self.portfolio_fusion[-2].bias.fill_(0.0)
+
 
     def set_train_mode(self, mode: str):
         """
@@ -1355,9 +1467,6 @@ class DenseMoESignalGenerator(nn.Module):
             # Freeze Selection Head (Gate Network)
             for p in self.gating_router.gate_network.parameters():
                 p.requires_grad = False
-            if hasattr(self.gating_router, "selection_adapter"):
-                for p in self.gating_router.selection_adapter.parameters():
-                    p.requires_grad = False
 
             # [FIX] Freeze Selection-related learnable parameters in MACRO_ONLY mode
             # These parameters only affect stock selection (PG Loss), not Macro direction
@@ -1373,28 +1482,24 @@ class DenseMoESignalGenerator(nn.Module):
         elif mode == "SELECTION_ONLY":
             # Freeze Backbone (Temporal Encoder) - CRITICAL: This is the Macro Stream
             if hasattr(self.gating_router, "temporal_encoder"):
-                 for p in self.gating_router.temporal_encoder.parameters():
-                     p.requires_grad = False
+                for p in self.gating_router.temporal_encoder.parameters():
+                    p.requires_grad = False
             if hasattr(self.gating_router, "mkt_proj"):
-                 for p in self.gating_router.mkt_proj.parameters():
-                     p.requires_grad = False
+                for p in self.gating_router.mkt_proj.parameters():
+                    p.requires_grad = False
             # Freeze context_norm (part of Macro path in router)
             if hasattr(self.gating_router, "context_norm"):
-                 for p in self.gating_router.context_norm.parameters():
-                     p.requires_grad = False
+                for p in self.gating_router.context_norm.parameters():
+                    p.requires_grad = False
 
             # Freeze Direction & Risk Heads (Macro Outputs)
             for p in self.direction_head.parameters():
                 p.requires_grad = False
             for p in self.risk_head.parameters():
                 p.requires_grad = False
-            if hasattr(self, "macro_adapter"):
-                 for p in self.macro_adapter.parameters():
-                     p.requires_grad = False
-            # Freeze delta_norm (part of Macro path)
-            if hasattr(self, "delta_norm"):
-                 for p in self.delta_norm.parameters():
-                     p.requires_grad = False
+            # Freeze macro_context_norm (separate LayerNorm for Macro path)
+            for p in self.macro_context_norm.parameters():
+                p.requires_grad = False
 
         # === GRADIENT VERIFICATION LOGGING ===
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1455,9 +1560,12 @@ class DenseMoESignalGenerator(nn.Module):
         explicit_signals: Optional[
             th.Tensor
         ] = None,  # (batch, 2) [vol_shock_flag, dc_event_flag] for Direction Head (Spec 3.5)
-        prev_holdings: Optional[
+        holding_alpha_bias: Optional[
             th.Tensor
-        ] = None,  # (batch, N) Binary mask of stocks held at t-1 (Memory Injection)
+        ] = None,  # (batch, N) Smart Holding Bias: alpha × sensitivity × is_held
+        portfolio_state: Optional[
+            th.Tensor
+        ] = None,  # (batch, N, 4) Portfolio context: [is_held, days_held, pnl, alpha]
     ) -> Tuple[
         th.Tensor,
         th.Tensor,
@@ -1521,21 +1629,28 @@ class DenseMoESignalGenerator(nn.Module):
             [o.squeeze(-1) for o in expert_outputs], dim=1
         )  # (batch, 4, N)
 
+        # [NaN GUARD] Sanitize expert logits before fusion
+        if th.isnan(expert_logits_stacked).any() or th.isinf(expert_logits_stacked).any():
+            expert_logits_stacked = th.nan_to_num(
+                expert_logits_stacked, nan=0.0, posinf=10.0, neginf=-10.0
+            )
+
         # Weighted combination using gate weights
         gate_weights_expanded = gate_weights.unsqueeze(-1)  # (batch, 4, 1)
         market_logits = th.sum(
             gate_weights_expanded * expert_logits_stacked, dim=1
         )  # (batch, N)
 
-        # Apply Holding Bias (Memory Injection)
-        # Logit_new = Logit_old + (Bias * Is_Held)
-        if prev_holdings is not None:
+        # Apply Smart Holding Bias (Alpha-based Memory Injection)
+        # Logit_new = Logit_old + holding_alpha_bias
+        # where holding_alpha_bias = alpha × sensitivity × is_held (computed in trainer)
+        if holding_alpha_bias is not None:
             # Ensure shape match
-            if prev_holdings.shape != market_logits.shape:
-               raise ValueError(f"prev_holdings shape {prev_holdings.shape} mismatch with logits {market_logits.shape}")
-            
-            # Add bias (broadcast scalar * tensor)
-            market_logits = market_logits + (self.holding_bias * prev_holdings)
+            if holding_alpha_bias.shape != market_logits.shape:
+               raise ValueError(f"holding_alpha_bias shape {holding_alpha_bias.shape} mismatch with logits {market_logits.shape}")
+
+            # Add pre-computed bias directly (already includes alpha × sensitivity × is_held)
+            market_logits = market_logits + holding_alpha_bias
 
         # Optional: fuse per-stock ST embeddings from experts using gate weights
         fused_stock_embedding = None
@@ -1551,6 +1666,29 @@ class DenseMoESignalGenerator(nn.Module):
             fused_stock_embedding = th.sum(
                 gate_weights_exp * stacked_emb, dim=1
             )  # (batch, N, D)
+
+        # ============================================================
+        # Portfolio Context Fusion (Option C: Portfolio Branch)
+        # ============================================================
+        # Fuse portfolio state with stock embeddings to enable learned
+        # holding decisions based on: is_held, days_held, pnl, alpha
+        if portfolio_state is not None and fused_stock_embedding is not None:
+            # Encode portfolio state: (batch, N, 4) → (batch, N, D), (batch, N, 1)
+            portfolio_embedding, portfolio_gate = self.portfolio_encoder(portfolio_state)
+
+            # Concatenate stock + portfolio embeddings: (batch, N, 2D)
+            combined_embedding = th.cat([fused_stock_embedding, portfolio_embedding], dim=-1)
+
+            # Fuse to single embedding: (batch, N, D)
+            fused_embedding = self.portfolio_fusion(combined_embedding)
+
+            # Compute portfolio-aware logit adjustment using a simple projection
+            # The gate controls how much portfolio context influences each stock
+            # portfolio_gate is (batch, N, 1) - sigmoid output [0, 1]
+            portfolio_logit_adjustment = (fused_embedding.mean(dim=-1, keepdim=True) * portfolio_gate).squeeze(-1)  # (batch, N)
+
+            # Apply adjustment to market_logits (additive, like holding_alpha_bias)
+            market_logits = market_logits + portfolio_logit_adjustment
 
         # Step 3: Gumbel-TopK selection
         # Use dynamic temperature: tau_gumbel is updated by MAFIAObserver.update_temperature()
@@ -1644,51 +1782,52 @@ class DenseMoESignalGenerator(nn.Module):
             topk_embeddings = th.gather(fused_stock_embedding, 1, topk_indices_exp)
         topk_scores = th.gather(market_vector, 1, topk_indices)  # (batch, K)
 
-        # === Risk Head (Wide & Deep v2.1) ===
-        # 1. Apply Macro Adapter to raw_context -> Separation of Concerns
-        context_macro = self.macro_adapter(raw_context)  # (batch, D)
+        # === Risk/Direction Heads (Spec v2.4 - Unified Context Augmentation) ===
+        # Compute C_bar and Delta_C from context buffer (same as Selection stream)
+        # Uses separate macro_context_norm for independent gradient flow
 
-        # 2. Compute Delta_C_mkt (Momentum/Velocity) using macro context
-        delta_c_mkt = th.zeros_like(context_macro)  # Default: zeros (cold start)
+        # Use separate context_norm for Macro path (NOT shared with GatingRouter)
+        # This ensures gradients flow correctly in MACRO_ONLY mode
+        context_norm = self.macro_context_norm
 
         if router_context_buffer is not None:
-            # router_context_buffer contains RAW contexts
-            # (W, D) or (batch, W, D)
+            # Ensure buffer has batch dimension
             if router_context_buffer.dim() == 2:  # (W, D)
-                c_oldest_raw = router_context_buffer[0:1].expand(batch_size, -1)  # (B, D)
-            else:  # (batch, W, D)
-                c_oldest_raw = router_context_buffer[:, 0, :]  # (B, D)
-            
-            # Project oldest raw -> oldest macro
-            # Spec 3.6 requires Delta = C_curr - C_(t-W+1).
-            # Buffer contains [C_(t-W), C_(t-W+1), ... C_(t-1)]
-            # Index 0 is C_(t-W). Index 1 is C_(t-W+1).
-            # We use index 1 to align with Gating Router and Spec.
-            if router_context_buffer.size(1) > 1:
-                # Use C_(t-W+1) if window is large enough
-                if router_context_buffer.dim() == 2:  # (W, D)
-                    c_oldest_raw = router_context_buffer[1:2].expand(batch_size, -1)
-                else:  # (batch, W, D)
-                    c_oldest_raw = router_context_buffer[:, 1, :]
+                buffer = router_context_buffer.unsqueeze(0)  # (1, W, D)
             else:
-                # Fallback for short windows (W=1)
-                if router_context_buffer.dim() == 2:
-                    c_oldest_raw = router_context_buffer[0:1].expand(batch_size, -1)
-                else:
-                    c_oldest_raw = router_context_buffer[:, 0, :]
-            
-            c_oldest_macro = self.macro_adapter(c_oldest_raw)
-            delta_c_mkt = context_macro - c_oldest_macro  # Macro momentum
-            # Normalize momentum for consistent scale with context
-            delta_c_mkt = self.delta_norm(delta_c_mkt)
+                buffer = router_context_buffer  # (B, W, D)
+
+            # Expand buffer to match batch size if needed
+            if buffer.size(0) == 1 and batch_size > 1:
+                buffer = buffer.expand(batch_size, -1, -1)
+
+            # Rolling window = [history + current] (same as Selection stream)
+            history_raw = buffer[:, 1:, :]  # (B, W-1, D)
+            current_raw = raw_context.unsqueeze(1)  # (B, 1, D)
+            rolling_raw = th.cat([history_raw, current_raw], dim=1)  # (B, W, D)
+
+            # Compute statistics on RAW data
+            C_bar_raw = rolling_raw.mean(dim=1)  # (B, D)
+            C_oldest_raw = rolling_raw[:, 0, :]  # (B, D)
+            Delta_C_raw = raw_context - C_oldest_raw  # (B, D)
+
+            # Normalize all 3 components with shared context_norm
+            raw_context_norm = context_norm(raw_context)
+            C_bar = context_norm(C_bar_raw)
+            Delta_C = context_norm(Delta_C_raw)
+        else:
+            # Cold start - still normalize raw_context
+            raw_context_norm = context_norm(raw_context)
+            C_bar = th.zeros_like(raw_context_norm)
+            Delta_C = th.zeros_like(raw_context_norm)
 
         # Require explicit signals - Spec §3.5.1 Updated (6 signals)
         if explicit_signals is None:
             raise ValueError("explicit_signals is required for Risk/Direction Head.")
 
-        # 3. Risk Prediction
+        # Risk Prediction - receives [raw_context_norm, C_bar, Delta_C, explicit_signals]
         eta_raw = self.risk_head(
-            context_macro, delta_c_mkt, explicit_signals
+            raw_context_norm, C_bar, Delta_C, explicit_signals
         )
         eta_base = getattr(self.config, "mafia_eta_base", 1.0)
         eta_amp = getattr(self.config, "mafia_eta_amplitude", 0.3)
@@ -1697,9 +1836,9 @@ class DenseMoESignalGenerator(nn.Module):
         eta = eta_base + eta_amp * th.tanh(eta_raw)
         eta = th.clamp(eta, min=eta_min, max=eta_max)
 
-        # Market direction logits (Spec 3.5: Context-Augmented Residual)
+        # Direction Classification - receives [raw_context_norm, C_bar, Delta_C, explicit_signals]
         sigma_logits = self.direction_head(
-            context_macro, delta_c_mkt, explicit_signals
+            raw_context_norm, C_bar, Delta_C, explicit_signals
         )  # (batch, 3)
 
         return (
@@ -1883,7 +2022,10 @@ class MAFIAModel(nn.Module):
         explicit_signals: Optional[
             th.Tensor
         ] = None,  # (batch, 2) [vol_shock, dc_flag] for Direction Head (Spec 3.5)
-        prev_holdings: Optional[th.Tensor] = None,  # Memory Injection
+        holding_alpha_bias: Optional[th.Tensor] = None,  # Smart Holding Bias
+        portfolio_state: Optional[
+            th.Tensor
+        ] = None,  # (batch, N, 4) Portfolio context: [is_held, days_held, pnl, alpha]
     ) -> Tuple[
         th.Tensor,
         th.Tensor,
@@ -1920,8 +2062,6 @@ class MAFIAModel(nn.Module):
         device = ochlv_data.device
         dtype = th.float32
 
-        # Process each batch item
-        tech_batches = []
         # Process each batch item
         tech_batches = []
         dc_batches = [[] for _ in range(len(self.config.mafia_DC_multipliers))]
@@ -2011,7 +2151,6 @@ class MAFIAModel(nn.Module):
             P_mkt = th.from_numpy(np.stack(mkt_batches, axis=0)).to(
                 dtype=dtype, device=device, non_blocking=True
             )  # (batch, 1, T_w, M_mkt)
-            # DC features for market index per threshold
             P_dc_mkt_list = [
                 th.from_numpy(np.stack(mkt_dc_batches[idx], axis=0)).to(
                     dtype=dtype, device=device, non_blocking=True
@@ -2059,7 +2198,8 @@ class MAFIAModel(nn.Module):
             force_topk_indices=force_topk_indices,
             router_context_buffer=router_context_buffer,  # Temporal augmentation (Spec 3.6)
             explicit_signals=explicit_signals,  # Direction Head explicit signals (Spec 3.5)
-            prev_holdings=prev_holdings,  # Memory Injection
+            holding_alpha_bias=holding_alpha_bias,  # Smart Holding Bias
+            portfolio_state=portfolio_state,  # Portfolio context for learned holding decisions
         )
 
         return (
@@ -2073,3 +2213,150 @@ class MAFIAModel(nn.Module):
             topk_scores,
             market_logits,
         )
+
+
+# ============================================================
+# WatchlistContextModule: Compute Watchlist/Portfolio Context
+# ============================================================
+
+class WatchlistContextModule(nn.Module):
+    """
+    Watchlist Context Module for temporal aggregation of Watchlist embeddings.
+
+    Used for:
+    - Screening decisions (ADD/REMOVE)
+    - Holdings protection
+    - Monitoring & logging
+
+    NOT used for:
+    - Gating Router (stays at 3D with Market Context only)
+
+    Derives from embeddings buffer:
+    - C_watchlist: Current day context (weighted sum)
+    - C_bar_watchlist: Mean context over window
+    - Delta_C_watchlist: Momentum (current - oldest)
+    """
+
+    def __init__(self, embedding_dim: int, context_window: int = 30):
+        """
+        Initialize WatchlistContextModule.
+
+        Args:
+            embedding_dim: Dimension of embeddings (D)
+            context_window: Size of temporal buffer (default 30)
+        """
+        super().__init__()
+        self.D = embedding_dim
+        self.context_window = context_window
+
+        # Optional: learnable projection for context aggregation
+        self.context_proj = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.GELU(),
+        )
+
+    def forward(
+        self,
+        embeddings_buffer: th.Tensor,
+        screening_scores: th.Tensor,
+        buffer_idx: int,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Compute Watchlist Context from embeddings buffer.
+
+        Args:
+            embeddings_buffer: (context_window, watchlist_size, D) buffer
+            screening_scores: (watchlist_size,) screening scores as weights
+            buffer_idx: Current FIFO buffer index (most recent = buffer_idx - 1)
+
+        Returns:
+            c_current: (D,) Current day context
+            c_bar: (D,) Mean context over window
+            delta_c: (D,) Momentum context (current - oldest)
+        """
+        # Get current day embeddings (most recent)
+        current_idx = (buffer_idx - 1) % self.context_window
+        current_embeddings = embeddings_buffer[current_idx]  # (watchlist_size, D)
+
+        # Normalize screening scores as weights
+        weights = screening_scores / (screening_scores.sum() + 1e-8)
+        weights = weights.unsqueeze(-1)  # (watchlist_size, 1)
+
+        # C_current: Weighted sum of current embeddings
+        c_current = (current_embeddings * weights).sum(dim=0)  # (D,)
+        c_current = self.context_proj(c_current)
+
+        # C_bar: Mean context over entire buffer
+        # Aggregate all days, then compute weighted sum for each day, then average
+        all_contexts = []
+        for t in range(self.context_window):
+            day_embeddings = embeddings_buffer[t]  # (watchlist_size, D)
+            day_context = (day_embeddings * weights).sum(dim=0)  # (D,)
+            all_contexts.append(day_context)
+        all_contexts = th.stack(all_contexts, dim=0)  # (context_window, D)
+        c_bar = all_contexts.mean(dim=0)  # (D,)
+        c_bar = self.context_proj(c_bar)
+
+        # Delta_C: Momentum (current - oldest)
+        oldest_idx = buffer_idx % self.context_window  # Oldest entry
+        oldest_embeddings = embeddings_buffer[oldest_idx]  # (watchlist_size, D)
+        c_oldest = (oldest_embeddings * weights).sum(dim=0)  # (D,)
+        c_oldest = self.context_proj(c_oldest)
+        delta_c = c_current - c_oldest  # (D,)
+
+        return c_current, c_bar, delta_c
+
+    def compute_portfolio_context(
+        self,
+        embeddings_buffer: th.Tensor,
+        holdings_mask: th.Tensor,
+        portfolio_weights: th.Tensor,
+        buffer_idx: int,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Compute Portfolio Context from embeddings buffer (holdings only).
+
+        Args:
+            embeddings_buffer: (context_window, watchlist_size, D) buffer
+            holdings_mask: (watchlist_size,) boolean mask of holdings
+            portfolio_weights: (watchlist_size,) allocation weights
+            buffer_idx: Current FIFO buffer index
+
+        Returns:
+            c_portfolio: (D,) Current portfolio context
+            c_bar_portfolio: (D,) Mean portfolio context
+            delta_c_portfolio: (D,) Portfolio momentum
+        """
+        # Get current day embeddings
+        current_idx = (buffer_idx - 1) % self.context_window
+        current_embeddings = embeddings_buffer[current_idx]  # (watchlist_size, D)
+
+        # Filter to holdings only
+        holdings_float = holdings_mask.float()
+        weights = portfolio_weights * holdings_float
+        weight_sum = weights.sum() + 1e-8
+        weights = (weights / weight_sum).unsqueeze(-1)  # (watchlist_size, 1)
+
+        # C_portfolio: Weighted sum of current holdings embeddings
+        c_portfolio = (current_embeddings * weights).sum(dim=0)  # (D,)
+        c_portfolio = self.context_proj(c_portfolio)
+
+        # C_bar_portfolio: Mean over buffer
+        all_contexts = []
+        for t in range(self.context_window):
+            day_embeddings = embeddings_buffer[t]
+            day_context = (day_embeddings * weights).sum(dim=0)
+            all_contexts.append(day_context)
+        all_contexts = th.stack(all_contexts, dim=0)
+        c_bar_portfolio = all_contexts.mean(dim=0)
+        c_bar_portfolio = self.context_proj(c_bar_portfolio)
+
+        # Delta_C_portfolio: Momentum
+        oldest_idx = buffer_idx % self.context_window
+        oldest_embeddings = embeddings_buffer[oldest_idx]
+        c_oldest = (oldest_embeddings * weights).sum(dim=0)
+        c_oldest = self.context_proj(c_oldest)
+        delta_c_portfolio = c_portfolio - c_oldest
+
+        return c_portfolio, c_bar_portfolio, delta_c_portfolio

@@ -22,6 +22,7 @@ Usage:
         valid_metrics = trainer.validate_epoch(valid_data)
 """
 
+import os
 import numpy as np
 import pandas as pd
 import torch as th
@@ -31,6 +32,27 @@ from dataclasses import dataclass, asdict
 
 from RL_controller.observer_validation_metrics import ObserverValidationResult
 from config import MafiaTrainMode
+
+# Deferred import to avoid circular dependency with mafia_observer.py
+# WatchlistIntegration imports WatchlistManager from mafia_observer.py
+# mafia_observer.py imports HybridRiskLoss from this file
+_WatchlistIntegration = None
+_compute_screening_inputs = None
+
+
+def _get_watchlist_integration():
+    """Lazy import to avoid circular dependency."""
+    global _WatchlistIntegration, _compute_screening_inputs
+    if _WatchlistIntegration is None:
+        from RL_controller.watchlist_integration import (
+            WatchlistIntegration,
+            compute_screening_inputs,
+        )
+
+        _WatchlistIntegration = WatchlistIntegration
+        _compute_screening_inputs = compute_screening_inputs
+    return _WatchlistIntegration, _compute_screening_inputs
+
 
 # LiveDisplay smart_print for terminal-safe logging
 # LiveDisplay smart_print for terminal-safe logging
@@ -559,7 +581,8 @@ class ObserverOfflineBatchTrainer:
 
         # Reward scaling factor (Spec §5.1.1: S_reward)
         # Raw compounding returns ~0.01, scale to ~1.0 for stable gradients
-        self.scale_factor_reward = float(getattr(config, "scale_factor_reward", 100.0))
+        # [FIX] Default reduced from 100.0 to 10.0 to prevent gradient explosion
+        self.scale_factor_reward = float(getattr(config, "scale_factor_reward", 10.0))
 
         # Curriculum Learning parameters (Spec §7.1)
         # warmup=1, rampup=5 → total 6 epochs curriculum for 10-epoch finetune
@@ -608,17 +631,23 @@ class ObserverOfflineBatchTrainer:
         self.risk_corr_alpha = float(
             getattr(config, "risk_loss_correlation_alpha", 0.7)
         )
-        self.risk_corr_eps = float(
-            getattr(config, "risk_loss_correlation_eps", 1e-8)
-        )
+        self.risk_corr_eps = float(getattr(config, "risk_loss_correlation_eps", 1e-8))
         self.risk_criterion = HybridRiskLoss(
-            alpha=self.risk_corr_alpha,
-            eps=self.risk_corr_eps,
-            reduction="mean"
+            alpha=self.risk_corr_alpha, eps=self.risk_corr_eps, reduction="mean"
         )
         smart_print(
             f"[LOSS] Risk Loss: HybridRiskLoss(α={self.risk_corr_alpha}, "
-            f"MSE={(1-self.risk_corr_alpha):.0%}, Corr={self.risk_corr_alpha:.0%})"
+            f"MSE={(1 - self.risk_corr_alpha):.0%}, Corr={self.risk_corr_alpha:.0%})"
+        )
+
+        # Log regularization status
+        l1_enabled = getattr(config, "macro_enable_l1_regularization", True)
+        l2_enabled = getattr(config, "macro_enable_l2_regularization", True)
+        l1_lambda = getattr(config, "mafia_l1_lambda", 0.0)
+        l2_wd = getattr(config, "mafia_weight_decay", 0.0)
+        smart_print(
+            f"[REGULARIZATION] L1={l1_enabled} (λ={l1_lambda:.1e}), "
+            f"L2={l2_enabled} (wd={l2_wd:.1e})"
         )
 
         # Direction Loss: Focal Loss (Spec 5.1.3)
@@ -644,9 +673,7 @@ class ObserverOfflineBatchTrainer:
                 f"smoothing={self.dynamic_weight_smoothing}"
             )
         else:
-            smart_print(
-                f"[LOSS] Using STATIC class weights: α={self.focal_alpha}"
-            )
+            smart_print(f"[LOSS] Using STATIC class weights: α={self.focal_alpha}")
 
         # Direction threshold for labeling
         self.direction_threshold = float(
@@ -702,6 +729,247 @@ class ObserverOfflineBatchTrainer:
         self._step = 0
         self._total_loss_accum = 0.0
         self._batch_count = 0
+
+        # Watchlist System Integration (Spec: cozy-whistling-nova.md)
+        self._init_watchlist_integration()
+
+    def _init_watchlist_integration(self):
+        """Initialize Watchlist System for screening and selection filtering.
+
+        Note: Watchlist only works in SELECTION_ONLY mode since it's designed
+        for stock selection screening, not macro signal training.
+        """
+        watchlist_enabled = getattr(self.config, "watchlist_enabled", False)
+        if not watchlist_enabled:
+            self.watchlist_integration = None
+            smart_print("[WATCHLIST] Disabled by config")
+            return
+
+        # Watchlist only works in SELECTION_ONLY mode
+        train_mode = getattr(self.config, "mafia_train_mode", None)
+        if train_mode != MafiaTrainMode.SELECTION_ONLY:
+            self.watchlist_integration = None
+            smart_print(f"[WATCHLIST] Disabled - only works in SELECTION_ONLY mode (current: {train_mode})")
+            return
+
+        try:
+            WatchlistIntegration, _ = _get_watchlist_integration()
+            self.watchlist_integration = WatchlistIntegration(
+                config=self.config, observer=self.observer, device=self.device
+            )
+            if self.watchlist_integration.is_enabled():
+                smart_print(
+                    f"[WATCHLIST] Enabled - Size: {getattr(self.config, 'watchlist_size', 40)}, "
+                    f"Screening Period: {getattr(self.config, 'watchlist_screening_period_days', 10)} days"
+                )
+            else:
+                smart_print(
+                    "[WATCHLIST] Initialization failed - running without Watchlist"
+                )
+        except Exception as e:
+            smart_print(f"[WATCHLIST] Init error: {e} - running without Watchlist")
+            self.watchlist_integration = None
+
+    def _run_watchlist_daily_step(
+        self,
+        batch: "TrajectoryBatch",
+        t: int,
+        market_logits: th.Tensor,
+        embeddings: Optional[th.Tensor] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run Watchlist daily screening step.
+
+        Called every timestep to:
+        1. Compute Technical Score
+        2. Run screening (ADD/REMOVE based on thresholds)
+        3. Update embeddings buffer
+
+        Args:
+            batch: Current TrajectoryBatch
+            t: Current timestep within trajectory
+            market_logits: (B, N) expert logits from model forward
+            embeddings: (B, N, D) stock embeddings (optional)
+
+        Returns:
+            Screening result dict or None if disabled
+        """
+        if (
+            self.watchlist_integration is None
+            or not self.watchlist_integration.is_enabled()
+        ):
+            return None
+
+        try:
+            # Extract screening inputs from batch
+            _, compute_screening_inputs = _get_watchlist_integration()
+            screening_inputs = compute_screening_inputs(
+                batch_data=batch,
+                feature_processor=self.watchlist_integration.feature_processor,
+                config=self.config,
+            )
+
+            # Convert logits to model scores via softmax
+            # market_scores_full = softmax(market_logits) represents model's allocation preference
+            market_scores = (
+                F.softmax(market_logits.mean(dim=0), dim=-1).cpu().numpy()
+            )  # (N,)
+
+            # Prepare embeddings if available
+            emb_tensor = None
+            if embeddings is not None:
+                emb_tensor = embeddings.mean(dim=0)  # (N, D)
+
+            # Run daily step with model scores (not raw logits)
+            result = self.watchlist_integration.daily_step(
+                close_prices=screening_inputs["close_prices"],
+                volumes=screening_inputs["volumes"],
+                market_close=screening_inputs["market_close"],
+                model_scores=market_scores,
+                embeddings=emb_tensor,
+                ma20_prices=screening_inputs.get("ma20_prices"),
+                ma50_prices=screening_inputs.get("ma50_prices"),
+                return_20d=screening_inputs.get("return_20d"),
+            )
+
+            return result
+
+        except Exception as e:
+            # Don't let Watchlist errors break training
+            if self._step % 100 == 0:  # Log occasionally
+                smart_print(f"[WATCHLIST] Daily step error: {e}")
+            return None
+
+    def _run_watchlist_post_rebalance(
+        self,
+        prev_holdings_indices: np.ndarray,
+        new_holdings_indices: np.ndarray,
+        current_prices: np.ndarray,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run Watchlist post-rebalance cleanup (ĐK B).
+
+        Called after Top-K selection on rebalance days.
+
+        Args:
+            prev_holdings_indices: Previous holdings (universe indices)
+            new_holdings_indices: New selections (universe indices)
+            current_prices: Current stock prices
+
+        Returns:
+            Cleanup result dict or None if disabled
+        """
+        if (
+            self.watchlist_integration is None
+            or not self.watchlist_integration.is_enabled()
+        ):
+            return None
+
+        try:
+            result = self.watchlist_integration.post_rebalance_cleanup(
+                prev_holdings_indices=prev_holdings_indices,
+                new_holdings_indices=new_holdings_indices,
+                current_prices=current_prices,
+            )
+            return result
+        except Exception as e:
+            if self._step % 100 == 0:
+                smart_print(f"[WATCHLIST] Post-rebalance error: {e}")
+            return None
+
+    def _init_watchlist_log(self, output_dir: str) -> None:
+        """Initialize Watchlist log file for tracking."""
+        if self.watchlist_integration is None or not self.watchlist_integration.is_enabled():
+            self._watchlist_log_path = None
+            return
+
+        self._watchlist_log_path = os.path.join(output_dir, "watchlist_log.csv")
+        self._watchlist_log_initialized = False
+
+    def _log_watchlist_state(
+        self,
+        epoch: int,
+        segment: int,
+        timestep: int,
+        action: str,
+        screening_result: Optional[Dict] = None,
+        stock_list: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Log Watchlist state to CSV for monitoring.
+
+        Args:
+            epoch: Current epoch
+            segment: Current segment/batch
+            timestep: Current timestep
+            action: "screening" or "cleanup" or "init"
+            screening_result: Result from screening step
+            stock_list: List of stock symbols for index mapping
+        """
+        if self._watchlist_log_path is None:
+            return
+
+        try:
+            wl_manager = self.watchlist_integration.watchlist_manager
+            if wl_manager is None:
+                return
+
+            # Get Watchlist info
+            wl_indices = wl_manager.watchlist_indices
+            wl_size = wl_manager.current_size
+            holdings_mask = wl_manager._holdings_mask
+
+            # Map indices to stock symbols if available
+            if wl_indices is not None and stock_list is not None:
+                wl_stocks = [stock_list[i] for i in wl_indices[:min(len(wl_indices), 20)]]  # Top 20
+                wl_stocks_str = ",".join(wl_stocks)
+                if len(wl_indices) > 20:
+                    wl_stocks_str += f"...(+{len(wl_indices)-20})"
+            else:
+                wl_stocks_str = str(wl_indices[:20].tolist()) if wl_indices is not None else "[]"
+
+            # Get holdings info
+            holdings_count = 0
+            holdings_stocks_str = "[]"
+            if holdings_mask is not None:
+                holdings_indices = np.where(holdings_mask)[0]
+                holdings_count = len(holdings_indices)
+                if stock_list is not None and holdings_count > 0:
+                    holdings_stocks = [stock_list[i] for i in holdings_indices]
+                    holdings_stocks_str = ",".join(holdings_stocks)
+                else:
+                    holdings_stocks_str = str(holdings_indices.tolist()) if holdings_count > 0 else "[]"
+
+            # Get screening result info
+            added = screening_result.get("added", 0) if screening_result else 0
+            removed = screening_result.get("removed", 0) if screening_result else 0
+            tech_mean = screening_result.get("tech_scores_mean", 0.0) if screening_result else 0.0
+            tech_std = screening_result.get("tech_scores_std", 0.0) if screening_result else 0.0
+
+            # Build log row
+            log_row = {
+                "epoch": epoch,
+                "segment": segment,
+                "timestep": timestep,
+                "action": action,
+                "watchlist_size": wl_size,
+                "holdings_count": holdings_count,
+                "added": added,
+                "removed": removed,
+                "tech_score_mean": round(tech_mean, 4),
+                "tech_score_std": round(tech_std, 4),
+                "watchlist_stocks": wl_stocks_str,
+                "holdings_stocks": holdings_stocks_str,
+            }
+
+            # Write to CSV
+            df = pd.DataFrame([log_row])
+            header = not self._watchlist_log_initialized
+            df.to_csv(self._watchlist_log_path, mode='a', header=header, index=False)
+            self._watchlist_log_initialized = True
+
+        except Exception:
+            pass  # Silent fail - don't interrupt training
 
     def _clear_memory_cache(self, force_gc: bool = False) -> None:
         """
@@ -1267,63 +1535,63 @@ class ObserverOfflineBatchTrainer:
         market_ochlv = data_tensors.get("market_ochlv")
         if market_ochlv is None:
             return np.array([])
-        
+
         # Move to CPU/Numpy for vector ops
         market_close = market_ochlv[:, 0, 1].cpu().numpy()
-        
+
         T_total = len(market_close)
         regime_indices_list = []
-        
+
         # 1. Volatility Shock Detection (Spec 8.1.3)
         # V_curr > mu_vol + k * sigma_vol
         vol_window = int(getattr(self.config, "regime_vol_window", 20))
         vol_k = float(getattr(self.config, "regime_vol_k", 3.0))
-        
+
         # Calc Rolling Volatility
         log_ret = np.zeros_like(market_close)
         log_ret[1:] = np.log(market_close[1:] / (market_close[:-1] + 1e-8))
-        
+
         # Use simple rolling std for speed
         rolling_std = pd.Series(log_ret).rolling(window=vol_window).std().values
         # Fill NaN
         rolling_std[:vol_window] = 0.0
-        
+
         # Calc Volatility Z-Score (Mean/Std of Vol itself over long window e.g. 252)
         # Spec says: V_curr > mu + k*sigma. Mu/Sigma here refer to distribution of Volatility itself?
         # Or simplistic: Price change > 3 sigma?
         # "Biến động giá vượt quá biên độ chuẩn (Bollinger Band breakout/Sigma shock)"
         # Logic: V_curr > mean_vol_252 + k * std_vol_252
-        
+
         long_window = 252
         vol_mean_long = pd.Series(rolling_std).rolling(window=long_window).mean().values
         vol_std_long = pd.Series(rolling_std).rolling(window=long_window).std().values
-        
+
         # Detect Shocks
         threshold = vol_mean_long + vol_k * vol_std_long
         vol_shock_mask = (rolling_std > threshold) & (rolling_std > 0)
-        
+
         # 2. Structural Break (Major DC Event) (Spec 8.1.2)
         # Downward DC at 2.0% threshold
         dc_threshold = float(getattr(self.config, "regime_dc_threshold_pct", 0.02))
-        
+
         # Simplified DC Logic for Indexing (offline pre-scan)
         # We assume any sharp drop > 2% from recent high is a candidate
         # For strict DC, we need the event loop. Here we approximate with MaxDD_20d
-        
+
         # Rolling Max (20d)
         roll_max = pd.Series(market_close).rolling(window=20).max().values
         dd_20 = (market_close / (roll_max + 1e-8)) - 1.0
         dc_crash_mask = dd_20 < -dc_threshold
-        
+
         # Combine Masks
         regime_mask = vol_shock_mask | dc_crash_mask
-        
+
         # Filter valid range [min_start, max_start]
         valid_range_mask = np.zeros(T_total, dtype=bool)
         valid_range_mask[min_start : max_start + 1] = True
-        
+
         final_mask = regime_mask & valid_range_mask
-        
+
         return np.where(final_mask)[0]
 
     def _build_class_indices(
@@ -1423,6 +1691,7 @@ class ObserverOfflineBatchTrainer:
         market_tensors: Optional[Dict[str, th.Tensor]] = None,
         mode: str = "TRAIN",
         batch_idx: Optional[int] = None,
+        force_start_indices: Optional[List[int]] = None,
     ) -> Optional[TrajectoryBatch]:
         """
         Sample a batch of trajectories per Spec §6.
@@ -1430,6 +1699,7 @@ class ObserverOfflineBatchTrainer:
         For TRAIN mode: Random sampling (hybrid weighted or uniform)
         For EVAL mode with batch_idx: Sequential sweep (deterministic, full coverage)
         For EVAL mode without batch_idx: Random sampling (legacy behavior)
+        For STATEFUL mode: force_start_indices overrides random sampling
 
         Each trajectory:
         1. Has start index t_s (random for TRAIN, sequential for EVAL+batch_idx)
@@ -1443,10 +1713,13 @@ class ObserverOfflineBatchTrainer:
             batch_idx: For EVAL mode, which batch index (0, 1, 2, ...) for sequential sweep.
                        If provided, returns non-overlapping sequential trajectories.
                        Returns None if batch_idx exceeds available data.
+            force_start_indices: For STATEFUL mode, force specific start indices.
+                                 If provided, overrides random sampling with these indices.
 
         Returns:
             TrajectoryBatch with B trajectories, or None if no more data (EVAL mode)
         """
+
         T_total = data_tensors["T_total"]
         ochlv = data_tensors["ochlv"]
         returns = data_tensors["returns"]
@@ -1527,6 +1800,13 @@ class ObserverOfflineBatchTrainer:
             end = min(start + self.batch_size, max_start + 1)
             start_indices = np.arange(start, end)
 
+        # ========== STATEFUL MODE: Force specific start indices ==========
+        elif force_start_indices is not None:
+            # Use forced indices (for sequential stateful training)
+            start_indices = np.array(force_start_indices)
+            # Validate indices are within range
+            start_indices = np.clip(start_indices, min_start, max_start)
+
         # ========== TRAIN MODE or EVAL without batch_idx: Random Sampling ==========
         else:
             # Sample B random start indices
@@ -1548,7 +1828,9 @@ class ObserverOfflineBatchTrainer:
 
                     start_indices = []
                     for class_id in [0, 1, 2]:  # Bear, Side, Bull
-                        n_samples = samples_per_class + (1 if class_id < remainder else 0)
+                        n_samples = samples_per_class + (
+                            1 if class_id < remainder else 0
+                        )
                         indices = class_indices[class_id]
 
                         if len(indices) == 0:
@@ -1570,18 +1852,27 @@ class ObserverOfflineBatchTrainer:
                         start_indices.extend(sampled)
 
                     start_indices = np.array(start_indices)
-                    np.random.shuffle(start_indices)  # Shuffle to avoid class order bias
+                    np.random.shuffle(
+                        start_indices
+                    )  # Shuffle to avoid class order bias
                 else:
                     # Fallback to uniform random if class indices couldn't be built
                     start_indices = np.random.randint(
                         min_start, max_start + 1, size=self.batch_size
                     )
 
-            elif self.config.mafia_sampling_strategy == "hybrid_weighted" and mode == "TRAIN":
+            elif (
+                self.config.mafia_sampling_strategy == "hybrid_weighted"
+                and mode == "TRAIN"
+            ):
                 # Hybrid Sampling: Recency (50%) + Regime (30%) + Random (20%)
                 # Get ratios from config
-                r_recent = float(getattr(self.config, "mafia_sampling_recency_ratio", 0.5))
-                r_regime = float(getattr(self.config, "mafia_sampling_regime_ratio", 0.3))
+                r_recent = float(
+                    getattr(self.config, "mafia_sampling_recency_ratio", 0.5)
+                )
+                r_regime = float(
+                    getattr(self.config, "mafia_sampling_regime_ratio", 0.3)
+                )
                 r_random = 1.0 - r_recent - r_regime
 
                 n_recent = int(self.batch_size * r_recent)
@@ -1608,8 +1899,11 @@ class ObserverOfflineBatchTrainer:
                     # Recompute weights for available indices
                     if weights is not None:
                         # Map original weights to available indices
-                        pool_list = list(pool)
-                        avail_weights = np.array([weights[pool_list.index(i)] for i in available])
+                        # [OPTIMIZED] Pre-build index map for O(1) lookup
+                        pool_to_idx = {val: idx for idx, val in enumerate(pool)}
+                        avail_weights = np.array(
+                            [weights[pool_to_idx[i]] for i in available]
+                        )
                         avail_weights = avail_weights / (avail_weights.sum() + 1e-8)
                     else:
                         avail_weights = None
@@ -1619,15 +1913,21 @@ class ObserverOfflineBatchTrainer:
                         return []
 
                     if avail_weights is not None:
-                        samples = np.random.choice(available, size=actual_n, p=avail_weights, replace=False)
+                        samples = np.random.choice(
+                            available, size=actual_n, p=avail_weights, replace=False
+                        )
                     else:
-                        samples = np.random.choice(available, size=actual_n, replace=False)
+                        samples = np.random.choice(
+                            available, size=actual_n, replace=False
+                        )
                     return list(samples)
 
                 # Helper function: uniform sampling without replacement, excluding already sampled
                 def uniform_sample_no_dup(low, high, n_samples, exclude_set):
                     """Sample n_samples uniformly from [low, high], excluding indices in exclude_set."""
-                    available = np.array([i for i in range(low, high + 1) if i not in exclude_set])
+                    available = np.array(
+                        [i for i in range(low, high + 1) if i not in exclude_set]
+                    )
                     if len(available) == 0:
                         return []
                     actual_n = min(n_samples, len(available))
@@ -1639,12 +1939,14 @@ class ObserverOfflineBatchTrainer:
                 # ========== 1. RECENCY SAMPLING (last 30%, fallback to historical) ==========
                 recent_indices = np.arange(recent_start, max_start + 1)
                 n_recent_available = len(recent_indices)
-                p_power = float(getattr(self.config, "mafia_sampling_recency_power", 1.0))
+                p_power = float(
+                    getattr(self.config, "mafia_sampling_recency_power", 1.0)
+                )
 
                 if n_recent_available > 0:
                     # Compute weights for recent portion
-                    weights = np.linspace(0, 1, n_recent_available)
-                    weights = weights ** p_power
+                    weights = np.linspace(0.1, 1, n_recent_available)
+                    weights = weights**p_power
                     weights = weights / (weights.sum() + 1e-8)
 
                     # Sample from recent with weights (no duplicates)
@@ -1670,7 +1972,9 @@ class ObserverOfflineBatchTrainer:
 
                 if n_regime > 0:
                     # Filter out already sampled indices from regime pool
-                    available_regime = [i for i in regime_idx_pool if i not in sampled_set]
+                    available_regime = [
+                        i for i in regime_idx_pool if i not in sampled_set
+                    ]
 
                     if len(available_regime) > 0:
                         actual_regime = min(n_regime, len(available_regime))
@@ -1711,7 +2015,9 @@ class ObserverOfflineBatchTrainer:
                     # Allow duplicates only as last resort
                     all_indices = np.arange(min_start, max_start + 1)
                     extra_needed = self.batch_size - total_sampled
-                    extra_samples = np.random.choice(all_indices, size=extra_needed, replace=True)
+                    extra_samples = np.random.choice(
+                        all_indices, size=extra_needed, replace=True
+                    )
                     start_indices.extend(extra_samples)
 
                 start_indices = np.array(start_indices)
@@ -1751,7 +2057,9 @@ class ObserverOfflineBatchTrainer:
 
         # Rebalance Triggers
         # Vol shock now relative (e.g. 2.0x normal vol). Default 2.0.
-        vol_shock_threshold = float(getattr(self.config, "mafia_rebalance_vol_threshold", 2.0))
+        vol_shock_threshold = float(
+            getattr(self.config, "mafia_rebalance_vol_threshold", 2.0)
+        )
         rebal_interval = int(getattr(self.config, "mafia_rebalance_interval", 20))
 
         for b, t_s in enumerate(start_indices):
@@ -2032,7 +2340,9 @@ class ObserverOfflineBatchTrainer:
 
         # Dynamic DC Threshold Params (Spec 3.5.1 v2.2)
         # Use multipliers instead of fixed threshold
-        dc_k_atr = float(getattr(self.config, "mafia_DC_multipliers", [1.0])[1]) # Use medium sensitivity (1.0)
+        dc_k_atr = float(
+            getattr(self.config, "mafia_DC_multipliers", [1.0])[1]
+        )  # Use medium sensitivity (1.0)
         atr_period = 14
 
         for b, t_s in enumerate(start_indices):
@@ -2055,7 +2365,9 @@ class ObserverOfflineBatchTrainer:
                 market_closes = stock_closes.mean(axis=1)
                 market_volumes = stock_volumes.mean(axis=1)
                 # Approx High/Low for fallback ATR
-                market_highs = ochlv[full_start:full_end, :, 2].mean(dim=1).cpu().numpy()
+                market_highs = (
+                    ochlv[full_start:full_end, :, 2].mean(dim=1).cpu().numpy()
+                )
                 market_lows = ochlv[full_start:full_end, :, 3].mean(dim=1).cpu().numpy()
 
             traj_offset = t_s - full_start
@@ -2081,19 +2393,24 @@ class ObserverOfflineBatchTrainer:
             # Compute Rolling Volatility
             vol_std10_full = np.zeros(len(market_closes), dtype=np.float32)
             vol_std30_full = np.zeros(len(market_closes), dtype=np.float32)
-            
+
             # Use pandas rolling for efficiency and safety (matches FeatureProcessor)
             s_ret = pd.Series(market_returns_np)
-            vol_std10_full = s_ret.rolling(window=10, min_periods=1).std(ddof=0).fillna(0.0).values
-            vol_std30_full = s_ret.rolling(window=30, min_periods=1).std(ddof=0).fillna(0.0).values
-            
+            vol_std10_full = (
+                s_ret.rolling(window=10, min_periods=1).std(ddof=0).fillna(0.0).values
+            )
+            vol_std30_full = (
+                s_ret.rolling(window=30, min_periods=1).std(ddof=0).fillna(0.0).values
+            )
+
             # Compute Relative Volatility (Vol10 / Vol30)
             vol_relative_full = np.divide(
-                vol_std10_full, vol_std30_full, 
-                out=np.ones_like(vol_std10_full), 
-                where=vol_std30_full > 1e-8
+                vol_std10_full,
+                vol_std30_full,
+                out=np.ones_like(vol_std10_full),
+                where=vol_std30_full > 1e-8,
             )
-            
+
             # === 1. DC_Event_Flag: Adaptive Threshold (ATR-based) ===
             # Compute ATR for the whole window
             tr_full = np.zeros(len(market_closes), dtype=np.float32)
@@ -2102,15 +2419,21 @@ class ObserverOfflineBatchTrainer:
                 l = market_lows
                 c_prev = np.roll(market_closes, 1)
                 c_prev[0] = c_prev[1]
-                
+
                 tr1 = h - l
                 tr2 = np.abs(h - c_prev)
                 tr3 = np.abs(l - c_prev)
                 tr_full = np.maximum(tr1, np.maximum(tr2, tr3))
-                
+
             # Smoothed ATR
-            atr_full = pd.Series(tr_full).rolling(window=atr_period, min_periods=1).mean().fillna(0.0).values
-            
+            atr_full = (
+                pd.Series(tr_full)
+                .rolling(window=atr_period, min_periods=1)
+                .mean()
+                .fillna(0.0)
+                .values
+            )
+
             # Dynamic Threshold Series
             dc_thresholds = dc_k_atr * (atr_full / (market_closes + 1e-8))
             # Clamp min threshold to 0.5% to avoid noise in flat markets
@@ -2119,7 +2442,7 @@ class ObserverOfflineBatchTrainer:
             p_ext = market_closes[0] if len(market_closes) > 0 else 1.0
             mode = "up"
             dc_flag_full = np.zeros(len(market_closes), dtype=np.float32)
-            
+
             for i in range(1, len(market_closes)):
                 price = market_closes[i]
                 threshold = dc_thresholds[i]
@@ -2176,21 +2499,26 @@ class ObserverOfflineBatchTrainer:
             # VPI = Sign(ΔP) × |ΔP| / (Vol / Vol_20_avg)
             # Measures money flow efficiency
             vpi_full = np.zeros(len(market_closes), dtype=np.float32)
-            
+
             # Compute VPI values
             if len(market_volumes) > 20:
-                vol_20_avg = pd.Series(market_volumes).rolling(window=20, min_periods=1).mean().values
+                vol_20_avg = (
+                    pd.Series(market_volumes)
+                    .rolling(window=20, min_periods=1)
+                    .mean()
+                    .values
+                )
                 for i in range(1, len(market_closes)):
                     delta_p = market_returns_np[i]  # Already computed price return
                     vol_ratio = market_volumes[i] / (vol_20_avg[i] + 1e-8)
                     # VPI = sign(ΔP) * |ΔP| / vol_ratio (adjusted formula)
                     vpi_full[i] = np.sign(delta_p) * abs(delta_p) / (vol_ratio + 1e-8)
-            
+
             # Z-score normalization (Expanding Window for causality)
             # Use cumulative stats to avoid lookahead bias
             vpi_zscore_full = np.zeros(len(market_closes), dtype=np.float32)
             for i in range(1, len(market_closes)):
-                window = vpi_full[:i+1]
+                window = vpi_full[: i + 1]
                 mean_val = np.mean(window)
                 std_val = np.std(window)
                 if std_val > 1e-8:
@@ -2202,7 +2530,7 @@ class ObserverOfflineBatchTrainer:
             for t in range(T_actual):
                 idx = traj_offset + t
                 if idx < len(vol_relative_full):
-                    vol_std20_traj[t] = vol_relative_full[idx] # Relative Vol
+                    vol_std20_traj[t] = vol_relative_full[idx]  # Relative Vol
                 if idx < len(dc_flag_full):
                     dc_event_flag_traj[t] = dc_flag_full[idx]
                 if idx < len(breadth_gap_full):
@@ -2211,7 +2539,7 @@ class ObserverOfflineBatchTrainer:
                     div_signal_traj[t] = div_signal_full[idx]
                 if idx < len(vpi_zscore_full):
                     signed_vpi_zscore_traj[t] = vpi_zscore_full[idx]
-            
+
             # === 5. Drawdown60: Rolling Max Drawdown (Pain Index) ===
             # Relative to 60-day rolling peak
             # (Logic maintained as is, just context for surrounding lines)
@@ -2327,12 +2655,13 @@ class ObserverOfflineBatchTrainer:
         data_tensors: Dict[str, th.Tensor],
         batch_idx: int = 0,
         epoch_idx: int = 0,
-    ) -> Dict[str, float]:
+        external_context_buffer: Optional[th.Tensor] = None,
+    ) -> Tuple[Dict[str, float], Optional[th.Tensor]]:
         """
         Execute one Collect → Train → Discard cycle per Spec §7.
 
         This is the core offline training loop:
-        1. Reset hidden state (fresh start for random t_s)
+        1. Reset hidden state (fresh start for random t_s) - UNLESS stateful mode
         2. Sequential forward pass through trajectory
         3. Compute masked losses
         4. Backprop and update
@@ -2341,9 +2670,14 @@ class ObserverOfflineBatchTrainer:
         Args:
             batch: TrajectoryBatch from sample_trajectory_batch()
             data_tensors: Full data tensors for feature window extraction
+            external_context_buffer: For STATEFUL mode, pass in the context buffer
+                                     from previous segment to preserve memory.
+                                     If None, uses fresh buffer.
 
         Returns:
-            Dict of loss values and metrics
+            Tuple of (metrics_dict, final_context_buffer)
+            - metrics_dict: Dict of loss values and metrics
+            - final_context_buffer: Updated context buffer for next segment (stateful mode)
         """
         # Step-wise Gumbel Annealing (Smoother Decay)
         # Update temp every step based on fractional epoch progress
@@ -2365,11 +2699,30 @@ class ObserverOfflineBatchTrainer:
         self.optimizer.zero_grad()
 
         # ============================================================
-        # STEP 1: RESET - Fresh hidden state for new random trajectories
+        # STEP 1: RESET or PRESERVE - Hidden state management
         # Per Spec §6: "Reset trạng thái hidden_state ở đầu mỗi Batch"
+        # EXCEPTION: In STATEFUL mode, preserve hidden state across segments
         # ============================================================
-        if hasattr(self.observer.mafia_model, "reset_temporal_state"):
-            self.observer.mafia_model.reset_temporal_state()
+        use_stateful = getattr(self.config, "mafia_stateful_training", False)
+        # Auto-enable for SELECTION_ONLY mode
+        if self.config.mafia_train_mode == MafiaTrainMode.SELECTION_ONLY:
+            use_stateful = True
+
+        if use_stateful:
+            if batch_idx == 0:
+                # First segment: Reset to zeros (fresh start for epoch)
+                if hasattr(self.observer.mafia_model, "reset_temporal_state"):
+                    self.observer.mafia_model.reset_temporal_state()
+                smart_print("[STATEFUL] Epoch start: Reset hidden state to zeros")
+            else:
+                # Subsequent segments: Detach but preserve hidden state
+                # This cuts the gradient but keeps the VALUE for long-term memory
+                if hasattr(self.observer.mafia_model, "detach_temporal_state"):
+                    self.observer.mafia_model.detach_temporal_state()
+        else:
+            # RANDOM MODE: Fresh hidden state for each new random trajectory
+            if hasattr(self.observer.mafia_model, "reset_temporal_state"):
+                self.observer.mafia_model.reset_temporal_state()
 
         # Reset dashboard tracking state for fresh batch
         self._last_rebalance_portfolio = {}
@@ -2386,6 +2739,8 @@ class ObserverOfflineBatchTrainer:
 
         # [METRIC FIX] Collect unscaled returns for financial metrics
         collected_unscaled_returns = []
+        # [METRIC FIX 2] Collect ONLY valid returns (when actually computed, not zeros)
+        collected_valid_returns = []
 
         # Initialize 'prev_indices' for turnover calculation (held portfolio)
         # At t=0, previous portfolio is empty set.
@@ -2398,16 +2753,60 @@ class ObserverOfflineBatchTrainer:
         N_action = self.observer.action_dim
         prev_holdings = th.zeros(B, N_action, device=self.device)
 
+        # ============================================================
+        # Entry Price Tracking for "Gồng Lời" Reward
+        # ============================================================
+        # Track entry prices and entry step for cumulative profit calculation
+        entry_prices = th.zeros(
+            B, N_action, device=self.device
+        )  # Entry price per stock
+        entry_step = th.full(
+            (B, N_action), -1, dtype=th.long, device=self.device
+        )  # Step when entered (-1 = not held)
+        # Track market price at entry for TRUE alpha_since_entry calculation
+        entry_market_prices = th.zeros(
+            B, N_action, device=self.device
+        )  # Market price when each stock was entered
+
+        # ============================================================
+        # Smart Holding Bias: Track prices at last rebalance
+        # ============================================================
+        # For computing alpha = stock_return - market_return since last rebalance
+        use_alpha_bias = getattr(self.config, "mafia_use_alpha_bias", True)
+        alpha_sensitivity = getattr(self.config, "mafia_alpha_sensitivity", 1.0)
+        alpha_max = getattr(self.config, "mafia_alpha_max", 0.30)
+        # Config to enable/disable rule-based holding bias in logits
+        # When False: only learned Portfolio Branch affects holding decisions
+        # When True: both rule-based bias AND learned branch are applied
+        apply_holding_alpha_bias = getattr(self.config, "mafia_apply_holding_alpha_bias", True)
+        last_rebal_stock_prices = th.zeros(B, N_action, device=self.device)  # Stock prices at last rebal
+        last_rebal_market_price = th.zeros(B, device=self.device)  # Market price at last rebal
+        has_rebal_history = th.zeros(B, dtype=th.bool, device=self.device)  # Track if we have rebal history
+
         # Initialize Context Buffer for Temporal Augmentation (Spec 3.6)
-        # Cold start with zeros for each batch item
+        # Cold start with zeros for each batch item (or use external buffer in STATEFUL mode)
         W_route = int(getattr(self.config, "router_context_window", 5))
+
+        # TBPTT (Truncated Backpropagation Through Time) config
+        # Detach hidden state every tbptt_len steps to balance memory vs gradient flow
+        # Default 32: gradient flows back 32 steps, good balance of memory and learning
+        tbptt_len = int(getattr(self.config, "tbptt_len", 32))
+        # Log TBPTT config on first batch of each epoch
+        if batch_idx == 0:
+            smart_print(f"  [TBPTT] Gradient truncation every {tbptt_len} steps (detach at t={tbptt_len}, {tbptt_len*2}, ...)")
         # Get D from model or config
         if hasattr(self.observer.mafia_model, "D"):
             mafia_D = self.observer.mafia_model.D
         else:
             mafia_D = int(getattr(self.config, "mafia_D", 128))
 
-        batch_context_buffer = th.zeros(B, W_route, mafia_D, device=self.device)
+        # STATEFUL MODE: Use external_context_buffer if provided (carries memory from previous segment)
+        if use_stateful and external_context_buffer is not None:
+            batch_context_buffer = (
+                external_context_buffer.detach()
+            )  # Detach to cut gradients
+        else:
+            batch_context_buffer = th.zeros(B, W_route, mafia_D, device=self.device)
 
         # Get full OCHLV data for feature window extraction
         full_ochlv = data_tensors["ochlv"]  # (T_total, N, 5)
@@ -2437,7 +2836,10 @@ class ObserverOfflineBatchTrainer:
 
         # Spec 5.2: Track actual rebalance event count for PG normalization
         # L_PG normalized by: Σ m_t + ε (actual event count, not expected)
-        actual_rebal_count = 0.0  # Running count of rebalance events across batch
+        # [PERF-FIX] Use tensor accumulation to avoid .item() sync in loop
+        actual_rebal_count = th.tensor(
+            0.0, device=self.device
+        )  # Running count of rebalance events
 
         # Compute volatility threshold for shock detection (Spec §8.1.2)
         # V_shock = μ_vol + k × σ_vol where k = vol_k (default 2.0)
@@ -2459,16 +2861,15 @@ class ObserverOfflineBatchTrainer:
         # Ensure non-zero for normalization
         expected_rebal_count = max(expected_rebal_count, 1.0)
         collected_market_context = []  # List of (B, D) tensors
-        
+
         # [OPTIMIZATION] Accumulators for metrics (Tensor) to avoid .item() sync inside loop
         acc_loss_pg = th.tensor(0.0, device=self.device)
         acc_loss_risk = th.tensor(0.0, device=self.device)
         acc_loss_dir = th.tensor(0.0, device=self.device)
         acc_loss_bal = th.tensor(0.0, device=self.device)
-        
+
         # Debug flag for detailed logging
         debug_logging = getattr(self.config, "mafia_debug_logging", False)
-
 
         # Reward breakdown collection
         collected_raw_returns = []
@@ -2505,6 +2906,7 @@ class ObserverOfflineBatchTrainer:
 
         # [TIMING] Measure timestep performance
         import time
+
         _batch_start_time = time.perf_counter()
         _timestep_times = []
 
@@ -2513,8 +2915,21 @@ class ObserverOfflineBatchTrainer:
         risk_loss = th.tensor(0.0, device=self.device)
         dir_loss = th.tensor(0.0, device=self.device)
 
+        # [DEBUG-TIMING] Breakdown tracking
+        _timing_forward = 0.0
+        _timing_loss = 0.0
+        _timing_backward = 0.0
+        _timing_other = 0.0
+
+        # [INSIGHT] Cumulative performance tracking for logging
+        _cumulative_alpha = 0.0
+        _cumulative_r_net = 0.0
+        _cumulative_baseline = 0.0
+        _rebal_count = 0
+
         for t in range(T_m):
             _step_start = time.perf_counter()
+            _t0 = time.perf_counter()
 
             # Progress logging for MPS (first step is slow due to JIT)
             if self._is_mps:
@@ -2667,14 +3082,117 @@ class ObserverOfflineBatchTrainer:
                     dim=-1,
                 )  # (B, 6)
 
+                # ============================================================
+                # Smart Holding Bias: Compute alpha-based bias
+                # Alpha = stock_return - market_return (since last rebalance)
+                # ============================================================
+                if use_alpha_bias and has_rebal_history.any():
+                    # Get prices at t-1 to avoid data leakage
+                    # Use batch.start_indices to map to absolute index in full_market_ochlv
+                    # Note: full_market_ochlv is on CPU, need to move index to CPU then result to device
+                    if t > 0:
+                        prev_stock_close = batch.stock_ochlv[:, t - 1, :, 3]  # (B, N) close at t-1
+                        # full_market_ochlv: (T_total, 1, 5), Close is index 1
+                        abs_idx_prev = (batch.start_indices + (t - 1)).cpu()  # (B,) on CPU
+                        prev_market_close = full_market_ochlv[abs_idx_prev, 0, 1].to(self.device)  # (B,)
+                    else:
+                        prev_stock_close = batch.stock_ochlv[:, 0, :, 3]
+                        abs_idx_prev = batch.start_indices.cpu()  # (B,) on CPU
+                        prev_market_close = full_market_ochlv[abs_idx_prev, 0, 1].to(self.device)  # (B,)
+
+                    # Compute returns since last rebalance
+                    stock_return = (prev_stock_close / (last_rebal_stock_prices + 1e-8)) - 1  # (B, N)
+                    market_return = (prev_market_close / (last_rebal_market_price + 1e-8)) - 1  # (B,)
+
+                    # Alpha = outperformance vs market
+                    alpha = stock_return - market_return.unsqueeze(1)  # (B, N)
+
+                    # Clip to avoid extreme bias
+                    alpha_clipped = th.clamp(alpha, -alpha_max, alpha_max)
+
+                    # Apply bias only to held stocks, scaled by sensitivity
+                    holding_alpha_bias = alpha_sensitivity * alpha_clipped * prev_holdings  # (B, N)
+
+                    # Zero out for batches without rebal history
+                    holding_alpha_bias = th.where(
+                        has_rebal_history.unsqueeze(1),
+                        holding_alpha_bias,
+                        th.zeros_like(holding_alpha_bias)
+                    )
+                else:
+                    # Fallback to simple binary bias (prev_holdings × default bias)
+                    holding_alpha_bias = 0.1 * prev_holdings  # (B, N) - use old behavior
+
+                # ============================================================
+                # Portfolio State Tensor for Learned Holding Decisions
+                # ============================================================
+                # Compute 4 features per stock: [is_held, days_held_norm, pnl, alpha]
+                # This enables the model to learn context-aware holding patterns
+
+                # 1. is_held: Binary indicator (already have as prev_holdings)
+                is_held = prev_holdings  # (B, N)
+
+                # 2. days_held_norm: Days since entry, normalized by 21 (typical holding period)
+                has_entry = (entry_step >= 0)  # (B, N) bool
+                days_held_raw = th.where(has_entry, (t - entry_step).float(), th.zeros_like(entry_step, dtype=th.float))
+                days_held_norm = days_held_raw / 21.0  # Normalize by ~1 month
+
+                # 3. unrealized_pnl: (current_price - entry_price) / entry_price
+                current_close = batch.stock_ochlv[:, t, :, 3]  # (B, N) close at t
+                has_valid_entry = (entry_prices > 0)  # (B, N) bool
+                unrealized_pnl = th.where(
+                    has_valid_entry,
+                    (current_close - entry_prices) / (entry_prices + 1e-8),
+                    th.zeros_like(current_close)
+                )  # (B, N)
+
+                # 4. alpha_since_entry: TRUE outperformance vs market since entry
+                # Uses entry_market_prices (tracked per-stock when entered)
+                # alpha = stock_return_since_entry - market_return_since_entry
+                has_valid_market_entry = (entry_market_prices > 0)  # (B, N)
+
+                # Get current market close price
+                abs_idx_curr = (batch.start_indices + t).cpu()
+                current_market_close = full_market_ochlv[abs_idx_curr, 0, 1].to(self.device)  # (B,)
+
+                # Compute TRUE alpha since entry
+                # stock_return = unrealized_pnl (already computed above)
+                # market_return = (current_market - entry_market) / entry_market
+                market_return_since_entry = th.where(
+                    has_valid_market_entry,
+                    (current_market_close.unsqueeze(1) - entry_market_prices) / (entry_market_prices + 1e-8),
+                    th.zeros_like(entry_market_prices)
+                )  # (B, N)
+
+                # Alpha = stock outperformance vs market
+                alpha_since_entry = th.where(
+                    has_valid_entry & has_valid_market_entry,
+                    unrealized_pnl - market_return_since_entry,
+                    th.zeros_like(unrealized_pnl)
+                )  # (B, N)
+
+                # Clip to prevent extreme values
+                alpha_since_entry = th.clamp(alpha_since_entry, -alpha_max, alpha_max)
+
+                # Stack into portfolio_state tensor: (B, N, 4)
+                portfolio_state = th.stack([
+                    is_held,
+                    days_held_norm,
+                    unrealized_pnl,
+                    alpha_since_entry
+                ], dim=-1)  # (B, N, 4)
+
                 # Pass buffer to model (Spec 3.6)
+                # holding_alpha_bias: Rule-based bias (configurable via mafia_apply_holding_alpha_bias)
+                # portfolio_state: Learned branch (always applied)
                 outputs = self.observer.mafia_model(
                     ochlv_data=ochlv_batch,
                     market_index_ochlv_data=market_ochlv_batch,
                     force_topk_indices=None,  # Always fresh selection first
                     router_context_buffer=batch_context_buffer,  # Batched buffer for temporal augmentation
                     explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
-                    prev_holdings=prev_holdings,  # Memory Injection: Bias current logits with last holdings
+                    holding_alpha_bias=holding_alpha_bias if apply_holding_alpha_bias else None,
+                    portfolio_state=portfolio_state,  # Portfolio context for learned holding decisions
                 )
 
                 (
@@ -2688,6 +3206,9 @@ class ObserverOfflineBatchTrainer:
                     topk_scores,  # (B, K)
                     market_logits,  # (B, N) - RAW LOGITS
                 ) = outputs
+
+                _timing_forward += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
 
                 # [MPS-FIX] In MACRO_ONLY mode, immediately detach selection outputs
                 # to free computation graph memory (selection gradients not needed)
@@ -2717,13 +3238,50 @@ class ObserverOfflineBatchTrainer:
                 collected_market_context.append(market_context.detach())  # (B, D)
 
                 # ============================================================
-                # SPEC 3.6.3: Explicit detach after each timestep (Training Collection)
-                # Purpose: Truncate gradient graph while preserving state values
+                # WATCHLIST SYSTEM: Daily Screening Step (Spec: cozy-whistling-nova.md)
+                # Run every timestep to update Technical Scores, screening, and embeddings buffer
                 # ============================================================
-                if hasattr(self.observer.mafia_model, "detach_temporal_state"):
-                    self.observer.mafia_model.detach_temporal_state()
-                # SPEC 3.6.3.2: Also detach context_buffer contents
-                batch_context_buffer = batch_context_buffer.detach()
+                if self.watchlist_integration is not None and t == 0:
+                    # Run screening on first timestep of each batch for efficiency
+                    # (In production, would run every day; here we sample once per trajectory)
+                    watchlist_result = self._run_watchlist_daily_step(
+                        batch=batch,
+                        t=t,
+                        market_logits=market_logits.detach(),
+                        embeddings=topk_embeddings.detach()
+                        if topk_embeddings is not None
+                        else None,
+                    )
+                    if watchlist_result is not None:
+                        # Log to CSV for monitoring
+                        self._log_watchlist_state(
+                            epoch=epoch_idx,
+                            segment=batch_idx,
+                            timestep=t,
+                            action="screening",
+                            screening_result=watchlist_result,
+                            stock_list=data_tensors.get("stock_list", None),
+                        )
+                        if debug_logging:
+                            wl_size = watchlist_result.get("new_watchlist_size", 0)
+                            wl_added = watchlist_result.get("added", 0)
+                            wl_removed = watchlist_result.get("removed", 0)
+                            if wl_added > 0 or wl_removed > 0:
+                                smart_print(
+                                    f"     📋 Watchlist: Size={wl_size} | "
+                                    f"+{wl_added} added, -{wl_removed} removed"
+                                )
+
+                # ============================================================
+                # SPEC 3.6.3: TBPTT - Detach every tbptt_len steps (Training Collection)
+                # Purpose: Truncate gradient graph while allowing gradient flow for tbptt_len steps
+                # Default tbptt_len=16: gradient flows back 16 steps, balanced memory usage
+                # ============================================================
+                if (t + 1) % tbptt_len == 0:
+                    if hasattr(self.observer.mafia_model, "detach_temporal_state"):
+                        self.observer.mafia_model.detach_temporal_state()
+                    # SPEC 3.6.3.2: Also detach context_buffer contents
+                    batch_context_buffer = batch_context_buffer.detach()
 
                 # ============================================================
                 # (Context logging removed - now handled by realtime dashboard)
@@ -2780,10 +3338,38 @@ class ObserverOfflineBatchTrainer:
 
                 # Spec 5.2: Accumulate actual rebalance event count
                 # Sum across batch dimension for this timestep
-                actual_rebal_count += effective_mask_float.sum().item()
+                actual_rebal_count = (
+                    actual_rebal_count + effective_mask_float.sum()
+                )  # [PERF-FIX] No .item()
 
                 # Reset Schedule Counter where rebalance occurred
                 days_since_last_rebal[effective_mask] = 0
+
+                # ============================================================
+                # Smart Holding Bias: Update last_rebal prices when rebalance occurs
+                # ============================================================
+                if use_alpha_bias and effective_mask.any():
+                    # Get current prices at time t
+                    current_stock_close = batch.stock_ochlv[:, t, :, 3]  # (B, N)
+                    # Use full_market_ochlv with absolute index (Close is index 1)
+                    # Note: full_market_ochlv is on CPU, need to move index to CPU then result to device
+                    abs_idx_current = (batch.start_indices + t).cpu()  # (B,) on CPU
+                    current_market_close = full_market_ochlv[abs_idx_current, 0, 1].to(self.device)  # (B,)
+
+                    # Update prices for batches that rebalanced
+                    # Use where to selectively update only rebalanced batches
+                    last_rebal_stock_prices = th.where(
+                        effective_mask.unsqueeze(1),
+                        current_stock_close,
+                        last_rebal_stock_prices
+                    )
+                    last_rebal_market_price = th.where(
+                        effective_mask,
+                        current_market_close,
+                        last_rebal_market_price
+                    )
+                    # Mark that we now have rebal history for these batches
+                    has_rebal_history = has_rebal_history | effective_mask
 
                 # --- Apply Holding Logic ---
                 # If effective_mask[b] is 0 -> We MUST hold previous portfolio.
@@ -2833,6 +3419,49 @@ class ObserverOfflineBatchTrainer:
             collected_direction_logits.append(direction_logits.detach())
 
             # ============================================================
+            # WATCHLIST SYSTEM: Post-Rebalance Cleanup (ĐK B)
+            # Remove holdings not selected in new Top-K from Watchlist
+            # ============================================================
+            if (
+                self.watchlist_integration is not None
+                and effective_mask.any()
+                and t > 0
+                and len(collected_topk_indices) > 1
+            ):
+                # Get previous and new holdings for batch element 0
+                # [BUG FIX] Renamed to avoid overwriting prev_holdings tensor used later
+                prev_holdings_wl = collected_topk_indices[-2][0].cpu().numpy()
+                new_holdings_wl = topk_indices[0].cpu().numpy()
+
+                # Get current prices from batch
+                current_prices = (
+                    batch.stock_ochlv[0, t, :, 1].cpu().numpy()
+                )  # (N,) close prices
+
+                cleanup_result = self._run_watchlist_post_rebalance(
+                    prev_holdings_indices=prev_holdings_wl,
+                    new_holdings_indices=new_holdings_wl,
+                    current_prices=current_prices,
+                )
+
+                if cleanup_result is not None:
+                    # Log cleanup to CSV
+                    self._log_watchlist_state(
+                        epoch=epoch_idx,
+                        segment=batch_idx,
+                        timestep=t,
+                        action="cleanup",
+                        screening_result=cleanup_result,
+                        stock_list=data_tensors.get("stock_list", None),
+                    )
+                    if debug_logging:
+                        removed = cleanup_result.get("removed", 0)
+                        if removed > 0:
+                            smart_print(
+                                f"     📋 Watchlist Cleanup: {removed} holdings removed (ĐK B)"
+                            )
+
+            # ============================================================
             # DETAILED TRAJECTORY LOGGING - ALL TIMESTEPS
             # ============================================================
             if getattr(self.config, "log_trajectory_details", False):
@@ -2876,112 +3505,348 @@ class ObserverOfflineBatchTrainer:
                 A_t = th.zeros(B, device=self.device)
                 A_t_raw = th.zeros(B, device=self.device)
             else:
-                # FULL/SELECTION_ONLY: Compute rewards and penalties
-                # 1. Calculate Rewards (R_t, Baseline) immediately
-                start_idx = t + 1
-                end_idx = t + 1 + self.horizon
-                future_returns_slice = batch.price_returns[
-                    :, start_idx:end_idx, :
-                ]  # (B, h, N)
-                market_returns_slice = batch.market_returns[
-                    :, start_idx:end_idx
-                ]  # (B, h)
-                h_len = future_returns_slice.size(1)
+                # ============================================================
+                # REFACTORED REWARD SYSTEM (Option A: Rebalance-Only)
+                #
+                # Principle: "Reward only at action points"
+                # - REBALANCE: Compute R_select + r_hold - Costs
+                # - HOLDING: R_net = 0 (no decision = no reward)
+                # ============================================================
 
-                if h_len == 0:
-                    R_net = th.zeros(B, device=self.device)
-                    baseline = th.zeros(B, device=self.device)
-                    R_raw = th.zeros(B, device=self.device)
-                    R_unscaled = th.zeros(B, device=self.device)
-                else:
-                    topk_idx = topk_indices  # (B, K)
-                    gather_idx = topk_idx.unsqueeze(1).expand(-1, h_len, -1)
-                    selected_returns = th.gather(future_returns_slice, 2, gather_idx)
-                    compounded_stock_returns = th.prod(1 + selected_returns, dim=1) - 1
-                    # Apply S_reward scaling (Spec §5.1.1) to amplify gradient signal
-                    R_unscaled = compounded_stock_returns.mean(dim=1)
-                    R_raw = self.scale_factor_reward * R_unscaled
-                    baseline = self.scale_factor_reward * (
-                        th.prod(1 + market_returns_slice, dim=1) - 1
-                    )
+                # Get rebalance mask for this timestep (computed earlier)
+                is_rebal_step = effective_mask  # (B,) boolean tensor
 
-                # Penalties
+                # Initialize all reward components to zero
+                R_select = th.zeros(B, device=self.device)  # Prospective: future return
+                r_hold = th.zeros(
+                    B, device=self.device
+                )  # Retrospective: profit × duration for held stocks
+                baseline = th.zeros(B, device=self.device)
                 turnover = th.zeros(B, device=self.device)
                 symdiff = th.zeros(B, device=self.device)
+                penalty = th.zeros(B, device=self.device)
+                R_net = th.zeros(B, device=self.device)
+                R_raw = th.zeros(
+                    B, device=self.device
+                )  # Keep for logging compatibility
+                R_unscaled = th.zeros(B, device=self.device)
 
-                if t > 0:
-                    # Compute Penalties
-                    N_stocks = batch.stock_ochlv.shape[2]
+                # Build current holdings mask (needed for entry tracking)
+                N_stocks = batch.stock_ochlv.shape[2]
+                curr_holdings = th.zeros(B, N_action, device=self.device)
+                curr_holdings.scatter_(1, topk_indices, 1.0)
+                held_mask = prev_holdings * curr_holdings
 
-                    # [OPTIMIZED] 1. SymDiff on GPU (no CPU transfer!)
-                    # Instead of Python set operations, use vectorized comparison
-                    curr_mask = th.zeros(B, N_stocks, device=self.device)
-                    curr_mask.scatter_(1, topk_indices, 1.0)
+                # Only compute rewards at REBALANCE points
+                if is_rebal_step.any():
+                    # Get future returns slice
+                    start_idx = t + 1
+                    end_idx = t + 1 + self.horizon
+                    future_returns_slice = batch.price_returns[:, start_idx:end_idx, :]
+                    market_returns_slice = batch.market_returns[:, start_idx:end_idx]
+                    h_len = future_returns_slice.size(1)
 
-                    prev_mask = th.zeros(B, N_stocks, device=self.device)
-                    # prev_indices is (B, K) tensor from collected_topk_indices[-1]
-                    if isinstance(prev_indices, th.Tensor) and prev_indices.numel() > 0:
-                        prev_mask.scatter_(1, prev_indices, 1.0)
-
-                    # Intersection count = sum of (curr AND prev)
-                    held_count = (curr_mask * prev_mask).sum(dim=1)  # (B,)
-
-                    # Symmetric difference: 2 * (K - held) / K
-                    symdiff = (2 * (self.K - held_count)) / self.K
-
-                    # 2. Turnover (Re-weighting Cost) - Weight Based (L1 Distance)
-                    curr_w_vector = th.zeros(B, N_stocks, device=self.device)
-                    curr_local_w = F.softmax(topk_scores, dim=1)
-                    curr_w_vector.scatter_(1, topk_indices, curr_local_w)
-
-                    prev_w_vector = th.zeros(B, N_stocks, device=self.device)
-
-                    if len(collected_topk_scores) >= 2:
-                        p_scores = collected_topk_scores[-2]
-                        p_idx = collected_topk_indices[-2]
-                        prev_local_w = F.softmax(p_scores.detach(), dim=1)
-                        prev_w_vector.scatter_(1, p_idx, prev_local_w)
-
-                    weight_diff = (curr_w_vector - prev_w_vector).abs().sum(dim=1)
-                    if th.isnan(weight_diff).any():
-                        smart_print(
-                            f"     ⚠️  [WARN] NaN in turnover weight_diff at t={t}."
+                    if h_len > 0:
+                        # ==============================================
+                        # R_SELECT: Prospective Selection Quality
+                        # Future return of newly selected portfolio
+                        # ==============================================
+                        topk_idx = topk_indices
+                        gather_idx = topk_idx.unsqueeze(1).expand(-1, h_len, -1)
+                        selected_returns = th.gather(
+                            future_returns_slice, 2, gather_idx
                         )
-                    turnover = 0.5 * weight_diff
-                    turnover = th.clamp(turnover, 0.0, 1.0)
+                        # [NaN GUARD] Sanitize returns before compounding
+                        selected_returns = th.nan_to_num(
+                            selected_returns, nan=0.0, posinf=0.5, neginf=-0.5
+                        )
+                        selected_returns = th.clamp(
+                            selected_returns, min=-0.99, max=10.0
+                        )  # Prevent log(0) in prod
+                        compounded_stock_returns = (
+                            th.prod(1 + selected_returns, dim=1) - 1
+                        )
+                        R_unscaled = compounded_stock_returns.mean(dim=1)
+                        R_select = self.scale_factor_reward * R_unscaled
+                        # [METRIC FIX 2] Collect valid returns for accurate metrics
+                        collected_valid_returns.append(R_unscaled.detach().cpu())
 
-                # Trend Holding Reward (R_hold)
-                r_hold = th.zeros(B, device=self.device)
-                if self.r_hold_alpha > 0 and h_len > 0:
-                    mkt_ret_expanded = market_returns_slice.unsqueeze(-1)
-                    win_day_mask = (future_returns_slice > mkt_ret_expanded) & (
-                        future_returns_slice > 0
-                    )
-                    stock_win_consistency = win_day_mask.float().sum(dim=1) / float(
-                        h_len
-                    )
-                    curr_holdings = th.zeros(B, N_action, device=self.device)
-                    curr_holdings.scatter_(1, topk_indices, 1.0)
-                    held_mask = prev_holdings * curr_holdings
-                    portfolio_win_score = (stock_win_consistency * held_mask).sum(dim=1)
-                    r_hold = self.r_hold_alpha * (portfolio_win_score / self.K)
+                        # Baseline: Market return
+                        # [NaN GUARD] Sanitize market returns
+                        market_returns_safe = th.nan_to_num(
+                            market_returns_slice, nan=0.0, posinf=0.5, neginf=-0.5
+                        )
+                        market_returns_safe = th.clamp(
+                            market_returns_safe, min=-0.99, max=10.0
+                        )
+                        baseline = self.scale_factor_reward * (
+                            th.prod(1 + market_returns_safe, dim=1) - 1
+                        )
 
-                # Advantage (Spec §5.1.1)
-                # lambda_epoch already defined at top of block
-                penalty = lambda_epoch * (
-                    self.alpha_turnover * turnover + self.alpha_change * symdiff
-                )
-                R_net = R_raw + r_hold - penalty
+                        # ==============================================
+                        # R_HOLD: Retrospective Hold Quality
+                        # Cumulative profit × duration for HELD stocks
+                        # (Only stocks being kept from previous period)
+                        # ==============================================
+                        alpha_hold = getattr(
+                            self.config, "mafia_reward_alpha_exit", 2.0
+                        )
+
+                        if t > 0 and alpha_hold > 0:
+                            current_prices = batch.stock_ochlv[:, t, :, 1]
+
+                            for b in range(B):
+                                if not is_rebal_step[b]:
+                                    continue
+
+                                # Held stocks = stocks in BOTH prev and curr
+                                held_idx = held_mask[b].nonzero(as_tuple=True)[0]
+                                if held_idx.numel() > 0:
+                                    e_prices = entry_prices[b, held_idx]
+                                    c_prices = current_prices[b, held_idx]
+
+                                    valid_mask = entry_step[b, held_idx] >= 0
+                                    if valid_mask.any():
+                                        valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+                                        e_p = e_prices[valid_idx]
+                                        c_p = c_prices[valid_idx]
+
+                                        profit_pct = (c_p - e_p) / (e_p + 1e-8)
+                                        duration = (
+                                            t - entry_step[b, held_idx[valid_idx]]
+                                        ).float()
+                                        duration_bonus = th.log1p(duration)
+
+                                        r_hold[b] = (
+                                            alpha_hold
+                                            * (profit_pct * duration_bonus).mean()
+                                        )
+
+                                        # [FIX 2026-01-02] Scale r_hold by n_held / K
+                                        # If only 1/10 stocks are held, r_hold should be 1/10 of full reward
+                                        n_held = valid_idx.numel()
+                                        scaling_factor = n_held / self.K
+                                        r_hold[b] = r_hold[b] * scaling_factor
+
+                            r_hold = r_hold * self.scale_factor_reward
+
+                        # ==============================================
+                        # COSTS: Turnover + Smart Rotation Penalty
+                        # Only at rebalance points
+                        # ==============================================
+                        if t > 0:
+                            # SymDiff (membership change)
+                            curr_mask = th.zeros(B, N_stocks, device=self.device)
+                            curr_mask.scatter_(1, topk_indices, 1.0)
+
+                            prev_mask_full = th.zeros(B, N_stocks, device=self.device)
+                            if (
+                                isinstance(prev_indices, th.Tensor)
+                                and prev_indices.numel() > 0
+                            ):
+                                prev_mask_full.scatter_(1, prev_indices, 1.0)
+
+                            held_count = (curr_mask * prev_mask_full).sum(dim=1)
+                            symdiff = (2 * (self.K - held_count)) / self.K
+
+                            # Turnover (weight change)
+                            curr_w_vector = th.zeros(B, N_stocks, device=self.device)
+                            curr_local_w = F.softmax(topk_scores, dim=1)
+                            curr_w_vector.scatter_(1, topk_indices, curr_local_w)
+
+                            prev_w_vector = th.zeros(B, N_stocks, device=self.device)
+                            if len(collected_topk_scores) >= 2:
+                                p_scores = collected_topk_scores[-2]
+                                p_idx = collected_topk_indices[-2]
+                                prev_local_w = F.softmax(p_scores.detach(), dim=1)
+                                prev_w_vector.scatter_(1, p_idx, prev_local_w)
+
+                            weight_diff = (
+                                (curr_w_vector - prev_w_vector).abs().sum(dim=1)
+                            )
+                            turnover = th.clamp(0.5 * weight_diff, 0.0, 1.0)
+
+                            # Smart Rotation Penalty
+                            penalty_multiplier = th.ones(B, device=self.device)
+                            smart_rotation_enabled = getattr(
+                                self.config, "mafia_smart_rotation_enabled", False
+                            )
+
+                            # [SMART ROTATION] Track winners/losers sold for differentiated penalty
+                            # Winner/Loser defined by ALPHA (stock return - market return)
+                            _n_winners_log = th.zeros(B, device=self.device)
+                            _n_losers_log = th.zeros(B, device=self.device)
+                            _n_exited_log = th.zeros(B, device=self.device)
+                            _avg_alpha_log = th.zeros(
+                                B, device=self.device
+                            )  # For logging
+
+                            if smart_rotation_enabled:
+                                exited_stocks = (prev_holdings > 0) & (
+                                    curr_holdings == 0
+                                )
+
+                                # Initialize tensors for smart rotation
+                                exit_alphas = th.zeros(B, device=self.device)
+                                rotation_quality = th.zeros(B, device=self.device)
+
+                                if exited_stocks.any():
+                                    current_prices_exit = batch.stock_ochlv[:, t, :, 1]
+
+                                    for b in range(B):
+                                        if not is_rebal_step[b]:
+                                            continue
+                                        exit_idx = exited_stocks[b].nonzero(
+                                            as_tuple=True
+                                        )[0]
+                                        if exit_idx.numel() > 0:
+                                            e_p = entry_prices[b, exit_idx]
+                                            x_p = current_prices_exit[b, exit_idx]
+                                            valid = entry_step[b, exit_idx] >= 0
+                                            if valid.any():
+                                                valid_idx = exit_idx[valid]
+                                                stock_returns = (
+                                                    x_p[valid] - e_p[valid]
+                                                ) / (e_p[valid] + 1e-8)
+
+                                                # Calculate ALPHA for each exited stock
+                                                # Alpha = stock_return - market_return (during holding period)
+                                                alphas = th.zeros_like(stock_returns)
+                                                for i, stock_i in enumerate(valid_idx):
+                                                    entry_t = int(
+                                                        entry_step[b, stock_i].item()
+                                                    )
+                                                    if (
+                                                        entry_t >= 0
+                                                        and entry_t < t
+                                                        and batch.market_returns
+                                                        is not None
+                                                    ):
+                                                        # Cumulative market return from entry to exit
+                                                        market_rets = (
+                                                            batch.market_returns[
+                                                                b, entry_t:t
+                                                            ]
+                                                        )
+                                                        cum_market_ret = (
+                                                            1 + market_rets
+                                                        ).prod() - 1
+                                                        alphas[i] = (
+                                                            stock_returns[i]
+                                                            - cum_market_ret
+                                                        )
+                                                    else:
+                                                        # Fallback to absolute return if no market data
+                                                        alphas[i] = stock_returns[i]
+
+                                                # Winner/Loser based on ALPHA (outperform/underperform market)
+                                                n_winners = (
+                                                    (alphas > 0).sum().float()
+                                                )  # Outperformers
+                                                n_losers = (
+                                                    (alphas <= 0).sum().float()
+                                                )  # Underperformers
+                                                n_total = alphas.numel()
+
+                                                # Store for logging
+                                                _n_winners_log[b] = n_winners
+                                                _n_losers_log[b] = n_losers
+                                                _n_exited_log[b] = n_total
+                                                _avg_alpha_log[b] = alphas.mean()
+
+                                                # [FIX 2026-01-02] COUNT-BASED EXACT LINEAR penalty
+                                                # Problem: Old formula used avg_alpha × tanh → non-linear,
+                                                #          3 high-alpha outperformers dominate 6 underperformers
+                                                # Fix: Use outperformer FRACTION for EXACT linear relationship
+                                                #   - 0/10 outperformers → PenMult = 1.0x (best)
+                                                #   - 5/10 outperformers → PenMult = 1.5x (neutral)
+                                                #   - 10/10 outperformers → PenMult = 2.0x (worst)
+                                                avg_alpha = alphas.mean()
+                                                outperformer_fraction = n_winners / (
+                                                    n_total + 1e-8
+                                                )
+
+                                                # Store for logging
+                                                exit_alphas[b] = (
+                                                    avg_alpha  # For AvgAlpha display
+                                                )
+
+                                                # PURE LINEAR: just use fraction directly, no alpha weighting
+                                                # PenMult = 1 + fraction → exactly [1.0, 2.0]
+                                                rotation_quality[b] = (
+                                                    outperformer_fraction
+                                                )
+
+                                    # [FIX 2026-01-02] EXACT LINEAR penalty: PenMult = 1.0 + (n_out / n_total)
+                                    # Range: [1.0x (0/10 out), 1.5x (5/10 out), 2.0x (10/10 out)]
+                                    penalty_multiplier = 1.0 + rotation_quality
+
+                            # Compute penalty
+                            base_penalty = (
+                                self.alpha_turnover * turnover
+                                + self.alpha_change * symdiff
+                            )
+                            penalty = lambda_epoch * base_penalty * penalty_multiplier
+
+                            # [INSIGHT LOG] Store smart rotation info for logging
+                            _exit_alphas_log = (
+                                exit_alphas.detach().clone()
+                                if smart_rotation_enabled
+                                else th.zeros(B, device=self.device)
+                            )
+                            _rotation_quality_log = (
+                                rotation_quality.detach().clone()
+                                if smart_rotation_enabled
+                                else th.zeros(B, device=self.device)
+                            )
+                            _penalty_multiplier_log = (
+                                penalty_multiplier.detach().clone()
+                                if isinstance(penalty_multiplier, th.Tensor)
+                                else th.ones(B, device=self.device)
+                            )
+
+                        # ==============================================
+                        # R_NET: Only at rebalance points
+                        # ==============================================
+                        R_net = R_select + r_hold - penalty
+
+                        # Mask out non-rebalance samples
+                        R_net = R_net * is_rebal_step.float()
+                        baseline = baseline * is_rebal_step.float()
+
+                # For logging compatibility
+                R_raw = R_select  # R_raw now equals R_select
+
+                # [INSIGHT LOG] Store R_select and r_hold for detailed logging
+                _R_select_log = R_select.detach().clone()
+                _r_hold_log = r_hold.detach().clone()
+                _penalty_log = penalty.detach().clone()
+
+                # Advantage (only meaningful at rebalance)
                 A_t_raw = R_net - baseline
 
                 # Normalize Advantage (Batch statistics)
+                # [NaN GUARD] Sanitize A_t_raw first
+                A_t_raw = th.nan_to_num(A_t_raw, nan=0.0, posinf=10.0, neginf=-10.0)
                 A_mean = A_t_raw.mean()
                 eps = 1e-5
                 if B > 1:
                     A_std = A_t_raw.std() + eps
+                    A_t = (A_t_raw - A_mean) / A_std
                 else:
-                    A_std = 1.0
-                A_t = (A_t_raw - A_mean) / A_std
+                    # [BUG FIX 2026-01-02] For B=1, use fixed scale factor instead of max_val
+                    # Previous bug: dividing by max_val always produces ±1.0
+                    # New approach: use a fixed reasonable std (e.g., 10.0 based on typical R_select range)
+                    # This preserves the relative magnitude of advantages
+                    A_std = 10.0  # Fixed scale factor for single sample
+                    A_t = A_t_raw / A_std  # No mean subtraction for B=1
+
+                # [STABILITY FIX] Clamp advantage to prevent extreme gradients
+                A_t = th.clamp(A_t, min=-10.0, max=10.0)
+
+                # [NaN GUARD] Replace any NaN/Inf with zeros
+                if th.isnan(A_t).any() or th.isinf(A_t).any():
+                    A_t = th.nan_to_num(A_t, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Store for Post-Loop Loss Calc (still needed for backprop)
             # [MPS-FIX] In MACRO_ONLY mode, detach all reward-related tensors
@@ -3030,6 +3895,8 @@ class ObserverOfflineBatchTrainer:
                 log_market_probs = F.log_softmax(market_logits, dim=-1)  # (B, N)
 
                 log_probs = th.gather(log_market_probs, 1, topk_indices)  # (B, K)
+                # [NaN Guard] Clamp log_probs to prevent extreme gradients in backward
+                log_probs = th.clamp(log_probs, min=-20.0, max=0.0)
 
                 imp_weights = th.ones_like(log_probs)
                 # Spec §5.1.1: Advantage must be detached to prevent gradient flow through it
@@ -3037,14 +3904,25 @@ class ObserverOfflineBatchTrainer:
                 pg_term = -(log_probs * imp_weights * A_t.detach().unsqueeze(1)).mean(
                     dim=1
                 )  # (B,)
+                # [NaN Guard] Sanitize pg_term before combining with entropy
+                pg_term = th.nan_to_num(pg_term, nan=0.0, posinf=10.0, neginf=-10.0)
 
                 # Entropy bonus on full distribution (spec 5.1.1)
                 # H(π) = -Σ p_i × log(p_i)
                 # Use probs * log_probs for stability
-                entropy = -(market_scores_full * log_market_probs).sum(dim=1)  # (B,)
+                # [NaN Guard] Clamp log_probs to prevent -inf
+                log_market_probs_safe = th.clamp(log_market_probs, min=-20.0)
+                entropy = -(market_scores_full * log_market_probs_safe).sum(
+                    dim=1
+                )  # (B,)
+                entropy = th.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
 
                 # L_PG = pg_term - β_ent × H(π) (subtract entropy to bonus exploration)
                 step_loss_val = pg_term - self.beta_entropy * entropy  # (B,)
+                # [NaN Guard] Sanitize step_loss_val
+                step_loss_val = th.nan_to_num(
+                    step_loss_val, nan=0.0, posinf=10.0, neginf=-10.0
+                )
             else:
                 # MACRO_ONLY: Zero tensors without gradient graph to save memory
                 pg_term = th.tensor(0.0, device=self.device)
@@ -3093,7 +3971,9 @@ class ObserverOfflineBatchTrainer:
                         )
                         # Sample-specific Losses (for logging only)
                         dir_loss_sample = self.dir_criterion(
-                            direction_logits[0:1], dir_target[0:1], alpha_override=dynamic_alpha
+                            direction_logits[0:1],
+                            dir_target[0:1],
+                            alpha_override=dynamic_alpha,
                         )
                     else:
                         dir_loss = self.dir_criterion(direction_logits, dir_target)
@@ -3116,7 +3996,6 @@ class ObserverOfflineBatchTrainer:
             # [MACRO_ONLY] Per-timestep detailed logging (ALL timesteps)
             # -----------------------------------------------------------
             if _is_macro_only and debug_logging:
-
                 # Get direction prediction and target for sample b=0
                 dir_names = ["Bear", "Side", "Bull"]
                 pred_dir_idx = int(pred_state[0].item())
@@ -3149,190 +4028,450 @@ class ObserverOfflineBatchTrainer:
                 )
 
             # -----------------------------------------------------------
-            # [SELECTION_ONLY] Per-timestep detailed logging (ALL timesteps)
-            # -----------------------------------------------------------
-            # -----------------------------------------------------------
-            # [SELECTION_ONLY] Per-timestep detailed logging (ALL timesteps)
+            # [SELECTION_ONLY] Per-timestep detailed logging (REBAL days only)
+            # [UPDATE] Only log when topk changes to reduce terminal noise
             # -----------------------------------------------------------
             elif _is_selection_only and debug_logging:
+                b = 0  # Sample index for logging
 
-                # PG loss for this step
-                pg_loss_step = step_loss_val.mean().item()
+                # Selection info - only log on REBAL days
+                is_rebal = effective_mask[b].item() > 0.5
+                hold_day = int(days_since_last_rebal[b].item())
 
-                # Selection info
-                is_rebal = effective_mask[0].item() > 0.5
-                rebal_status = "REBAL" if is_rebal else "HOLD"
-
-                # Turnover/SymDiff from collected values (current step)
-                turn_val = turnover[0].item() if t > 0 else 0.0
-                sym_val = symdiff[0].item() if t > 0 else 0.0
-
-                # Return and Advantage
-                ret_val = R_raw[0].item() if "R_raw" in dir() else 0.0
-                adv_val = A_t[0].item() if "A_t" in dir() else 0.0
-
-                smart_print(
-                    f"  ⏱  [Epoch {self._epoch}] Batch {batch_idx + 1} | Step {t + 1}/{T_m}  [Sample 1/{B} trajectories]"
+                # Trigger info
+                trig_list = []
+                if sched_trigger[b].item():
+                    trig_list.append("Schedule")
+                if vol_trigger[b].item():
+                    trig_list.append("Vol Shock")
+                if dc_trigger[b].item():
+                    trig_list.append("DC Event")
+                if dir_trigger[b].item():
+                    trig_list.append("Dir Reversal")
+                trigger_str = (
+                    " | ".join(trig_list)
+                    if trig_list
+                    else f"None (Hold Day {hold_day})"
                 )
-                smart_print(
-                    f"     📉 Losses:  L_pg(B)={pg_loss_step:.4f} | Status={rebal_status}"
+
+                # Turnover/SymDiff costs
+                # [BUG FIX 2026-01-02] Include penalty_multiplier in logging for accurate display
+                # Previously: only showed base penalty, not actual penalty after SmartRotation multiplier
+                turn_val = turnover[b].item() if t > 0 else 0.0
+                sym_val = symdiff[b].item() if t > 0 else 0.0
+                pen_mult_val = (
+                    _penalty_multiplier_log[b].item()
+                    if "_penalty_multiplier_log" in dir() and is_rebal
+                    else 1.0
                 )
-                smart_print(
-                    f"     💰 Selection:  Return={ret_val:+.4f} | Advantage={adv_val:+.4f} | "
-                    f"Turnover={turn_val:.4f} | SymDiff={sym_val:.4f}"
+                turn_pen = (
+                    turn_val * self.alpha_turnover * lambda_epoch * pen_mult_val
+                    if is_rebal
+                    else 0.0
                 )
+                sym_pen = (
+                    sym_val * self.alpha_change * lambda_epoch * pen_mult_val
+                    if is_rebal
+                    else 0.0
+                )
+
+                # Returns and Advantages
+                r_raw_val = R_raw[b].item()
+                r_net_val = R_net[b].item()
+                baseline_val = baseline[b].item()
+                adv_raw_val = A_t_raw[b].item()
+                r_hold_val = r_hold[b].item() if isinstance(r_hold, th.Tensor) else 0.0
+
+                # Consistency (win days in held stocks)
+                # Calculate from collected data if available
+                consistency_val = 0.0
+                consistency_sum = 0.0
+                if self.r_hold_alpha > 0 and r_hold_val > 0:
+                    consistency_sum = r_hold_val / self.r_hold_alpha * self.K
+                    consistency_val = consistency_sum / self.K
+
+                # Market context diff
+                prev_ctx = getattr(self, "_prev_c_mkt_b0", None)
+                ctx_diff = (
+                    (market_context[b] - prev_ctx).norm().item()
+                    if prev_ctx is not None
+                    else 0.0
+                )
+
+                # Direction and Risk (frozen in SELECTION_ONLY but log for reference)
+                dir_names = ["Bear", "Side", "Bull"]
+                pred_dir_idx = int(pred_state[b].item())
+                target_dir_idx = int(batch.direction_labels[b, t].item())
+                pred_dir_name = dir_names[min(max(pred_dir_idx, 0), 2)]
+                target_dir_name = dir_names[min(max(target_dir_idx, 0), 2)]
+                dir_match = "✅" if pred_dir_idx == target_dir_idx else "❌"
+                dir_probs = F.softmax(direction_logits[b], dim=-1)
+                prob_bear, prob_side, prob_bull = (
+                    dir_probs[0].item(),
+                    dir_probs[1].item(),
+                    dir_probs[2].item(),
+                )
+                eta_val = risk_eta[b].item()
+                eta_target = risk_target[b].item()
+
+                # Portfolio info - show all K stocks
+                stock_list = batch.stock_list if batch.stock_list else None
+                sel_indices = topk_indices[b].cpu().tolist()
+                if stock_list:
+                    sel_syms = [stock_list[idx] for idx in sel_indices]
+                    sym_str = ", ".join(sel_syms)
+                else:
+                    sym_str = ", ".join([f"S{idx}" for idx in sel_indices])
+
+                # Held/Added count
+                if t > 0 and len(collected_topk_indices) > 1:
+                    prev_set = set(collected_topk_indices[-2][b].cpu().tolist())
+                    curr_set = set(sel_indices)
+                    held_cnt = len(curr_set.intersection(prev_set))
+                    added_cnt = len(curr_set) - held_cnt
+                else:
+                    held_cnt, added_cnt = 0, len(sel_indices)
+
+                # Gate weights
+                gate_str = ""
+                if (
+                    self._latest_gate_weights is not None
+                    and self._latest_gate_weights.size(0) > b
+                ):
+                    gw = self._latest_gate_weights[b]
+                    # [NaN GUARD] Check for NaN in individual gate weights
+                    if th.isnan(gw).any() or th.isinf(gw).any():
+                        gate_str = "Tech=N/A, DC1=N/A, DC2=N/A, DC3=N/A (NaN detected)"
+                    else:
+                        gate_str = f"Tech={gw[0].item() * 100:.1f}%, DC1={gw[1].item() * 100:.1f}%, DC2={gw[2].item() * 100:.1f}%, DC3={gw[3].item() * 100:.1f}%"
+
+                # Balance loss - compute from gate weights for logging
+                bal_loss_val = 0.0
+                if self._latest_gate_weights is not None:
+                    avg_gate = self._latest_gate_weights.mean(dim=0)
+                    # [NaN GUARD] Check for NaN in gate weights
+                    if th.isnan(avg_gate).any() or th.isinf(avg_gate).any():
+                        bal_loss_val = 0.0
+                    else:
+                        num_experts = avg_gate.size(0)
+                        target_uniform = 1.0 / num_experts
+                        bal_loss_val = (avg_gate - target_uniform).pow(
+                            2
+                        ).sum().item() * self.balance_loss_scale
+
+                # Print detailed log - ONLY on REBAL days
+                if is_rebal:
+                    # [INSIGHT] Extract R_select, r_hold, and penalty breakdown
+                    r_select_val = (
+                        _R_select_log[b].item()
+                        if "_R_select_log" in dir()
+                        else r_raw_val
+                    )
+                    r_hold_val = (
+                        _r_hold_log[b].item() if "_r_hold_log" in dir() else 0.0
+                    )
+                    penalty_val = (
+                        _penalty_log[b].item()
+                        if "_penalty_log" in dir()
+                        else (turn_pen + sym_pen)
+                    )
+
+                    # [INSIGHT] Churning rate (0 at t=0 since no previous portfolio)
+                    churn_rate = (
+                        (added_cnt / self.K) * 100 if (self.K > 0 and t > 0) else 0.0
+                    )
+
+                    # [INSIGHT] Stock changes detail
+                    if t > 0 and len(collected_topk_indices) > 1 and stock_list:
+                        prev_set = set(collected_topk_indices[-2][b].cpu().tolist())
+                        curr_set = set(sel_indices)
+                        exited_idx = prev_set - curr_set
+                        entered_idx = curr_set - prev_set
+                        exited_syms = [stock_list[idx] for idx in exited_idx][
+                            :5
+                        ]  # Max 5 for display
+                        entered_syms = [stock_list[idx] for idx in entered_idx][:5]
+                        # Show count if truncated
+                        exit_count = len(exited_idx)
+                        enter_count = len(entered_idx)
+                        exit_suffix = (
+                            f"(+{exit_count - 5} more)" if exit_count > 5 else ""
+                        )
+                        enter_suffix = (
+                            f"(+{enter_count - 5} more)" if enter_count > 5 else ""
+                        )
+                        exit_str = (
+                            (", ".join(exited_syms) + " " + exit_suffix).strip()
+                            if exited_syms
+                            else "-"
+                        )
+                        enter_str = (
+                            (", ".join(entered_syms) + " " + enter_suffix).strip()
+                            if entered_syms
+                            else "-"
+                        )
+                    else:
+                        exit_str, enter_str = "-", "All new"
+
+                    # [INSIGHT] Alpha calculation
+                    alpha_val = r_net_val - baseline_val
+
+                    # [INSIGHT] Accumulate cumulative performance
+                    _cumulative_alpha += alpha_val
+                    _cumulative_r_net += r_net_val
+                    _cumulative_baseline += baseline_val
+                    _rebal_count += 1
+
+                    smart_print(
+                        f"  ⏱  [Epoch {self._epoch}] Batch {batch_idx + 1} | Step {t + 1}/{T_m} | REBAL  [#{_rebal_count}]"
+                    )
+                    smart_print(f"     Trigger: {trigger_str}")
+                    smart_print(
+                        f"     📈 Reward:    R_select={r_select_val:+.4f} | Baseline={baseline_val:+.4f} | r_hold={r_hold_val:+.4f} | Penalty={penalty_val:.4f} | R_net={r_net_val:+.4f}"
+                    )
+                    smart_print(
+                        f"     ⚖️  Advantage: Raw={adv_raw_val:+.4f} | Norm={A_t[b].item():+.4f} | Cumulative={_cumulative_alpha:+.4f}"
+                    )
+                    smart_print(
+                        f"     💸 Costs:     TurnPen={turn_pen:.4f} | SymDiffPen={sym_pen:.4f} | ChurnRate={churn_rate:.1f}%"
+                    )
+
+                    # [INSIGHT] Smart Rotation info (Winner/Loser based on ALPHA vs market)
+                    if (
+                        "_penalty_multiplier_log" in dir()
+                        and "_exit_alphas_log" in dir()
+                    ):
+                        exit_alpha = (
+                            _exit_alphas_log[b].item() * 100
+                        )  # Convert to % (weighted by winner_ratio)
+                        avg_alpha = (
+                            _avg_alpha_log[b].item() * 100
+                            if "_avg_alpha_log" in dir()
+                            else 0.0
+                        )
+                        pen_mult = _penalty_multiplier_log[b].item()
+                        n_win = (
+                            int(_n_winners_log[b].item())
+                            if "_n_winners_log" in dir()
+                            else 0
+                        )
+                        n_lose = (
+                            int(_n_losers_log[b].item())
+                            if "_n_losers_log" in dir()
+                            else 0
+                        )
+                        n_exit = (
+                            int(_n_exited_log[b].item())
+                            if "_n_exited_log" in dir()
+                            else 0
+                        )
+                        # Winner = outperform market (alpha > 0), Loser = underperform market (alpha <= 0)
+                        if pen_mult < 1.0:
+                            rot_status = (
+                                f"🟢 Bán {n_lose} Underperformer"
+                                if n_lose > 0
+                                else "🟢 Good"
+                            )
+                        elif pen_mult > 1.0:
+                            rot_status = (
+                                f"🔴 Bán {n_win} Outperformer"
+                                if n_win > 0
+                                else "🔴 Bad"
+                            )
+                        else:
+                            rot_status = "⚪ Neutral"
+                        exit_detail = (
+                            f"Exit {n_exit}: {n_win}Out/{n_lose}Under"
+                            if n_exit > 0
+                            else "No Exit"
+                        )
+                        smart_print(
+                            f"     🎯 SmartRot:  {exit_detail} | AvgAlpha={avg_alpha:+.2f}% | PenMult={pen_mult:.2f}x ({rot_status})"
+                        )
+
+                    # Get PG loss for this sample
+                    pg_loss_val = (
+                        step_loss_val[b].item()
+                        if isinstance(step_loss_val, th.Tensor)
+                        and step_loss_val.numel() > b
+                        else 0.0
+                    )
+                    smart_print(
+                        f"     📉 Losses:    L_PG={pg_loss_val:.4f} | L_bal={bal_loss_val:.4f}"
+                    )
+                    smart_print(
+                        f"     📊 Portfolio: Held={held_cnt}/{self.K} | New={added_cnt} | {sym_str}"
+                    )
+                    smart_print(
+                        f"     🔄 Changes:   EXIT: [{exit_str}] | ENTER: [{enter_str}]"
+                    )
+                    smart_print(
+                        f"     🔮 Forecast:  Risk(η)={eta_val:.2f}(Tg={eta_target:.2f}) | "
+                        f"Dir={pred_dir_name} (GT: {target_dir_name}){dir_match} [Bear={prob_bear:.2f}, Side={prob_side:.2f}, Bull={prob_bull:.2f}]"
+                    )
+                    if gate_str:
+                        smart_print(f"     🧩 Gate:      {gate_str}")
 
             # -----------------------------------------------------------
             # REAL-TIME LOGGING (UnifiedLogger Integration)
+            # [PERF-FIX] Skip expensive .item() calls when not debugging
             # -----------------------------------------------------------
-            b = 0
-            # Construct Sample Details for Visualization
-            curr_c_mkt = market_context[b]
-            is_rebalance_b0 = effective_mask[b].item() > 0.5
-            target_dir_idx = int(min(max(batch.direction_labels[b, t].item(), 0), 2))
-            pred_state_b = int(min(max(pred_state[b].item(), 0), 2))
+            # FIX: Initialize c_mkt_diff to avoid UnboundLocalError
+            c_mkt_diff = 0.0
 
-            # Triggers logic
-            triggers = []
-            if sched_trigger[b].item():
-                triggers.append("Schedule")
-            if batch.vol_std20[b, t] > vol_shock_threshold:
-                triggers.append("Vol Shock")
-            if batch.dc_event_flag[b, t] > 0.5:
-                triggers.append("Struct Break (DC)")
-            if dir_trigger[b].item():
-                prev_s_idx = int(min(max(prev_pred_state[b].item(), 0), 2))
-                prev_s = ["Bear", "Side", "Bull"][prev_s_idx]
-                curr_s = ["Bear", "Side", "Bull"][pred_state_b]
-                triggers.append(f"Regime Shift ({prev_s}->{curr_s})")
-            elif t == 0:
-                triggers.append("Regime Shift (Initial)")
+            if debug_logging:
+                b = 0
+                # Construct Sample Details for Visualization
+                curr_c_mkt = market_context[b]
+                is_rebalance_b0 = effective_mask[b].item() > 0.5
+                target_dir_idx = int(
+                    min(max(batch.direction_labels[b, t].item(), 0), 2)
+                )
+                pred_state_b = int(min(max(pred_state[b].item(), 0), 2))
 
-            trigger_str = " | ".join(triggers) if triggers else "None"
-            trigger_details = trigger_str
+                # Triggers logic
+                triggers = []
+                if sched_trigger[b].item():
+                    triggers.append("Schedule")
+                if batch.vol_std20[b, t] > vol_shock_threshold:
+                    triggers.append("Vol Shock")
+                if batch.dc_event_flag[b, t] > 0.5:
+                    triggers.append("Struct Break (DC)")
+                if dir_trigger[b].item():
+                    prev_s_idx = int(min(max(prev_pred_state[b].item(), 0), 2))
+                    prev_s = ["Bear", "Side", "Bull"][prev_s_idx]
+                    curr_s = ["Bear", "Side", "Bull"][pred_state_b]
+                    triggers.append(f"Regime Shift ({prev_s}->{curr_s})")
+                elif t == 0:
+                    triggers.append("Regime Shift (Initial)")
 
-            # Costs (Conditional formatting logic moved to Logger, passing raw values)
-            turn_pen_disp = (
-                turnover[b].item() * self.alpha_turnover * lambda_epoch
-                if is_rebalance_b0
-                else 0.0
-            )
-            symdiff_pen_disp = (
-                symdiff[b].item() * self.alpha_change * lambda_epoch
-                if is_rebalance_b0
-                else 0.0
-            )
+                trigger_str = " | ".join(triggers) if triggers else "None"
+                trigger_details = trigger_str
 
-            # Symbols for Portfolio
-            stock_list = batch.stock_list if batch.stock_list else None
-            sel_stocks = topk_indices[b].cpu().tolist()
-
-            # Hold count for display
-            if not hasattr(self, "_last_rebalance_portfolio"):
-                self._last_rebalance_portfolio = {}
-            if is_rebalance_b0:
-                prev_port = self._last_rebalance_portfolio.get(b, set())
-                curr_set = set(sel_stocks)
-                if prev_port:
-                    held = len(curr_set.intersection(prev_port))
-                    changed = len(curr_set) - held
-                else:
-                    held, changed = 0, len(sel_stocks)
-                self._last_rebalance_portfolio[b] = curr_set
-            else:
-                held = len(sel_stocks)
-                changed = 0
-
-            if stock_list:
-                syms = [stock_list[idx] for idx in sel_stocks]
-                # Pass list to logger
-                portfolio_tickers = syms
-            else:
-                portfolio_tickers = [f"S{i}" for i in sel_stocks]
-
-            # Gate Weights for Logging details
-            gate_w_dict = {}
-            if (
-                self._latest_gate_weights is not None
-                and self._latest_gate_weights.size(0) > b
-            ):
-                # Assuming shape (B, 4) -> Tech, DC1, DC2, DC3
-                gw = self._latest_gate_weights[b]
-                gate_w_dict = {
-                    "Tech": gw[0].item(),
-                    "DC1": gw[1].item(),
-                    "DC2": gw[2].item(),
-                    "DC3": gw[3].item(),
-                }
-
-            # Forecast probabilities
-            probs = F.softmax(direction_logits[b], dim=-1).tolist()
-
-            c_mkt_diff = (
-                (curr_c_mkt - getattr(self, "_prev_c_mkt_b0", None)).norm().item()
-                if getattr(self, "_prev_c_mkt_b0", None) is not None
-                else 0.0
-            )
-
-            # Real-time display update (conditioned on config AND debug_logging)
-            # Default to False to avoid verbose per-timestep logging in batch mode
-            display = get_display()
-            if display and getattr(self.config, "realtime_display", False) and debug_logging:
-                display.update(
-                    step=batch_idx * T_m + t,  # Unique step for batch
-                    sample_details={
-                        "step_t": t,
-                        "total_steps_in_traj": T_m,
-                        "trigger": trigger_str,
-                        "trigger_details": trigger_details,
-                        "market_raw_return": R_raw[b].item(),
-                        "ctx_diff": c_mkt_diff,
-                        "cost_turn_pen": turn_pen_disp,
-                        "cost_symdiff_pen": symdiff_pen_disp,
-                        "score_r_total": R_net[b].item(),
-                        "score_r_baseline": baseline[b].item(),
-                        "score_advantage": A_t_raw[b].item(),
-                        "score_r_hold": r_hold[b].item(),
-                        # [MPS-FIX] Use initialized loss variables (computed later in loop)
-                        "loss_pg": step_loss_val[b].item()
-                        if (
-                            is_rebalance_b0
-                            and self.config.mafia_train_mode
-                            != MafiaTrainMode.MACRO_ONLY
-                            and "step_loss_val" in dir()
-                        )
-                        else 0.0,
-                        "loss_risk": risk_loss.item()
-                        if (
-                            self.config.mafia_train_mode
-                            != MafiaTrainMode.SELECTION_ONLY
-                            and risk_loss.abs().item() > 0
-                        )
-                        else 0.0,
-                        "loss_dir": dir_loss.item()
-                        if (
-                            self.config.mafia_train_mode
-                            != MafiaTrainMode.SELECTION_ONLY
-                            and dir_loss.abs().item() > 0
-                        )
-                        else 0.0,
-                        "loss_bal": loss_balance.item()
-                        if ("loss_balance" in dir() and hasattr(loss_balance, "item"))
-                        else 0.0,
-                        "portfolio_held_count": float(held),  # held is calc before
-                        "portfolio_tickers": portfolio_tickers,
-                        "forecast_dir_pred": pred_state_b,
-                        "forecast_dir_gt": target_dir_idx,
-                        "forecast_dir_probs": probs,
-                        "forecast_risk_eta": risk_eta[b].item(),
-                        "forecast_risk_target": risk_target[b].item(),
-                        "gate_weights": gate_w_dict,
-                    },
+                # Costs (Conditional formatting logic moved to Logger, passing raw values)
+                turn_pen_disp = (
+                    turnover[b].item() * self.alpha_turnover * lambda_epoch
+                    if is_rebalance_b0
+                    else 0.0
+                )
+                symdiff_pen_disp = (
+                    symdiff[b].item() * self.alpha_change * lambda_epoch
+                    if is_rebalance_b0
+                    else 0.0
                 )
 
+                # Symbols for Portfolio
+                stock_list = batch.stock_list if batch.stock_list else None
+                sel_stocks = topk_indices[b].cpu().tolist()
 
-            # Update prev for next step (keep existing logic)
-            self._prev_c_mkt_b0 = curr_c_mkt.detach()
+                # Hold count for display
+                if not hasattr(self, "_last_rebalance_portfolio"):
+                    self._last_rebalance_portfolio = {}
+                if is_rebalance_b0:
+                    prev_port = self._last_rebalance_portfolio.get(b, set())
+                    curr_set = set(sel_stocks)
+                    if prev_port:
+                        held = len(curr_set.intersection(prev_port))
+                        changed = len(curr_set) - held
+                    else:
+                        held, changed = 0, len(sel_stocks)
+                    self._last_rebalance_portfolio[b] = curr_set
+                else:
+                    held = len(sel_stocks)
+                    changed = 0
+
+                if stock_list:
+                    syms = [stock_list[idx] for idx in sel_stocks]
+                    # Pass list to logger
+                    portfolio_tickers = syms
+                else:
+                    portfolio_tickers = [f"S{i}" for i in sel_stocks]
+
+                # Gate Weights for Logging details
+                gate_w_dict = {}
+                if (
+                    self._latest_gate_weights is not None
+                    and self._latest_gate_weights.size(0) > b
+                ):
+                    # Assuming shape (B, 4) -> Tech, DC1, DC2, DC3
+                    gw = self._latest_gate_weights[b]
+                    gate_w_dict = {
+                        "Tech": gw[0].item(),
+                        "DC1": gw[1].item(),
+                        "DC2": gw[2].item(),
+                        "DC3": gw[3].item(),
+                    }
+
+                # Forecast probabilities
+                probs = F.softmax(direction_logits[b], dim=-1).tolist()
+
+                c_mkt_diff = (
+                    (curr_c_mkt - getattr(self, "_prev_c_mkt_b0", None)).norm().item()
+                    if getattr(self, "_prev_c_mkt_b0", None) is not None
+                    else 0.0
+                )
+
+                # Real-time display update (conditioned on config AND debug_logging)
+                # Default to False to avoid verbose per-timestep logging in batch mode
+                display = get_display()
+                if display and getattr(self.config, "realtime_display", False):
+                    display.update(
+                        step=batch_idx * T_m + t,  # Unique step for batch
+                        sample_details={
+                            "step_t": t,
+                            "total_steps_in_traj": T_m,
+                            "trigger": trigger_str,
+                            "trigger_details": trigger_details,
+                            "market_raw_return": R_raw[b].item(),
+                            "ctx_diff": c_mkt_diff,
+                            "cost_turn_pen": turn_pen_disp,
+                            "cost_symdiff_pen": symdiff_pen_disp,
+                            "score_r_total": R_net[b].item(),
+                            "score_r_baseline": baseline[b].item(),
+                            "score_advantage": A_t_raw[b].item(),
+                            "score_r_hold": r_hold[b].item(),
+                            # [MPS-FIX] Use initialized loss variables (computed later in loop)
+                            "loss_pg": step_loss_val[b].item()
+                            if (
+                                is_rebalance_b0
+                                and self.config.mafia_train_mode
+                                != MafiaTrainMode.MACRO_ONLY
+                                and "step_loss_val" in dir()
+                            )
+                            else 0.0,
+                            "loss_risk": risk_loss.item()
+                            if (
+                                self.config.mafia_train_mode
+                                != MafiaTrainMode.SELECTION_ONLY
+                                and risk_loss.abs().item() > 0
+                            )
+                            else 0.0,
+                            "loss_dir": dir_loss.item()
+                            if (
+                                self.config.mafia_train_mode
+                                != MafiaTrainMode.SELECTION_ONLY
+                                and dir_loss.abs().item() > 0
+                            )
+                            else 0.0,
+                            "loss_bal": loss_balance.item()
+                            if (
+                                "loss_balance" in dir()
+                                and hasattr(loss_balance, "item")
+                            )
+                            else 0.0,
+                            "portfolio_held_count": float(held),  # held is calc before
+                            "portfolio_tickers": portfolio_tickers,
+                            "forecast_dir_pred": pred_state_b,
+                            "forecast_dir_gt": target_dir_idx,
+                            "forecast_dir_probs": probs,
+                            "forecast_risk_eta": risk_eta[b].item(),
+                            "forecast_risk_target": risk_target[b].item(),
+                            "gate_weights": gate_w_dict,
+                        },
+                    )
+
+                # Update prev for next step (keep existing logic)
+                self._prev_c_mkt_b0 = curr_c_mkt.detach()
 
             if t == T_m - 1:
                 # End of trajectory - show batch-wide statistics
@@ -3423,14 +4562,34 @@ class ObserverOfflineBatchTrainer:
                         else "🔴 Underperforming"
                     )
 
+                    # [INSIGHT] Count REBAL steps and calculate churning
+                    rebal_count_total = int((all_rewards != 0).sum().item())
+                    avg_churn = (
+                        (all_symdiffs.sum() / (rebal_count_total + 1e-8)).item()
+                        * 100
+                        / 2
+                    )  # Convert to %
+
+                    # [INSIGHT] Calculate R_select and r_hold breakdown
+                    all_hold_rewards = th.stack(collected_hold_rewards, dim=1)  # r_hold
+                    mean_r_select = mean_return  # R_select = R_raw in new system
+                    mean_r_hold = all_hold_rewards.mean().item()
+                    total_penalty = mean_turn_pen + mean_symdiff_pen
+
+                    # [INSIGHT] Market baseline
+                    mean_baseline = all_baselines.mean().item()
+
                     smart_print(
-                        f"     📈 Returns:    Mean={mean_return:+.4f} | Std={std_return:.4f} | Min={min_return:+.4f} | Max={max_return:+.4f}"
+                        f"     📈 Reward:     R_select={mean_r_select:+.4f} | Baseline={mean_baseline:+.4f} | r_hold={mean_r_hold:+.4f} | Penalty={total_penalty:.4f} | R_net={mean_net_reward:+.4f}"
                     )
                     smart_print(
-                        f"     💰 Net Reward: Mean={mean_net_reward:+.4f} | TurnPen={mean_turn_pen:.4f} | SymDiffPen={mean_symdiff_pen:.4f}"
+                        f"     ⚖️  Advantage:  Mean={mean_raw_advantage:+.4f} ({adv_status}) | R_net={mean_net_reward:+.4f} vs Market={mean_baseline:+.4f}"
                     )
                     smart_print(
-                        f"     ⚖️  Advantage:  Mean={mean_raw_advantage:+.4f} ({adv_status})"
+                        f"     💸 Costs:      TurnPen={mean_turn_pen:.4f} | SymDiffPen={mean_symdiff_pen:.4f} | AvgChurn={avg_churn:.1f}%"
+                    )
+                    smart_print(
+                        f"     📉 Stats:      REBAL={rebal_count_total} | Return: Min={min_return:+.4f} Max={max_return:+.4f} Std={std_return:.4f}"
                     )
                     smart_print("=" * 100)
                 else:
@@ -3548,7 +4707,20 @@ class ObserverOfflineBatchTrainer:
             if self.config.mafia_train_mode != MafiaTrainMode.MACRO_ONLY:
                 # Only compute PG term if we are NOT in Macro Only mode
                 # step_pg_loss depends on the graph, effectively keeping it alive if computed
-                step_pg_loss = (step_loss_val * effective_mask_float).sum()
+                # [FIX] Divide by effective sample count to prevent gradient accumulation
+                effective_count = effective_mask_float.sum() + eps_norm
+                # [NaN Guard] Replace NaN in step_loss_val BEFORE masking (NaN × 0 = NaN!)
+                step_loss_val_safe = th.nan_to_num(
+                    step_loss_val, nan=0.0, posinf=10.0, neginf=-10.0
+                )
+                step_pg_loss = (
+                    step_loss_val_safe * effective_mask_float
+                ).sum() / effective_count
+                # [NaN Guard] Double-check after computation
+                if th.isnan(step_pg_loss) or th.isinf(step_pg_loss):
+                    step_pg_loss = th.tensor(
+                        0.0, device=self.device, requires_grad=False
+                    )
                 term_pg = step_pg_loss * norm_pg * self.lambda_pg
                 step_total_loss = step_total_loss + term_pg
             else:
@@ -3574,65 +4746,91 @@ class ObserverOfflineBatchTrainer:
                 and hasattr(self, "_gate_weights_with_grad")
                 and self._gate_weights_with_grad is not None
             ):
-                # 1. Get Average Gate distribution across batch: (num_experts,)
-                avg_gate = self._gate_weights_with_grad.mean(dim=0)
-                # 2. Compute MSE from Uniform (0.25): sum((w - 0.25)^2)
-                # or CV^2 (Variance / Mean^2)
-                num_experts = avg_gate.size(0)
-                target_uniform = 1.0 / num_experts
-                loss_balance = (avg_gate - target_uniform).pow(
-                    2
-                ).sum() * self.balance_loss_scale
+                # [NaN GUARD] Check gate weights BEFORE using for balance loss
+                # NaN in gate_weights will cause NaN gradients in backward pass
+                if (
+                    th.isnan(self._gate_weights_with_grad).any()
+                    or th.isinf(self._gate_weights_with_grad).any()
+                ):
+                    # Skip balance loss if gate weights are corrupted
+                    pass
+                else:
+                    # 1. Get Average Gate distribution across batch: (num_experts,)
+                    avg_gate = self._gate_weights_with_grad.mean(dim=0)
 
-                # Add to total loss
-                bal_term = loss_balance * self.lambda_balance
-                step_total_loss = step_total_loss + bal_term
+                    # [NaN GUARD] Clamp avg_gate to prevent numerical instability in backward pass
+                    # Values very close to 0 can cause exploding gradients through softmax
+                    # Clamp to [0.01, 0.99] to ensure stable gradients
+                    avg_gate = th.clamp(avg_gate, min=0.01, max=0.99)
+                    # Renormalize to ensure sum to 1 (softmax property)
+                    avg_gate = avg_gate / avg_gate.sum()
 
-                # Add to list for averaging
-                balance_losses.append(loss_balance.item())
+                    # 2. Compute MSE from Uniform (0.25): sum((w - 0.25)^2)
+                    # or CV^2 (Variance / Mean^2)
+                    num_experts = avg_gate.size(0)
+                    target_uniform = 1.0 / num_experts
+                    loss_balance = (avg_gate - target_uniform).pow(
+                        2
+                    ).sum() * self.balance_loss_scale
 
-            # [NEW] L1 Regularization (Lasso) - GLOBAL
-            # Apply sparsity penalty to ALL trainable weights
-            l1_lambda = getattr(self.config, "mafia_l1_lambda", 0.0)
-            if l1_lambda > 0:
-                l1_norm = th.tensor(0.0, device=self.device)
-                for param in self.observer.mafia_model.parameters():
-                    if param.requires_grad:
-                         # Use th.norm(p=1) or .abs().sum()
-                        l1_norm += param.abs().sum()
-                
-                l1_loss = l1_norm * l1_lambda
-                step_total_loss = step_total_loss + l1_loss
-            
+                    # [NaN Guard] Sanitize balance loss
+                    if th.isnan(loss_balance) or th.isinf(loss_balance):
+                        loss_balance = th.tensor(
+                            0.0, device=self.device, requires_grad=False
+                        )
+
+                    # Add to total loss
+                    # [BUG FIX 2026-01-02] Normalize balance loss by T_m to match PG loss scale
+                    # Previously: bal_term was 58x larger than PG loss, dominating gradients
+                    norm_bal = 1.0 / T_m  # Same as norm_risk, norm_dir
+                    bal_term = loss_balance * norm_bal * self.lambda_balance
+                    step_total_loss = step_total_loss + bal_term
+
+                    # Add to list for averaging
+                    balance_losses.append(loss_balance.item())
+
+            # NOTE: L1 Regularization moved OUTSIDE the trajectory loop to avoid
+            # accumulating L1 gradients T times. Applied once after all step gradients.
+
             # Cleanup reference to free graph after backward (always clear to prevent leak)
             self._gate_weights_with_grad = None
 
             # ===========================================================
             # BACKWARD PASS (Per-Step) - RESTORED
             # ===========================================================
+            _timing_loss += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+
             # Truncated BPTT (k1=1): Backward immediate step only.
             # Requires graph not to be linked to previous steps (fixed via detach in turnover).
             # [SPEED-FIX] Always backward - checking zero adds CPU-GPU sync overhead
             # Zero loss just produces zero gradients (no side effects)
             if step_total_loss.requires_grad:
-                try:
-                    step_total_loss.backward()
-                except RuntimeError as e:
-                    if "nan" in str(e).lower() or "inf" in str(e).lower():
-                        smart_print(
-                            f"[WARN] NaN/Inf in backward pass (t={t}). Skipping step."
-                        )
-                    else:
-                        raise e
+                # [NaN Guard] Skip backward if loss is NaN/Inf to prevent gradient corruption
+                if th.isnan(step_total_loss) or th.isinf(step_total_loss):
+                    smart_print(f"[WARN] NaN/Inf in loss at t={t}. Skipping backward.")
+                else:
+                    try:
+                        step_total_loss.backward()
+                    except RuntimeError as e:
+                        if "nan" in str(e).lower() or "inf" in str(e).lower():
+                            smart_print(
+                                f"[WARN] NaN/Inf in backward pass (t={t}). Skipping step."
+                            )
+                        else:
+                            raise e
+
+            _timing_backward += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
             # [MPS-FIX] Free computation graph memory immediately after backward
             del step_total_loss
 
             # Store Metrics BEFORE cleanup (Float only - NO GRAPH)
-            # [OPTIMIZATION] Accumulate tensors instead of .item() 
+            # [OPTIMIZATION] Accumulate tensors instead of .item()
             if self.config.mafia_train_mode != MafiaTrainMode.MACRO_ONLY:
                 acc_loss_pg += step_pg_loss.detach()
-            
+
             if self.config.mafia_train_mode != MafiaTrainMode.SELECTION_ONLY:
                 acc_loss_risk += risk_loss.detach()
                 acc_loss_dir += dir_loss.detach()
@@ -3641,9 +4839,7 @@ class ObserverOfflineBatchTrainer:
             if loss_balance.numel() > 0:
                 acc_loss_bal += loss_balance.detach()
 
-
             # [MPS-FIX] Cleanup block moved to end of loop
-
 
             # Periodic MPS cache cleanup to prevent memory buildup
             # [FIX] More aggressive cleanup for MACRO_ONLY (every 4 steps) to compensate
@@ -3657,8 +4853,41 @@ class ObserverOfflineBatchTrainer:
 
             # --- Update Memory Injection State (prev_holdings) for NEXT step ---
             # This must reflect the ACTUAL portfolio held after this step (whether rebalanced or held)
-            prev_holdings = th.zeros(B, N_action, device=self.device)
-            prev_holdings.scatter_(1, topk_indices, 1.0)
+            curr_holdings_mask = th.zeros(B, N_action, device=self.device)
+            curr_holdings_mask.scatter_(1, topk_indices, 1.0)
+
+            # ============================================================
+            # Update Entry Price Tracking for "Gồng Lời" Reward
+            # ============================================================
+            # Find newly entered stocks (in curr but not in prev)
+            new_entries = (curr_holdings_mask > 0) & (prev_holdings == 0)  # (B, N)
+            # Find exited stocks (in prev but not in curr)
+            exits = (prev_holdings > 0) & (curr_holdings_mask == 0)  # (B, N)
+
+            # Get current close prices (index 1 = Close in OCHLV)
+            current_close_prices = batch.stock_ochlv[:, t, :, 1]  # (B, N)
+
+            # Get current market close price for alpha_since_entry tracking
+            # full_market_ochlv: (T_total, 1, 5), Close is index 1
+            abs_idx_t = (batch.start_indices + t).cpu()  # (B,) on CPU
+            current_market_close_for_entry = full_market_ochlv[abs_idx_t, 0, 1].to(self.device)  # (B,)
+
+            # Update entry prices and step for new entries
+            entry_prices = th.where(new_entries, current_close_prices, entry_prices)
+            entry_step = th.where(new_entries, th.full_like(entry_step, t), entry_step)
+            # Update market price at entry (broadcast to all stocks, but only used where new_entries=True)
+            entry_market_prices = th.where(
+                new_entries,
+                current_market_close_for_entry.unsqueeze(1).expand(-1, N_action),
+                entry_market_prices
+            )
+
+            # Clear entry tracking for exited stocks
+            entry_prices = th.where(exits, th.zeros_like(entry_prices), entry_prices)
+            entry_step = th.where(exits, th.full_like(entry_step, -1), entry_step)
+            entry_market_prices = th.where(exits, th.zeros_like(entry_market_prices), entry_market_prices)
+
+            prev_holdings = curr_holdings_mask
 
             # [SPEED-FIX] Only do expensive logging when explicitly enabled
             # This block has many .item() calls that cause CPU-GPU sync
@@ -3680,7 +4909,9 @@ class ObserverOfflineBatchTrainer:
 
                     # Regime Shift logic
                     if dir_trigger[b_log].item():
-                        prev_s_idx_b = int(min(max(prev_pred_state[b_log].item(), 0), 2))
+                        prev_s_idx_b = int(
+                            min(max(prev_pred_state[b_log].item(), 0), 2)
+                        )
                         curr_s_idx_b = int(min(max(pred_state[b_log].item(), 0), 2))
                         prev_s_str = ["Bear", "Side", "Bull"][prev_s_idx_b]
                         curr_s_str = ["Bear", "Side", "Bull"][curr_s_idx_b]
@@ -3720,7 +4951,10 @@ class ObserverOfflineBatchTrainer:
                         log_entry.update(
                             {
                                 "selected_stocks": ",".join(
-                                    [str(idx) for idx in topk_indices[b_log].cpu().tolist()]
+                                    [
+                                        str(idx)
+                                        for idx in topk_indices[b_log].cpu().tolist()
+                                    ]
                                 ),
                                 "raw_return": R_raw[b_log].item(),
                                 "turnover_penalty": turnover[b_log].item()
@@ -3749,11 +4983,11 @@ class ObserverOfflineBatchTrainer:
 
             # Note: Hidden state is automatically maintained inside the LSTM
             # via _cached_state (detached for TBPTT)
-            
+
             # [MPS-FIX] Aggressive cleanup - delete intermediate tensors no longer needed
             # (Moved here to allow logging access before deletion)
             try:
-                del pg_term, entropy, step_loss_val
+                del pg_term, entropy, step_loss_val, step_loss_val_safe
                 del term_pg, term_risk, term_dir, loss_balance
             except NameError:
                 pass
@@ -3768,7 +5002,6 @@ class ObserverOfflineBatchTrainer:
                 except NameError:
                     pass
 
-
             # Update Context Buffer via FIFO (Spec 3.6.2.2)
             # Remove oldest ([:, 0, :]), append new (market_context)
             # market_context is (B, D). Need (B, 1, D)
@@ -3781,13 +5014,21 @@ class ObserverOfflineBatchTrainer:
             batch_context_buffer = th.cat([history_part, new_part], dim=1)
 
             # [TIMING] Record timestep duration
+            _timing_other += time.perf_counter() - _t0
             _timestep_times.append(time.perf_counter() - _step_start)
 
         # [TIMING] Report batch timing
         _batch_duration = time.perf_counter() - _batch_start_time
+        print(
+            f"      ⏱️  [TIMING BREAKDOWN] Forward: {_timing_forward:.1f}s | Loss: {_timing_loss:.1f}s | Backward: {_timing_backward:.1f}s | Other: {_timing_other:.1f}s",
+            flush=True,
+        )
         if len(_timestep_times) > 2:  # Skip first 2 (JIT warmup)
             _avg_step_ms = 1000 * sum(_timestep_times[2:]) / len(_timestep_times[2:])
-            print(f"      ⏱️  [TIMING] Batch: {_batch_duration:.1f}s | Avg step: {_avg_step_ms:.1f}ms (excl. JIT warmup)", flush=True)
+            print(
+                f"      ⏱️  [TIMING] Batch: {_batch_duration:.1f}s | Avg step: {_avg_step_ms:.1f}ms (excl. JIT warmup)",
+                flush=True,
+            )
 
         # ===========================================================
         # BACKWARD PASS (Per-Step) already done in loop
@@ -3797,30 +5038,87 @@ class ObserverOfflineBatchTrainer:
         # STEP 3: OPTIMIZER STEP (After accumulating all T_m gradients)
         # ============================================================
 
+        # ===== L1 Regularization (applied ONCE after trajectory, not per-step) =====
+        # This ensures L1 gradient is added only once, not T times
+        l1_enabled = getattr(self.config, "macro_enable_l1_regularization", True)
+        l1_lambda = getattr(self.config, "mafia_l1_lambda", 0.0)
+        if l1_enabled and l1_lambda > 0:
+            l1_norm = th.tensor(0.0, device=self.device)
+            for param in self.observer.mafia_model.parameters():
+                if param.requires_grad:
+                    l1_norm += param.abs().sum()
+
+            l1_loss = l1_norm * l1_lambda
+            # Backward on L1 loss only - adds to existing accumulated gradients
+            l1_loss.backward()
+
         # ===== Optimizer Step (gradients already accumulated via backward() in loop) =====
         try:
-            # Clip gradients
-            grad_norm = th.nn.utils.clip_grad_norm_(
-                self.observer.mafia_model.parameters(), max_norm=1.0
-            )
-            if th.is_tensor(grad_norm):
-                grad_norm = grad_norm.item()
+            # [TUNING] Use Gradient Normalization instead of Clipping
+            # Normalizes gradient to have unit norm, preserving direction but controlling magnitude
+            # This is more effective than clipping when raw grad_norm >> clip_threshold
 
-            # Retrospective Log Update
-            if hasattr(self, "_trajectory_log"):
-                for i in range(start_log_idx, len(self._trajectory_log)):
-                    self._trajectory_log[i]["grad_norm"] = grad_norm
+            # First compute total gradient norm
+            total_norm = 0.0
+            has_nan_grad = False
+            nan_param_name = None
+            for name, param in self.observer.mafia_model.named_parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2).item()
+                    if np.isnan(param_norm) or np.isinf(param_norm):
+                        has_nan_grad = True
+                        nan_param_name = name
+                        break
+                    total_norm += param_norm**2
+            grad_norm = total_norm**0.5
 
-            # Update weights
-            self.optimizer.step()
-            # If an LR scheduler is used, step it here. Assuming it's self.lr_scheduler
-            if hasattr(self, "lr_scheduler") and self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+            # [NaN GUARD] Skip update if gradient contains NaN/Inf
+            if has_nan_grad or np.isnan(grad_norm) or np.isinf(grad_norm):
+                if nan_param_name:
+                    smart_print(
+                        f"[WARN] NaN/Inf in gradients detected at '{nan_param_name}'. Skipping update."
+                    )
+                else:
+                    smart_print(
+                        f"[WARN] NaN/Inf in gradients detected. Skipping update."
+                    )
+                self.optimizer.zero_grad()
+                skipped_update = True
+                grad_norm = -1.0  # Indicator for failure
 
-            # [MPS-FIX] Clear gradient memory after optimizer step
-            self.optimizer.zero_grad(
-                set_to_none=True
-            )  # More memory efficient than zero_grad()
+                # Update log with failure indicator
+                if hasattr(self, "_trajectory_log"):
+                    for i in range(start_log_idx, len(self._trajectory_log)):
+                        self._trajectory_log[i]["grad_norm"] = -1.0
+            else:
+                # Normalize gradients to have norm = max_grad_norm (from config)
+                # IMPORTANT: Only scale DOWN when grad_norm > target, never amplify small gradients
+                target_norm = self.max_grad_norm  # Use config value (default 5.0)
+                if grad_norm > target_norm:  # Only clip if exceeds threshold
+                    scale = target_norm / grad_norm
+                    for param in self.observer.mafia_model.parameters():
+                        if param.grad is not None:
+                            param.grad.data.mul_(scale)
+                if th.is_tensor(grad_norm):
+                    grad_norm = grad_norm.item()
+
+                # Retrospective Log Update
+                if hasattr(self, "_trajectory_log"):
+                    for i in range(start_log_idx, len(self._trajectory_log)):
+                        self._trajectory_log[i]["grad_norm"] = grad_norm
+
+                # Update weights
+                self.optimizer.step()
+                # If an LR scheduler is used, step it here. Assuming it's self.lr_scheduler
+                if hasattr(self, "lr_scheduler") and self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+
+                # [MPS-FIX] Clear gradient memory after optimizer step
+                self.optimizer.zero_grad(
+                    set_to_none=True
+                )  # More memory efficient than zero_grad()
+
+                skipped_update = False
 
         except RuntimeError as e:
             if "nan" in str(e).lower() or "inf" in str(e).lower():
@@ -3837,20 +5135,22 @@ class ObserverOfflineBatchTrainer:
                         self._trajectory_log[i]["grad_norm"] = -1.0
             else:
                 raise e
-        else:
-            skipped_update = False
+        # Note: skipped_update is already set inside the try block
 
         # Calculate Average Metrics for Log
         # [OPTIMIZATION] Sync once per batch
-        avg_pg = (acc_loss_pg / expected_rebal_count).item() if expected_rebal_count > 0 else 0.0
-        
+        avg_pg = (
+            (acc_loss_pg / expected_rebal_count).item()
+            if expected_rebal_count > 0
+            else 0.0
+        )
+
         # Risk/Dir are averaged over T_m steps
         avg_risk = (acc_loss_risk / T_m).item()
         avg_dir = (acc_loss_dir / T_m).item()
-        
+
         # Balance over T_m
         avg_loss_balance = (acc_loss_bal / T_m).item()
-
 
         # Reconstruct approximate total loss for display
         # (This won't exactly match the backwarded loss due to estimator norm, but close enough for logs)
@@ -3906,12 +5206,17 @@ class ObserverOfflineBatchTrainer:
             batch_symdiff_pens = (
                 (all_symdiffs.detach() * self.alpha_change).mean(dim=1).cpu().numpy()
             )  # (B,)
+            # [AVG_CHURN] Track raw symdiffs sum and rebal count for avg_churn calculation
+            batch_raw_symdiffs_sum = all_symdiffs.detach().sum().item()
+            batch_rebal_count = (all_rewards.detach() != 0).sum().item()
         else:
             batch_returns = np.array([])
             batch_advantages = np.array([])
             batch_net_rewards = np.array([])
             batch_turn_pens = np.array([])
             batch_symdiff_pens = np.array([])
+            batch_raw_symdiffs_sum = 0.0
+            batch_rebal_count = 0
             all_hold_rewards = None
             all_returns = None
             all_turnovers = None
@@ -3922,8 +5227,16 @@ class ObserverOfflineBatchTrainer:
         if collected_topk_indices and all_returns is not None:
             # batch_topk_indices = th.stack(collected_topk_indices, dim=1)  # Unused for current metric calc
 
+            # [METRIC FIX 2] Use collected_valid_returns (only actual computed returns)
+            # instead of all_return_ratios (which includes zeros for non-rebalance steps)
+            valid_returns_tensor = (
+                th.cat(collected_valid_returns, dim=0)
+                if collected_valid_returns
+                else all_return_ratios.detach().cpu().flatten()
+            )
+
             selection_metrics = self.compute_selection_metrics(
-                returns=all_return_ratios.detach(),  # [METRIC FIX] Use unscaled return ratios
+                returns=valid_returns_tensor,  # [METRIC FIX 2] Use valid returns only
                 turnover=all_turnovers.detach(),
                 advantages=all_raw_advantages.detach(),
                 hold_rewards=all_hold_rewards.detach()
@@ -4009,6 +5322,9 @@ class ObserverOfflineBatchTrainer:
             "batch_net_rewards": batch_net_rewards,
             "batch_turn_pens": batch_turn_pens,
             "batch_symdiff_pens": batch_symdiff_pens,
+            # [AVG_CHURN] For epoch-level avg_churn calculation
+            "batch_raw_symdiffs_sum": batch_raw_symdiffs_sum,
+            "batch_rebal_count": batch_rebal_count,
             # Detailed Selection Metrics
             "topk_sharpe_ratio": selection_metrics["sharpe_ratio"],
             "topk_hit_rate": selection_metrics.get("hit_rate", 0.5),
@@ -4061,6 +5377,12 @@ class ObserverOfflineBatchTrainer:
             collected_advantages,
         )
 
+        # [MEMORY-FIX] Clear trajectory log if not saving details
+        # This prevents memory leak when log_trajectory_details is disabled
+        if not getattr(self.config, "log_trajectory_details", False):
+            if hasattr(self, "_trajectory_log"):
+                self._trajectory_log = []
+
         # Clear batch tensors
         if "ochlv_batch" in dir():
             del ochlv_batch
@@ -4070,7 +5392,8 @@ class ObserverOfflineBatchTrainer:
         # Device-aware memory cleanup
         self._clear_memory_cache(force_gc=True)
 
-        return metrics
+        # Return metrics and final context buffer (for stateful mode carry-over)
+        return metrics, batch_context_buffer.detach() if use_stateful else None
 
     def _save_trajectory_log(self):
         """
@@ -4091,6 +5414,7 @@ class ObserverOfflineBatchTrainer:
         if output_dir is None:
             # Warn user about missing res_root - this indicates a setup issue
             import datetime
+
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = f"./trajectory_logs_{timestamp}"
             smart_print(f"[WARN] config.res_root not set! Using fallback: {output_dir}")
@@ -4123,6 +5447,7 @@ class ObserverOfflineBatchTrainer:
         verbose: bool = True,  # NEW: Verbose print flag
         limit_batches: Optional[int] = None,
         training_mode: str = "FULL",  # NEW: Explicit Training Mode
+        epoch: Optional[int] = None,  # NEW: Sync epoch display with outer loop
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -4161,7 +5486,11 @@ class ObserverOfflineBatchTrainer:
         # Store for step-wise annealing
         self.steps_per_epoch = steps_per_epoch
 
-        self._epoch += 1
+        # Sync epoch with outer loop if passed, otherwise use internal counter
+        if epoch is not None:
+            self._epoch = epoch
+        else:
+            self._epoch += 1
         # Update curriculum penalty weight based on current epoch (Spec §7.1)
         # Only compute for SELECTION_ONLY mode (MACRO_ONLY doesn't use penalties)
         if self.config.mafia_train_mode == MafiaTrainMode.SELECTION_ONLY:
@@ -4183,6 +5512,7 @@ class ObserverOfflineBatchTrainer:
             "mean_risk_eta": 0.0,
             # Selection Metrics
             "topk_sharpe_ratio": 0.0,
+            "topk_hit_rate": 0.0,  # [BUG FIX] Was missing, caused default 0.5
             "topk_mean_return": 0.0,
             "topk_volatility": 0.0,
             "topk_turnover": 0.0,
@@ -4234,6 +5564,9 @@ class ObserverOfflineBatchTrainer:
         epoch_net_rewards = []  # List of net reward values
         epoch_turn_pens = []  # List of turnover penalty values
         epoch_symdiff_pens = []  # List of symdiff penalty values
+        # [AVG_CHURN] Accumulators for epoch-level avg_churn
+        epoch_raw_symdiffs_sum = 0.0
+        epoch_rebal_count = 0
 
         # Accumulators for Global Metrics (to match validation logic)
         epoch_dir_logits = []
@@ -4244,20 +5577,63 @@ class ObserverOfflineBatchTrainer:
         # NEW: Log details container
         detailed_log_data = []
 
+        # Watchlist Log Initialization
+        output_dir = getattr(self.config, "res_root", None)
+        if output_dir is not None:
+            self._init_watchlist_log(output_dir)
+
         # ============================================================
-        # EPOCH HEADER
+        # STATEFUL TRAINING MODE: Sequential iteration with hidden state carry-over
+        # ============================================================
+        # Auto-enable for SELECTION_ONLY mode (requires long-term memory)
+        use_stateful = getattr(self.config, "mafia_stateful_training", False)
+        if self.config.mafia_train_mode == MafiaTrainMode.SELECTION_ONLY:
+            use_stateful = True  # Force stateful for Selection training
+        stateful_stride = int(getattr(self.config, "mafia_stateful_stride", 0))
+        # stride=0 means no overlap → use T_m as effective stride
+        effective_stride = stateful_stride if stateful_stride > 0 else self.T_m
+
+        # For stateful mode, compute sequential start indices
+        if use_stateful:
+            min_start = self.T_w
+            max_start = T_total - self.T_m - self.horizon
+            # Generate sequential start indices with stride
+            sequential_starts = list(range(min_start, max_start + 1, effective_stride))
+            steps_per_epoch = len(sequential_starts)
+            self.steps_per_epoch = steps_per_epoch
+
+            # Initialize epoch-level hidden state (batch_size=1 for sequential mode)
+            # Will be initialized properly on first forward pass
+            epoch_hidden_state = None
+            epoch_context_buffer = None
+
+        # ============================================================
+        # EPOCH HEADER (Updated for stateful mode)
         # ============================================================
         smart_print("\n" + "=" * 100)
-        smart_print(f"EPOCH {self._epoch} TRAINING")
-        smart_print(f"  Batches per epoch: {steps_per_epoch}")
-        smart_print(
-            f"  Trajectories per batch: {self.batch_size} (processed in PARALLEL on {self.device})"
-        )
-        smart_print(f"  Timesteps per trajectory: {self.T_m}")
-        smart_print(
-            f"  Total training steps this epoch: {steps_per_epoch * self.batch_size * self.T_m:,}"
-        )
-        # Only show curriculum lambda for SELECTION_ONLY mode (MACRO_ONLY doesn't use penalties)
+        if use_stateful:
+            smart_print(f"EPOCH {self._epoch} TRAINING [🔗 STATEFUL MODE]")
+            smart_print(f"  Mode: SELECTION_ONLY with sequential memory")
+            smart_print(
+                f"  Segments per epoch: {steps_per_epoch} (stride={effective_stride}, no overlap)"
+            )
+            smart_print(f"  Batch size: 1 (sequential processing)")
+            smart_print(f"  Timesteps per segment: {self.T_m}")
+            smart_print(
+                f"  Memory carry-over: Hidden state + Context buffer ({self.config.router_context_window} days)"
+            )
+        else:
+            smart_print(f"EPOCH {self._epoch} TRAINING")
+            smart_print(f"  Batches per epoch: {steps_per_epoch}")
+            smart_print(
+                f"  Trajectories per batch: {self.batch_size} (processed in PARALLEL on {self.device})"
+            )
+            smart_print(f"  Timesteps per trajectory: {self.T_m}")
+            smart_print(
+                f"  Total training steps this epoch: {steps_per_epoch * self.batch_size * self.T_m:,}"
+            )
+
+        # Only show curriculum lambda for SELECTION_ONLY mode
         if self.config.mafia_train_mode == MafiaTrainMode.SELECTION_ONLY:
             smart_print(
                 f"  Curriculum λ_epoch: {self._current_lambda_epoch:.2f} (penalty weight)"
@@ -4274,35 +5650,81 @@ class ObserverOfflineBatchTrainer:
             # ============================================================
             # Consolidated Logging
 
-            # Sample batch
-            batch = self.sample_trajectory_batch(data_tensors, mode="TRAIN")
+            # Sample batch - STATEFUL vs RANDOM mode
+            if use_stateful:
+                # Sequential stateful: use pre-computed start index
+                start_idx = sequential_starts[step]
+                batch = self.sample_trajectory_batch(
+                    data_tensors,
+                    mode="TRAIN",
+                    batch_idx=step,
+                    force_start_indices=[start_idx],  # Force single sequential start
+                )
+            else:
+                # Random mode (default): random sampling
+                batch = self.sample_trajectory_batch(data_tensors, mode="TRAIN")
+
             # -------------------------------------------------------------------
             # Collect and train step
             # -------------------------------------------------------------------
-            step_metrics = self.collect_and_train_step(
-                batch, data_tensors, batch_idx=step, epoch_idx=self._epoch
-            )
+            if use_stateful:
+                # STATEFUL MODE: Pass and receive context buffer for memory carry-over
+                step_metrics, epoch_context_buffer = self.collect_and_train_step(
+                    batch,
+                    data_tensors,
+                    batch_idx=step,
+                    epoch_idx=self._epoch,
+                    external_context_buffer=epoch_context_buffer,
+                )
+            else:
+                # RANDOM MODE: Standard call (context buffer not preserved)
+                step_metrics, _ = self.collect_and_train_step(
+                    batch, data_tensors, batch_idx=step, epoch_idx=self._epoch
+                )
 
             if verbose:
                 loss_bal_val = step_metrics.get("loss_bal", 0.0)
                 bal_str = f", Bal: {loss_bal_val:.4f}" if loss_bal_val != 0 else ""
 
-                print(
-                    f"[Batch {step + 1}/{steps_per_epoch}] "
-                    f"Loss: {step_metrics['loss_total']:.4f} "
-                    f"(PG: {step_metrics['loss_pg']:.4f}, Risk: {step_metrics['loss_risk']:.4f}, "
-                    f"Dir: {step_metrics['loss_dir']:.4f}{bal_str}) | "
-                    f"Grad: {step_metrics['grad_norm']:.4f}",
-                    flush=True,
-                )
+                if use_stateful:
+                    # Enhanced logging for stateful mode
+                    start_day = sequential_starts[step]
+                    end_day = start_day + self.T_m - 1
+                    memory_str = "🔗" if step > 0 else "🆕"  # Memory carried or fresh
+
+                    print(
+                        f"[Seg {step + 1}/{steps_per_epoch}] {memory_str} Days [{start_day}-{end_day}] | "
+                        f"Loss: {step_metrics['loss_total']:.4f} "
+                        f"(PG: {step_metrics['loss_pg']:.4f}{bal_str}) | "
+                        f"Grad: {step_metrics['grad_norm']:.4f}",
+                        flush=True,
+                    )
+                else:
+                    # Standard logging for random mode
+                    print(
+                        f"[Batch {step + 1}/{steps_per_epoch}] "
+                        f"Loss: {step_metrics['loss_total']:.4f} "
+                        f"(PG: {step_metrics['loss_pg']:.4f}, Risk: {step_metrics['loss_risk']:.4f}, "
+                        f"Dir: {step_metrics['loss_dir']:.4f}{bal_str}) | "
+                        f"Grad: {step_metrics['grad_norm']:.4f}",
+                        flush=True,
+                    )
             elif (step + 1) % max(1, steps_per_epoch // 10) == 0:
                 # Only show periodic update if NOT verbose
                 progress = (step + 1) / steps_per_epoch * 100
-                smart_print(
-                    f"[TRAIN] Epoch {self._epoch} | "
-                    f"Batch {step + 1}/{steps_per_epoch} ({progress:.0f}%) | "
-                    f"L_total: {step_metrics['loss_total']:.4f}"
-                )
+                if use_stateful:
+                    memory_str = "🔗" if step > 0 else "🆕"
+                    smart_print(
+                        f"[TRAIN] Epoch {self._epoch} | "
+                        f"Seg {step + 1}/{steps_per_epoch} ({progress:.0f}%) {memory_str} | "
+                        f"L_pg: {step_metrics['loss_pg']:.4f}"
+                    )
+                else:
+                    smart_print(
+                        f"[TRAIN] Epoch {self._epoch} | "
+                        f"Batch {step + 1}/{steps_per_epoch} ({progress:.0f}%) | "
+                        f"L_total: {step_metrics['loss_total']:.4f}"
+                    )
 
             # --- Collect Detailed Log Data ---
             if log_file:
@@ -4363,6 +5785,9 @@ class ObserverOfflineBatchTrainer:
                 and len(step_metrics["batch_symdiff_pens"]) > 0
             ):
                 epoch_symdiff_pens.append(step_metrics["batch_symdiff_pens"])
+            # [AVG_CHURN] Accumulate raw symdiffs sum and rebal count
+            epoch_raw_symdiffs_sum += step_metrics.get("batch_raw_symdiffs_sum", 0.0)
+            epoch_rebal_count += step_metrics.get("batch_rebal_count", 0)
 
             # Collect raw data for global metrics
             if step_metrics.get("dir_logits") is not None:
@@ -4641,6 +6066,11 @@ class ObserverOfflineBatchTrainer:
             epoch_mean_turn_pen = 0.0
             epoch_mean_symdiff_pen = 0.0
 
+        # [AVG_CHURN] Compute epoch-level avg_churn = sum(raw_symdiffs) / rebal_count * 100 / 2
+        epoch_avg_churn = (
+            (epoch_raw_symdiffs_sum / (epoch_rebal_count + 1e-8)) * 100 / 2
+        )
+
         # Check training mode for customized display
         is_macro_only = self.config.mafia_train_mode == MafiaTrainMode.MACRO_ONLY
         is_selection_only = (
@@ -4783,6 +6213,7 @@ class ObserverOfflineBatchTrainer:
             net_reward=epoch_mean_net_reward,
             turnover_penalty=epoch_mean_turn_pen,
             symdiff_penalty=epoch_mean_symdiff_pen,
+            avg_churn=epoch_avg_churn,  # [AVG_CHURN]
             # CES placeholders
             ces_score=0.0,
         )
@@ -5062,6 +6493,9 @@ class ObserverOfflineBatchTrainer:
         total_turnover_penalty = 0.0
         total_symdiff_penalty = 0.0
         total_hold_reward = 0.0  # [NEW] Accumulator
+        # [AVG_CHURN] Accumulators for epoch-level avg_churn
+        epoch_raw_symdiffs_sum = 0.0
+        epoch_rebal_count = 0
 
         # Accumulators for metric computation
         # Tensors for metric computation (for compute_selection_metrics)
@@ -5087,7 +6521,9 @@ class ObserverOfflineBatchTrainer:
 
         for step in range(steps):
             # Sequential sweep: pass batch_idx for deterministic, non-overlapping coverage
-            batch = self.sample_trajectory_batch(data_tensors, mode="EVAL", batch_idx=step)
+            batch = self.sample_trajectory_batch(
+                data_tensors, mode="EVAL", batch_idx=step
+            )
 
             # Check if we've exhausted all data (last batch may be smaller)
             if batch is None:
@@ -5115,11 +6551,13 @@ class ObserverOfflineBatchTrainer:
                 # [OPTIMIZATION] Pre-compute ALL windows BEFORE the time loop
                 # This moves O(B * T_m) slicing operations OUTSIDE the loop,
                 # and transfers to GPU only ONCE instead of T_m times.
-                precomputed_windows, precomputed_mkt_windows = self._precompute_ochlv_windows(
-                    full_ochlv=full_ochlv,
-                    start_indices=batch.start_indices,
-                    T_m=T_m,
-                    full_market_ochlv=full_market_ochlv,
+                precomputed_windows, precomputed_mkt_windows = (
+                    self._precompute_ochlv_windows(
+                        full_ochlv=full_ochlv,
+                        start_indices=batch.start_indices,
+                        T_m=T_m,
+                        full_market_ochlv=full_market_ochlv,
+                    )
                 )
                 # precomputed_windows: (B, T_m, N, 5, T_w) on device
                 # precomputed_mkt_windows: (B, T_m, 1, 5, T_w) on device or None
@@ -5168,9 +6606,21 @@ class ObserverOfflineBatchTrainer:
                 curr_batch_turnover = []
                 curr_batch_symdiff = []
                 curr_batch_hold_rewards = []  # [NEW]
+                # [AVG_CHURN] Track raw values for avg_churn
+                curr_batch_raw_symdiffs_sum = 0.0
+                curr_batch_rebal_count = 0
 
                 prev_indices_tensor = None
                 prev_scores_tensor = None
+
+                # [SYNC] Entry tracking for profit×duration r_hold (same as training)
+                N_stocks = batch.stock_ochlv.shape[2]
+                entry_prices = th.zeros(B, N_stocks, device=self.device)
+                entry_step = th.full(
+                    (B, N_stocks), -1, dtype=th.long, device=self.device
+                )
+                entry_market_prices = th.zeros(B, N_stocks, device=self.device)  # Market price at entry
+                prev_holdings_mask = th.zeros(B, N_stocks, device=self.device)
 
                 for t in range(T_m):
                     # [OPTIMIZED] Use pre-computed windows instead of nested loop slicing
@@ -5178,7 +6628,9 @@ class ObserverOfflineBatchTrainer:
                     ochlv_batch = precomputed_windows[:, t]  # (B, N, 5, T_w)
                     market_ochlv_batch = None
                     if precomputed_mkt_windows is not None:
-                        market_ochlv_batch = precomputed_mkt_windows[:, t]  # (B, 1, 5, T_w)
+                        market_ochlv_batch = precomputed_mkt_windows[
+                            :, t
+                        ]  # (B, 1, 5, T_w)
 
                     # Rebalance schedule trigger
                     if t == 0:
@@ -5227,12 +6679,50 @@ class ObserverOfflineBatchTrainer:
                     )
                     explicit_signals = th.clamp(explicit_signals, min=-10.0, max=10.0)
 
+                    # Compute simplified portfolio_state for validation
+                    # Uses prev_holdings_mask and entry tracking initialized earlier
+                    is_held_val = prev_holdings_mask  # (B, N)
+                    has_entry_val = (entry_step >= 0)
+                    days_held_norm_val = th.where(
+                        has_entry_val,
+                        (t - entry_step).float() / 21.0,
+                        th.zeros_like(entry_step, dtype=th.float)
+                    )
+                    current_close_val = batch.stock_ochlv[:, t, :, 3]  # (B, N)
+                    has_valid_entry_val = (entry_prices > 0)
+                    unrealized_pnl_val = th.where(
+                        has_valid_entry_val,
+                        (current_close_val - entry_prices) / (entry_prices + 1e-8),
+                        th.zeros_like(current_close_val)
+                    )
+
+                    # Alpha: TRUE outperformance vs market since entry
+                    has_valid_market_entry_val = (entry_market_prices > 0)
+                    abs_idx_val = (batch.start_indices + t).cpu()
+                    current_market_val = full_market_ochlv[abs_idx_val, 0, 1].to(self.device)
+                    market_return_val = th.where(
+                        has_valid_market_entry_val,
+                        (current_market_val.unsqueeze(1) - entry_market_prices) / (entry_market_prices + 1e-8),
+                        th.zeros_like(entry_market_prices)
+                    )
+                    alpha_val = th.where(
+                        has_valid_entry_val & has_valid_market_entry_val,
+                        unrealized_pnl_val - market_return_val,
+                        th.zeros_like(unrealized_pnl_val)
+                    )
+                    alpha_val = th.clamp(alpha_val, -0.30, 0.30)  # Clip
+
+                    portfolio_state_val = th.stack([
+                        is_held_val, days_held_norm_val, unrealized_pnl_val, alpha_val
+                    ], dim=-1)  # (B, N, 4)
+
                     outputs = self.observer.mafia_model(
                         ochlv_data=ochlv_batch,
                         market_index_ochlv_data=market_ochlv_batch,
                         force_topk_indices=None,
                         router_context_buffer=batch_context_buffer,
                         explicit_signals=explicit_signals,
+                        portfolio_state=portfolio_state_val,  # Portfolio context
                     )
 
                     (
@@ -5396,74 +6886,141 @@ class ObserverOfflineBatchTrainer:
                     )
                     penalty = lambda_epoch * penalty_sum
 
-                    # [NEW] R_hold Calculation (Validation)
-                    # Consistency Score = (Count of Days where R_stock > R_mkt AND R_stock > 0) / h_len
+                    # [SYNC] R_hold Calculation (Validation) - Same as Training
+                    # Uses profit × duration_bonus formula (not consistency score)
+                    # ============================================================
+
+                    # Current Holdings Mask (B, N_stocks)
+                    curr_holdings_mask = th.zeros(B, N_stocks, device=self.device)
+                    curr_holdings_mask.scatter_(1, final_indices, 1.0)
+
+                    # Held stocks = intersection of prev and curr
+                    held_mask = prev_holdings_mask * curr_holdings_mask
+
+                    # Get current prices (close price at timestep t)
+                    current_prices = batch.stock_ochlv[
+                        :, t, :, 1
+                    ]  # (B, N) - close price
+
+                    # Compute profit × duration for r_hold (same formula as training)
+                    # [OPTIMIZATION 2026-01-02] Vectorized version - no Python loop
+                    alpha_exit = getattr(self.config, "mafia_reward_alpha_exit", 2.0)
+                    r_hold = th.zeros(B, device=self.device)
+
+                    if t > 0 and alpha_exit > 0:
+                        # Valid positions: held AND entry_step >= 0
+                        valid_held_mask = held_mask * (entry_step >= 0).float()  # (B, N_stocks)
+
+                        # Profit percentage for all positions (vectorized)
+                        profit_pct = (current_prices - entry_prices) / (entry_prices + 1e-8)  # (B, N_stocks)
+
+                        # Duration for all positions
+                        duration = (t - entry_step).float().clamp(min=0)  # (B, N_stocks)
+                        duration_bonus = th.log1p(duration)  # (B, N_stocks)
+
+                        # Combined reward per position
+                        reward_per_pos = profit_pct * duration_bonus  # (B, N_stocks)
+
+                        # Masked sum and count per batch
+                        masked_sum = (reward_per_pos * valid_held_mask).sum(dim=1)  # (B,)
+                        valid_count = valid_held_mask.sum(dim=1).clamp(min=1)  # (B,), avoid div by zero
+
+                        # Mean over valid held positions
+                        r_hold = alpha_exit * masked_sum / valid_count  # (B,)
+                        r_hold = r_hold * self.scale_factor_reward
+
+                    # Update entry tracking for new entries
+                    new_entries = (curr_holdings_mask > 0) & (prev_holdings_mask == 0)
+                    exits = (prev_holdings_mask > 0) & (curr_holdings_mask == 0)
+
+                    # Get current market price for entry tracking
+                    abs_idx_entry = (batch.start_indices + t).cpu()
+                    current_market_for_entry = full_market_ochlv[abs_idx_entry, 0, 1].to(self.device)
+
+                    # Set entry prices for new entries
+                    entry_prices = th.where(new_entries, current_prices, entry_prices)
+                    entry_step = th.where(
+                        new_entries, th.full_like(entry_step, t), entry_step
+                    )
+                    # Set market price at entry for new entries
+                    entry_market_prices = th.where(
+                        new_entries,
+                        current_market_for_entry.unsqueeze(1).expand(-1, N_stocks),
+                        entry_market_prices
+                    )
+
+                    # Clear entry tracking for exited stocks
+                    entry_prices = th.where(
+                        exits, th.zeros_like(entry_prices), entry_prices
+                    )
+                    entry_step = th.where(
+                        exits, th.full_like(entry_step, -1), entry_step
+                    )
+                    entry_market_prices = th.where(
+                        exits, th.zeros_like(entry_market_prices), entry_market_prices
+                    )
+
+                    # Update prev_holdings for next iteration
+                    prev_holdings_mask = curr_holdings_mask
+
+                    # [METRIC] Also compute consistency score for topk_hold_reward metric
+                    consistency_r_hold = th.zeros(B, device=self.device)
                     if h_len > 0:
-                        # Expand market returns for broadcast: (B, h) -> (B, h, 1)
                         mkt_ret_expanded = market_returns_slice.unsqueeze(-1)
-                        # Check condition: Stock > Market AND Stock > 0
                         win_day_mask = (future_returns_slice > mkt_ret_expanded) & (
                             future_returns_slice > 0
                         )
-                        # Score per Stock (B, N)
                         stock_consistency = win_day_mask.float().sum(dim=1) / float(
                             h_len
                         )
 
-                        # Current Holdings Mask (B, N)
-                        curr_holdings = th.zeros(
-                            B, self.observer.action_dim, device=self.device
-                        )
-                        curr_holdings.scatter_(1, final_indices, 1.0)
-
-                        # Previous Holdings Mask (for continuity check - optional, but logical given intent)
-                        # However, for R_hold, do we require holding from t-1? The spec says "Held Stocks".
-                        # In training, we use `prev_holdings * curr_holdings`.
-                        # Here, `prev_indices_tensor` is available.
-                        if prev_indices_tensor is not None:
-                            prev_h = th.zeros(
-                                B, self.observer.action_dim, device=self.device
-                            )
-                            prev_h.scatter_(1, prev_indices_tensor, 1.0)
-                            held_mask = prev_h * curr_holdings
-                        else:
-                            held_mask = curr_holdings  # First step, treat current as held? Or 0? Usually 0 if no prev.
-
-                        # Sum Scores
-                        # [FIX] Handle dimension mismatch during fast validation (limit_stocks < full_universe)
-                        # stock_consistency has shape (B, N_data) e.g. (B, 10)
-                        # held_mask has shape (B, N_model) e.g. (B, 122)
                         N_data = stock_consistency.shape[1]
-                        N_model = held_mask.shape[1]
-                        
-                        if N_data < N_model:
-                             # Align dimension by padding consistency with 0 (un-calcuated stocks don't contribute)
-                             consistency_padded = th.zeros(B, N_model, device=self.device)
-                             consistency_padded[:, :N_data] = stock_consistency
-                             portfolio_win_score = (consistency_padded * held_mask).sum(dim=1)
+                        if N_data < N_stocks:
+                            consistency_padded = th.zeros(
+                                B, N_stocks, device=self.device
+                            )
+                            consistency_padded[:, :N_data] = stock_consistency
+                            portfolio_win_score = (consistency_padded * held_mask).sum(
+                                dim=1
+                            )
                         else:
-                             portfolio_win_score = (stock_consistency * held_mask).sum(dim=1)
+                            portfolio_win_score = (stock_consistency * held_mask).sum(
+                                dim=1
+                            )
 
-                        # Scale
-                        r_hold = self.r_hold_alpha * (portfolio_win_score / self.K)
-                    else:
-                        r_hold = th.zeros(B, device=self.device)
+                        consistency_r_hold = self.r_hold_alpha * (
+                            portfolio_win_score / self.K
+                        )
 
                     R_net = R_raw + r_hold - penalty
                     A_t_raw = R_net - baseline
+                    # [NaN GUARD] Sanitize A_t_raw first
+                    A_t_raw = th.nan_to_num(A_t_raw, nan=0.0, posinf=10.0, neginf=-10.0)
                     A_mean = A_t_raw.mean()
-                    A_std = A_t_raw.std() + eps if B > 1 else 1.0
-                    A_t = (A_t_raw - A_mean) / A_std
+                    # [BUG FIX] For B=1, skip mean subtraction (mean of 1 sample = sample itself → always 0)
+                    if B > 1:
+                        A_std = A_t_raw.std() + eps
+                        A_t = (A_t_raw - A_mean) / A_std
+                    else:
+                        # [BUG FIX 2026-01-02] For B=1, use fixed scale factor instead of max_val
+                        # Previous bug: dividing by max_val always produces ±1.0
+                        A_std = 10.0  # Fixed scale factor for single sample
+                        A_t = A_t_raw / A_std  # No mean subtraction for B=1
+                    # [STABILITY FIX] Clamp advantage
+                    A_t = th.clamp(A_t, min=-10.0, max=10.0)
+                    A_t = th.nan_to_num(A_t, nan=0.0, posinf=0.0, neginf=0.0)
 
                     if compute_loss:
                         # [Restored] Loss calculation for training metrics or if requested
-                        log_probs = th.log(
-                            th.gather(market_scores_full, 1, final_indices) + eps
-                        )
+                        # [FIX] Use log_softmax for numerical stability (consistent with training)
+                        log_market_probs = F.log_softmax(market_logits, dim=-1)
+                        log_probs = th.gather(log_market_probs, 1, final_indices)
                         pg_term = -(log_probs * A_t.detach().unsqueeze(1)).mean(dim=1)
-                        entropy = -(
-                            market_scores_full * th.log(market_scores_full + eps)
-                        ).sum(dim=1)
+                        # [FIX] Use clamped log_probs for entropy stability
+                        log_market_probs_safe = th.clamp(log_market_probs, min=-20.0)
+                        entropy = -(market_scores_full * log_market_probs_safe).sum(
+                            dim=1
+                        )
                         step_loss_val = pg_term - self.beta_entropy * entropy
 
                         risk_loss = (
@@ -5504,7 +7061,9 @@ class ObserverOfflineBatchTrainer:
 
                     curr_batch_rewards.append(R_raw.mean().item())  # Mean across batch
                     curr_batch_net.append(R_net.mean().item())
-                    curr_batch_hold_rewards.append(r_hold.mean().item())  # [NEW]
+                    # [SYNC] Use consistency_r_hold for topk_hold_reward metric (measures holding quality)
+                    # r_hold (profit×duration) is used for actual reward calculation
+                    curr_batch_hold_rewards.append(consistency_r_hold.mean().item())
 
                     # For penalties, meaningful only if rebalance occurred?
                     # If we hold, turnover=0. So summing 0s works fine for average.
@@ -5514,6 +7073,9 @@ class ObserverOfflineBatchTrainer:
                     curr_batch_symdiff.append(
                         (symdiff * lambda_epoch * self.alpha_change).mean().item()
                     )
+                    # [AVG_CHURN] Track raw symdiffs sum and rebal count
+                    curr_batch_raw_symdiffs_sum += symdiff.sum().item()
+                    curr_batch_rebal_count += int((R_net != 0).sum().item())
 
                     # Collect tensors for compute_selection_metrics
                     # [METRIC FIX] Use UN-SCALED returns for financial metrics
@@ -5604,6 +7166,9 @@ class ObserverOfflineBatchTrainer:
             total_turnover_penalty += avg_turn
             total_symdiff_penalty += avg_sym
             total_hold_reward += avg_hold_reward  # Need this accumulator initialized
+            # [AVG_CHURN] Accumulate raw symdiffs sum and rebal count
+            epoch_raw_symdiffs_sum += curr_batch_raw_symdiffs_sum
+            epoch_rebal_count += curr_batch_rebal_count
 
             # Store for metric computation
             all_topk_indices.append(topk_indices_stack)
@@ -5628,6 +7193,10 @@ class ObserverOfflineBatchTrainer:
         avg_turnover_penalty = total_turnover_penalty / steps
         avg_symdiff_penalty = total_symdiff_penalty / steps
         avg_hold_reward = total_hold_reward / steps  # [NEW]
+        # [AVG_CHURN] Compute epoch-level avg_churn = sum(raw_symdiffs) / rebal_count * 100 / 2
+        epoch_avg_churn = (
+            (epoch_raw_symdiffs_sum / (epoch_rebal_count + 1e-8)) * 100 / 2
+        )
 
         # Concatenate all batches for metric computation
         all_topk_indices_cat = th.cat(all_topk_indices, dim=0)
@@ -5703,6 +7272,7 @@ class ObserverOfflineBatchTrainer:
             net_reward=avg_net_reward,
             turnover_penalty=avg_turnover_penalty,
             symdiff_penalty=avg_symdiff_penalty,
+            avg_churn=epoch_avg_churn,  # [AVG_CHURN]
         )
 
         # Compute phase_score (same logic as ValidationTracker)

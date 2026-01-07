@@ -27,7 +27,9 @@ from typing import Tuple, Dict, Callable, Any, Optional
 # Import HybridRiskLoss for consistent risk loss computation
 from RL_controller.observer_offline_trainer import HybridRiskLoss
 
-th.autograd.set_detect_anomaly(True)
+# NOTE: Disabled for production - only enable for debugging
+# th.autograd.set_detect_anomaly(True)
+th.autograd.set_detect_anomaly(False)
 
 # LiveDisplay integration for warmup logging
 try:
@@ -53,6 +55,686 @@ except ImportError:
     TRAINING_LOGGER_AVAILABLE = False
     get_logger = None
     TrainingPhase = None
+
+
+# ============================================================
+# WatchlistManager: Manages stock screening and tracking
+# ============================================================
+
+class WatchlistManager:
+    """
+    Watchlist Manager for MAFIA stock screening and tracking.
+
+    Responsibilities:
+    1. Screening: Filter universe (122 stocks) to Watchlist (40 stocks)
+       - Uses Technical Score + Model Logits
+       - ADD/REMOVE with hysteresis thresholds
+
+    2. Watching: Track embeddings of Watchlist stocks daily
+       - Buffer of shape (context_window, watchlist_size, D)
+
+    3. Holdings Protection: Protect profitable holdings from removal
+       - Holdings removed only when: Tech < floor AND r_hold < -10%
+       - Or: Not selected in Top-K during rebalance (ĐK B)
+
+    4. Index Mapping: Map Watchlist indices to Universe indices
+    """
+
+    def __init__(self, config, universe_size: int, embedding_dim: int, device: th.device):
+        """
+        Initialize WatchlistManager.
+
+        Args:
+            config: Configuration object with watchlist parameters
+            universe_size: Total number of stocks in universe (e.g., 122)
+            embedding_dim: Dimension of stock embeddings (D)
+            device: Torch device
+        """
+        self.config = config
+        self.universe_size = universe_size
+        self.embedding_dim = embedding_dim
+        self.device = device
+
+        # Watchlist configuration
+        self.watchlist_size = getattr(config, 'watchlist_size', 40)
+        self.min_size = getattr(config, 'watchlist_min_size', 35)
+        self.max_size = getattr(config, 'watchlist_max_size', 45)
+        self.context_window = getattr(config, 'watchlist_context_window', 30)
+
+        # Screening thresholds
+        self.tech_add_threshold = getattr(config, 'watchlist_tech_add_threshold', 0.7)
+        self.tech_remove_threshold = getattr(config, 'watchlist_tech_remove_threshold', 0.3)
+        self.model_add_percentile = getattr(config, 'watchlist_model_add_percentile', 50.0)
+        self.model_remove_percentile = getattr(config, 'watchlist_model_remove_percentile', 30.0)
+
+        # Holdings protection
+        self.holdings_tech_floor = getattr(config, 'watchlist_holdings_tech_floor', 0.3)
+        self.holdings_loss_threshold = getattr(config, 'watchlist_holdings_loss_threshold', -0.10)
+
+        # Screening schedule
+        self.screening_period_days = getattr(config, 'watchlist_screening_period_days', 10)
+
+        # Combined Score Weights (Phương án C - Configurable)
+        # Score = w_mom × Momentum + w_vol × Volume + w_ma20 × MA20 + w_model × Model
+        self.weight_momentum = getattr(config, 'watchlist_weight_momentum', 0.20)
+        self.weight_volume = getattr(config, 'watchlist_weight_volume', 0.20)
+        self.weight_ma20 = getattr(config, 'watchlist_weight_ma20', 0.20)
+        self.weight_model = getattr(config, 'watchlist_weight_model', 0.40)
+
+        # State
+        self._watchlist_indices = None  # (watchlist_size,) - indices into universe
+        self._screening_scores = None  # (watchlist_size,) - screening scores for weights
+        self._portfolio_weights = None  # (watchlist_size,) - allocation weights for Portfolio Context
+        self._embeddings_buffer = None  # (context_window, watchlist_size, D)
+        self._holdings_mask = None  # (universe_size,) - which stocks are held
+        self._entry_prices = None  # (universe_size,) - entry prices for held stocks
+        self._days_since_screening = 0
+        self._initialized = False
+        self._buffer_idx = 0  # FIFO buffer index
+
+        # Model trust: Only use model_scores after sufficient training
+        # When False: screening uses Technical Score only (model is random/untrained)
+        # When True: screening uses Combined Score (Technical + Model)
+        self._use_model_scores = False
+
+    def initialize(self, initial_indices: Optional[np.ndarray] = None):
+        """
+        Initialize Watchlist with initial indices or cold start.
+
+        Args:
+            initial_indices: Optional (watchlist_size,) indices for cold start
+        """
+        if initial_indices is not None:
+            self._watchlist_indices = initial_indices.copy()
+        else:
+            # Cold start: use first watchlist_size stocks
+            self._watchlist_indices = np.arange(min(self.watchlist_size, self.universe_size))
+
+        n_stocks = len(self._watchlist_indices)
+        self._screening_scores = np.ones(n_stocks, dtype=np.float32) / n_stocks
+        self._portfolio_weights = np.zeros(n_stocks, dtype=np.float32)  # No holdings initially
+        self._embeddings_buffer = th.zeros(
+            (self.context_window, self.watchlist_size, self.embedding_dim),
+            dtype=th.float32,
+            device=self.device
+        )
+        self._holdings_mask = np.zeros(self.universe_size, dtype=bool)
+        self._entry_prices = np.zeros(self.universe_size, dtype=np.float32)
+        self._days_since_screening = 0
+        self._buffer_idx = 0
+        self._initialized = True
+
+    def reset(self):
+        """Reset manager state (for new training episode)."""
+        self._watchlist_indices = None
+        self._screening_scores = None
+        self._portfolio_weights = None
+        self._embeddings_buffer = None
+        self._holdings_mask = None
+        self._entry_prices = None
+        self._days_since_screening = 0
+        self._buffer_idx = 0
+        self._initialized = False
+        # Note: Don't reset _use_model_scores - that persists across episodes
+
+    def set_use_model_scores(self, use_model: bool):
+        """
+        Set whether to use model scores for screening.
+
+        Call this after model has been trained (e.g., after first iteration).
+        Before this is called, screening uses Technical Score only.
+
+        Args:
+            use_model: True to use Combined Score (Technical + Model),
+                      False for Technical-only screening
+        """
+        self._use_model_scores = use_model
+
+    def update_portfolio_weights(self, universe_weights: np.ndarray):
+        """
+        Update portfolio weights for Watchlist stocks.
+
+        Args:
+            universe_weights: (universe_size,) allocation weights for all stocks
+        """
+        if self._watchlist_indices is None:
+            return
+
+        # Extract weights for Watchlist stocks only
+        self._portfolio_weights = universe_weights[self._watchlist_indices].astype(np.float32)
+
+    def get_portfolio_context_weights(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Get holdings mask and portfolio weights relative to Watchlist.
+
+        Returns:
+            Tuple of:
+                - watchlist_holdings_mask: (watchlist_size,) boolean mask
+                - watchlist_portfolio_weights: (watchlist_size,) allocation weights
+        """
+        if self._watchlist_indices is None:
+            return None, None
+
+        # Get holdings mask relative to Watchlist
+        watchlist_holdings_mask = self._holdings_mask[self._watchlist_indices]
+        watchlist_portfolio_weights = self._portfolio_weights if self._portfolio_weights is not None else np.zeros(len(self._watchlist_indices), dtype=np.float32)
+
+        return watchlist_holdings_mask, watchlist_portfolio_weights
+
+    @property
+    def watchlist_indices(self) -> Optional[np.ndarray]:
+        """Get current Watchlist indices (universe indices)."""
+        return self._watchlist_indices
+
+    @property
+    def current_size(self) -> int:
+        """Get current Watchlist size."""
+        return len(self._watchlist_indices) if self._watchlist_indices is not None else 0
+
+    def get_watchlist_mask(self) -> np.ndarray:
+        """Get boolean mask (universe_size,) of stocks in Watchlist."""
+        mask = np.zeros(self.universe_size, dtype=bool)
+        if self._watchlist_indices is not None:
+            mask[self._watchlist_indices] = True
+        return mask
+
+    def update_holdings(
+        self,
+        new_holdings_mask: np.ndarray,
+        current_prices: np.ndarray
+    ):
+        """
+        Update holdings information for protection logic.
+
+        Args:
+            new_holdings_mask: (universe_size,) boolean mask of current holdings
+            current_prices: (universe_size,) current close prices
+        """
+        if self._holdings_mask is None:
+            self._holdings_mask = np.zeros(self.universe_size, dtype=bool)
+        if self._entry_prices is None:
+            self._entry_prices = np.zeros(self.universe_size, dtype=np.float32)
+
+        # Find new entries (just bought)
+        new_entries = new_holdings_mask & (~self._holdings_mask)
+        self._entry_prices[new_entries] = current_prices[new_entries]
+
+        # Update holdings mask
+        self._holdings_mask = new_holdings_mask.copy()
+
+    def compute_holdings_returns(self, current_prices: np.ndarray) -> np.ndarray:
+        """
+        Compute returns since entry for held stocks.
+
+        Args:
+            current_prices: (universe_size,) current close prices
+
+        Returns:
+            holdings_returns: (universe_size,) returns since entry (0 for non-holdings)
+        """
+        returns = np.zeros(self.universe_size, dtype=np.float32)
+        if self._holdings_mask is not None and self._entry_prices is not None:
+            held_mask = self._holdings_mask & (self._entry_prices > 0)
+            returns[held_mask] = (
+                current_prices[held_mask] / self._entry_prices[held_mask] - 1.0
+            )
+        return returns
+
+    def update_embeddings_buffer(self, embeddings: th.Tensor):
+        """
+        Update embeddings buffer with current day's Watchlist embeddings.
+
+        Args:
+            embeddings: (watchlist_size, D) embeddings for Watchlist stocks
+        """
+        if self._embeddings_buffer is None:
+            return
+
+        # FIFO update
+        self._embeddings_buffer[self._buffer_idx] = embeddings.detach()
+        self._buffer_idx = (self._buffer_idx + 1) % self.context_window
+
+    def get_watchlist_context(self) -> Optional[th.Tensor]:
+        """
+        Compute Watchlist Context from embeddings buffer.
+
+        C_watchlist = WeightedSum(embeddings[current_day], screening_scores)
+
+        Returns:
+            watchlist_context: (D,) tensor or None if not initialized
+        """
+        if self._embeddings_buffer is None or self._screening_scores is None:
+            return None
+
+        # Get current day embeddings (most recent in buffer)
+        current_idx = (self._buffer_idx - 1) % self.context_window
+        current_embeddings = self._embeddings_buffer[current_idx]  # (watchlist_size, D)
+
+        # Weighted sum using screening scores as weights
+        weights = th.tensor(self._screening_scores, dtype=th.float32, device=self.device)
+        weights = weights / (weights.sum() + 1e-8)  # Normalize
+        weights = weights.unsqueeze(-1)  # (watchlist_size, 1)
+
+        context = (current_embeddings * weights).sum(dim=0)  # (D,)
+        return context
+
+    def _compute_combined_score(
+        self,
+        technical_scores: np.ndarray,
+        model_percentiles: np.ndarray,
+        tech_components: Optional[Dict[str, np.ndarray]] = None,
+    ) -> np.ndarray:
+        """
+        Compute combined score using configurable weights.
+
+        Iteration 0 (model not trusted):
+            Score = w_mom × Momentum + w_vol × Volume + w_ma20 × MA20 (normalized)
+
+        Iteration 1+ (model trusted):
+            Score = w_mom × Momentum + w_vol × Volume + w_ma20 × MA20 + w_model × Model
+
+        Args:
+            technical_scores: (N,) Technical Scores (fallback if components not provided)
+            model_percentiles: (N,) Model percentiles [0-100]
+            tech_components: Optional dict with 'momentum_score', 'volume_score', 'ma20_score'
+
+        Returns:
+            combined_scores: (N,) Combined scores for ranking
+        """
+        N = len(technical_scores)
+
+        if tech_components is not None:
+            # Use individual components with configurable weights
+            momentum = tech_components.get('momentum_score', np.full(N, 0.5))
+            volume = tech_components.get('volume_score', np.full(N, 0.5))
+            ma20 = tech_components.get('ma20_score', np.full(N, 0.5))
+
+            if self._use_model_scores:
+                # Iteration 1+: Use all 4 components
+                # Score = w_mom × Momentum + w_vol × Volume + w_ma20 × MA20 + w_model × Model
+                model_score = model_percentiles / 100.0  # Normalize to [0, 1]
+                combined = (
+                    self.weight_momentum * momentum +
+                    self.weight_volume * volume +
+                    self.weight_ma20 * ma20 +
+                    self.weight_model * model_score
+                )
+            else:
+                # Iteration 0: Technical only (normalize weights to sum to 1)
+                tech_total = self.weight_momentum + self.weight_volume + self.weight_ma20
+                if tech_total > 0:
+                    combined = (
+                        (self.weight_momentum / tech_total) * momentum +
+                        (self.weight_volume / tech_total) * volume +
+                        (self.weight_ma20 / tech_total) * ma20
+                    )
+                else:
+                    combined = (momentum + volume + ma20) / 3.0
+        else:
+            # Fallback: use technical_scores directly (backward compatibility)
+            if self._use_model_scores:
+                tech_weight = self.weight_momentum + self.weight_volume + self.weight_ma20
+                model_score = model_percentiles / 100.0
+                combined = tech_weight * technical_scores + self.weight_model * model_score
+            else:
+                combined = technical_scores
+
+        return combined.astype(np.float32)
+
+    def run_screening(
+        self,
+        technical_scores: np.ndarray,
+        model_percentiles: np.ndarray,
+        current_prices: np.ndarray,
+        ma20_prices: Optional[np.ndarray] = None,
+        ma50_prices: Optional[np.ndarray] = None,
+        return_20d: Optional[np.ndarray] = None,
+        force_review: bool = False,
+        tech_components: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run daily screening to update Watchlist.
+
+        Args:
+            technical_scores: (universe_size,) Technical Scores (average of components)
+            model_percentiles: (universe_size,) Model percentiles [0-100]
+            current_prices: (universe_size,) current prices
+            ma20_prices: (universe_size,) SMA(20) prices for uptrend check
+            ma50_prices: (universe_size,) SMA(50) prices for emergency removal
+            return_20d: (universe_size,) 20-day returns for emergency removal
+            force_review: If True, force full Watchlist review
+            tech_components: Optional dict with individual components:
+                - 'momentum_score': (N,) momentum scores [0-1]
+                - 'volume_score': (N,) volume scores [0-1]
+                - 'ma20_score': (N,) MA20 scores [0-1]
+                If provided, uses configurable weights; otherwise uses technical_scores directly.
+
+        Returns:
+            Dict with screening results and changes
+        """
+        self._days_since_screening += 1
+        force_review = force_review or (self._days_since_screening >= self.screening_period_days)
+
+        # Compute combined score using configurable weights
+        combined_scores = self._compute_combined_score(
+            technical_scores=technical_scores,
+            model_percentiles=model_percentiles,
+            tech_components=tech_components,
+        )
+
+        if not self._initialized:
+            # Cold start: select top stocks by combined score
+            top_indices = np.argsort(combined_scores)[-self.watchlist_size:]
+            self.initialize(top_indices)
+            return {
+                'action': 'cold_start',
+                'added': len(top_indices),
+                'removed': 0,
+                'new_size': self.current_size,
+                'threshold_adjusted': False,
+                'model_used': self._use_model_scores,
+            }
+
+        # Compute holdings returns for protection
+        holdings_returns = self.compute_holdings_returns(current_prices)
+
+        # Create screening decision
+        current_watchlist_mask = self.get_watchlist_mask()
+        N = len(technical_scores)
+
+        # === DYNAMIC THRESHOLD ADJUSTMENT (Spec line 77-81) ===
+        # Adjust thresholds to maintain target size
+        # FIX: Always check size constraints, not just during force_review
+        effective_add_threshold = self.tech_add_threshold
+        effective_remove_threshold = self.tech_remove_threshold
+        threshold_adjusted = False
+        force_replenish = False
+
+        current_size = self.current_size
+
+        # === FIX: Aggressively relax thresholds when watchlist is too small ===
+        if current_size < self.min_size:
+            # Calculate how much to relax based on severity
+            deficit = self.min_size - current_size
+            severity = deficit / self.min_size  # 0 to 1
+
+            # Relax ADD threshold: 0.7 -> 0.5 -> 0.3 based on severity
+            relax_amount = 0.1 + (0.3 * severity)  # 0.1 to 0.4
+            effective_add_threshold = max(0.3, self.tech_add_threshold - relax_amount)
+
+            # If critically low (< min_size/2), force replenish mode
+            if current_size < self.min_size // 2:
+                force_replenish = True
+                effective_add_threshold = 0.2  # Very aggressive
+
+            threshold_adjusted = True
+        elif current_size > self.max_size and force_review:
+            # Too many stocks: tighten REMOVE threshold
+            effective_remove_threshold = min(0.5, self.tech_remove_threshold + 0.1)
+            threshold_adjusted = True
+
+        # === ADD CONDITIONS ===
+        # Model not trusted: Technical only (all 3 components pass)
+        # Model trusted: Technical + Model must both pass
+        tech_pass_add = technical_scores > effective_add_threshold
+        if self._use_model_scores:
+            model_pass_add = model_percentiles > self.model_add_percentile
+            add_mask = tech_pass_add & model_pass_add & (~current_watchlist_mask)
+        else:
+            # Model not trusted: Technical pass is sufficient
+            add_mask = tech_pass_add & (~current_watchlist_mask)
+
+        # === REMOVE CONDITIONS ===
+        # Model not trusted: Technical fail triggers removal
+        # Model trusted: Technical OR Model fail triggers removal
+        tech_fail = technical_scores < effective_remove_threshold
+        if self._use_model_scores:
+            model_fail = model_percentiles < self.model_remove_percentile
+            base_remove = (tech_fail | model_fail) & current_watchlist_mask
+        else:
+            # Model not trusted: Only Technical fail triggers removal
+            base_remove = tech_fail & current_watchlist_mask
+
+        # === HOLDINGS PROTECTION (Spec line 339-341) ===
+        # Holdings NOT removed if: Price > MA20 (uptrend) OR r_hold > 0 (profitable)
+        # Only remove if: Tech < 0.3 AND r_hold < -10%
+        if ma20_prices is not None:
+            uptrend_mask = current_prices > ma20_prices
+        else:
+            uptrend_mask = np.zeros(N, dtype=bool)
+
+        holdings_protected = self._holdings_mask & (
+            uptrend_mask |  # Price > MA20 (uptrend)
+            (holdings_returns >= 0) |  # r_hold > 0 (profitable)
+            (  # NOT (Tech < floor AND loss > threshold)
+                ~((technical_scores < self.holdings_tech_floor) &
+                  (holdings_returns < self.holdings_loss_threshold))
+            )
+        )
+        remove_mask = base_remove & (~holdings_protected)
+
+        # === EMERGENCY REMOVAL (Spec Quy tắc 4, line 461-465) ===
+        # Remove immediately if: Price < SMA(50) AND Return_20d < -20%
+        emergency_removed = 0
+        if getattr(self.config, 'watchlist_emergency_removal_enabled', False):
+            if ma50_prices is not None and return_20d is not None:
+                emergency_threshold = getattr(self.config, 'watchlist_emergency_return_threshold', -0.20)
+                emergency_mask = (
+                    current_watchlist_mask &
+                    (current_prices < ma50_prices) &
+                    (return_20d < emergency_threshold)
+                )
+                # Emergency removal overrides holdings protection
+                remove_mask = remove_mask | emergency_mask
+                emergency_removed = emergency_mask.sum()
+
+        # === APPLY CHANGES ===
+        stocks_to_add = np.where(add_mask)[0]
+        stocks_to_remove = np.where(remove_mask)[0]
+
+        # Remove stocks (but maintain min_size constraint)
+        if len(stocks_to_remove) > 0:
+            # FIX: Only remove if we'll stay above min_size
+            projected_size = len(self._watchlist_indices) - len(stocks_to_remove)
+            if projected_size < self.min_size:
+                # Limit removals to stay at min_size
+                max_to_remove = max(0, len(self._watchlist_indices) - self.min_size)
+                stocks_to_remove = stocks_to_remove[:max_to_remove]
+
+            if len(stocks_to_remove) > 0:
+                keep_mask = ~np.isin(self._watchlist_indices, stocks_to_remove)
+                self._watchlist_indices = self._watchlist_indices[keep_mask]
+                self._screening_scores = self._screening_scores[keep_mask]
+                # Also update portfolio weights if tracked
+                if self._portfolio_weights is not None:
+                    self._portfolio_weights = self._portfolio_weights[keep_mask]
+
+        # === FIX: Force replenish if below min_size ===
+        n_added = 0
+        current_watchlist_after_remove = len(self._watchlist_indices)
+
+        if force_replenish or current_watchlist_after_remove < self.min_size:
+            # Need to add stocks to reach at least min_size
+            needed = self.min_size - current_watchlist_after_remove
+            available_slots = self.max_size - current_watchlist_after_remove
+
+            if needed > 0 and available_slots > 0:
+                # Get all non-watchlist stocks, sorted by combined_scores
+                not_in_watchlist = ~current_watchlist_mask
+                candidate_indices = np.where(not_in_watchlist)[0]
+
+                if len(candidate_indices) > 0:
+                    # Sort by combined score (highest first)
+                    add_order = np.argsort(combined_scores[candidate_indices])[::-1]
+                    n_to_add = min(max(needed, len(stocks_to_add)), available_slots, len(candidate_indices))
+                    new_indices = candidate_indices[add_order[:n_to_add]]
+
+                    self._watchlist_indices = np.concatenate([self._watchlist_indices, new_indices])
+                    new_scores = combined_scores[new_indices]
+                    self._screening_scores = np.concatenate([self._screening_scores, new_scores])
+                    if self._portfolio_weights is not None:
+                        self._portfolio_weights = np.concatenate([
+                            self._portfolio_weights,
+                            np.zeros(len(new_indices), dtype=np.float32)
+                        ])
+                    n_added = len(new_indices)
+        else:
+            # Normal add (threshold-based)
+            available_slots = self.max_size - len(self._watchlist_indices)
+            if len(stocks_to_add) > 0 and available_slots > 0:
+                n_add = min(len(stocks_to_add), available_slots)
+                # Sort by combined_scores (already computed with configurable weights)
+                add_order = np.argsort(combined_scores[stocks_to_add])[::-1][:n_add]
+                new_indices = stocks_to_add[add_order]
+
+                self._watchlist_indices = np.concatenate([self._watchlist_indices, new_indices])
+                new_scores = technical_scores[new_indices]
+                self._screening_scores = np.concatenate([self._screening_scores, new_scores])
+                # Add zero portfolio weights for new stocks
+                if self._portfolio_weights is not None:
+                    self._portfolio_weights = np.concatenate([
+                        self._portfolio_weights,
+                        np.zeros(len(new_indices), dtype=np.float32)
+                    ])
+                n_added = len(new_indices)
+
+        # Normalize screening scores
+        if len(self._screening_scores) > 0:
+            self._screening_scores = self._screening_scores / (self._screening_scores.sum() + 1e-8)
+
+        if force_review:
+            self._days_since_screening = 0
+
+        return {
+            'action': 'screening',
+            'added': n_added,
+            'removed': len(stocks_to_remove),
+            'emergency_removed': emergency_removed,
+            'new_size': self.current_size,
+            'holdings_protected': holdings_protected.sum(),
+            'threshold_adjusted': threshold_adjusted,
+            'effective_add_threshold': effective_add_threshold,
+            'effective_remove_threshold': effective_remove_threshold,
+            'model_used': self._use_model_scores,
+        }
+
+    def post_selection_cleanup(
+        self,
+        prev_holdings_indices: np.ndarray,
+        new_holdings_indices: np.ndarray,
+    ) -> int:
+        """
+        Post-selection cleanup: Remove holdings not selected in new Top-K (ĐK B).
+
+        IMPORTANT: Maintains min_size constraint to prevent watchlist from shrinking too much.
+        Only removes stocks if current_size > min_size after removal.
+
+        Args:
+            prev_holdings_indices: (K,) universe indices of previous holdings
+            new_holdings_indices: (K,) universe indices of new Top-K selection
+
+        Returns:
+            Number of stocks removed
+        """
+        if self._watchlist_indices is None:
+            return 0
+
+        # Find holdings that were NOT re-selected
+        not_reselected = np.setdiff1d(prev_holdings_indices, new_holdings_indices)
+
+        # Filter to only stocks currently in watchlist
+        candidates_to_remove = [idx for idx in not_reselected if idx in self._watchlist_indices]
+
+        if len(candidates_to_remove) == 0:
+            return 0
+
+        # === FIX: Maintain min_size constraint ===
+        # Calculate how many we can safely remove while staying above min_size
+        current_size = len(self._watchlist_indices)
+        max_removable = max(0, current_size - self.min_size)
+
+        if max_removable == 0:
+            # Already at or below min_size, don't remove anything
+            return 0
+
+        # Limit removals to maintain min_size
+        n_to_remove = min(len(candidates_to_remove), max_removable)
+        stocks_to_remove = candidates_to_remove[:n_to_remove]
+
+        # Remove from Watchlist
+        removed = 0
+        for idx in stocks_to_remove:
+            mask = self._watchlist_indices != idx
+            self._watchlist_indices = self._watchlist_indices[mask]
+            self._screening_scores = self._screening_scores[mask]
+            if self._portfolio_weights is not None:
+                self._portfolio_weights = self._portfolio_weights[mask]
+            removed += 1
+
+        # Normalize screening scores
+        if len(self._screening_scores) > 0:
+            self._screening_scores = self._screening_scores / (self._screening_scores.sum() + 1e-8)
+
+        return removed
+
+    def map_to_universe_indices(self, watchlist_indices: np.ndarray) -> np.ndarray:
+        """
+        Map Watchlist indices (0 to watchlist_size-1) to Universe indices.
+
+        Args:
+            watchlist_indices: (K,) indices within Watchlist
+
+        Returns:
+            universe_indices: (K,) indices within Universe
+        """
+        if self._watchlist_indices is None:
+            return watchlist_indices  # Fallback: assume already universe indices
+
+        return self._watchlist_indices[watchlist_indices]
+
+    def filter_logits_to_watchlist(self, expert_logits: th.Tensor) -> th.Tensor:
+        """
+        Filter full universe logits to only Watchlist stocks.
+
+        Args:
+            expert_logits: (batch, universe_size) full logits
+
+        Returns:
+            watchlist_logits: (batch, watchlist_size) filtered logits
+        """
+        if self._watchlist_indices is None:
+            return expert_logits[:, :self.watchlist_size]
+
+        return expert_logits[:, self._watchlist_indices]
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Get state for checkpointing."""
+        return {
+            'watchlist_indices': self._watchlist_indices,
+            'screening_scores': self._screening_scores,
+            'portfolio_weights': self._portfolio_weights,
+            'embeddings_buffer': self._embeddings_buffer.cpu() if self._embeddings_buffer is not None else None,
+            'holdings_mask': self._holdings_mask,
+            'entry_prices': self._entry_prices,
+            'days_since_screening': self._days_since_screening,
+            'buffer_idx': self._buffer_idx,
+            'initialized': self._initialized,
+            'use_model_scores': self._use_model_scores,  # Persist model trust state
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]):
+        """Load state from checkpoint."""
+        self._watchlist_indices = state.get('watchlist_indices')
+        self._screening_scores = state.get('screening_scores')
+        self._portfolio_weights = state.get('portfolio_weights')
+        buffer = state.get('embeddings_buffer')
+        self._embeddings_buffer = buffer.to(self.device) if buffer is not None else None
+        self._holdings_mask = state.get('holdings_mask')
+        self._entry_prices = state.get('entry_prices')
+        self._days_since_screening = state.get('days_since_screening', 0)
+        self._buffer_idx = state.get('buffer_idx', 0)
+        self._initialized = state.get('initialized', False)
+        self._use_model_scores = state.get('use_model_scores', False)  # Restore model trust state
 
 
 class MAFIAObserver:
@@ -126,8 +808,16 @@ class MAFIAObserver:
         lr_direction = getattr(config, "mafia_lr_direction_head", 5e-4)
         lr_risk = getattr(config, "mafia_lr_risk_head", 1e-4)
         lr_backbone = getattr(config, "mafia_lr_backbone", 3e-4)
-        weight_decay = config.mafia_weight_decay
-        weight_decay_risk = getattr(config, "mafia_weight_decay_risk_head", 0.01)
+
+        # Check L2 regularization enable flag (for ablation studies)
+        l2_enabled = getattr(config, "macro_enable_l2_regularization", True)
+        if l2_enabled:
+            weight_decay = config.mafia_weight_decay
+            weight_decay_risk = getattr(config, "mafia_weight_decay_risk_head", 0.01)
+        else:
+            weight_decay = 0.0
+            weight_decay_risk = 0.0
+            smart_print("[MAFIAObserver] L2 Regularization DISABLED (weight_decay=0)")
 
         # Initialize HybridRiskLoss for consistent risk loss computation
         # Same as offline trainer for consistency
@@ -584,6 +1274,39 @@ class MAFIAObserver:
 
         return explicit_signals
 
+    def _remap_legacy_layernorm_keys(self, state_dict: dict) -> dict:
+        """
+        Remap old checkpoint keys for backward compatibility.
+
+        When StableLayerNorm replaced nn.LayerNorm, the parameter paths changed:
+        - Old: input_norm.weight, input_norm.bias
+        - New: input_norm.norm.weight, input_norm.norm.bias
+
+        This method remaps old keys to new keys so old checkpoints can still be loaded.
+        """
+        remapped = {}
+        remapped_count = 0
+
+        for key, value in state_dict.items():
+            new_key = key
+            # Check if this is an old-style input_norm key (without .norm.)
+            if ".input_norm.weight" in key and ".input_norm.norm." not in key:
+                new_key = key.replace(".input_norm.weight", ".input_norm.norm.weight")
+                remapped_count += 1
+            elif ".input_norm.bias" in key and ".input_norm.norm." not in key:
+                new_key = key.replace(".input_norm.bias", ".input_norm.norm.bias")
+                remapped_count += 1
+
+            remapped[new_key] = value
+
+        if remapped_count > 0:
+            smart_print(
+                f"[MAFIA] Remapped {remapped_count} legacy LayerNorm keys (input_norm -> input_norm.norm)",
+                flush=True,
+            )
+
+        return remapped
+
     def _ensure_temp_embeddings_from_state(self, state_dict: dict):
         """
         Materialize temporary layers (embeddings/projections) that may have been created
@@ -653,9 +1376,16 @@ class MAFIAObserver:
             out_features = w.shape[0]
 
             module._temp_proj = nn.Linear(in_features, out_features).to(self.device)
+            
+            # CRITICAL FIX: Copy weights from checkpoint into the newly created layer
+            # Without this, the layer has random weights and checkpoint weights are lost
+            with th.no_grad():
+                module._temp_proj.weight.copy_(w.to(self.device))
+                module._temp_proj.bias.copy_(b.to(self.device))
+            
             smart_print(
                 f"[MAFIA] Recreated temp projection for {prefix} "
-                f"(in={in_features}, out={out_features})",
+                f"(in={in_features}, out={out_features}) - weights loaded from checkpoint",
                 flush=True,
             )
 
@@ -741,7 +1471,7 @@ class MAFIAObserver:
         collect_pg: bool = True,
         collect_eta: bool = True,
         force_topk_indices=None,
-        prev_holdings=None,
+        holding_alpha_bias=None,
         **kwargs,
     ):
         """
@@ -751,7 +1481,7 @@ class MAFIAObserver:
             raw_ochlv_data: (N, M, T_w) - Direct MAFIA input (required)
             finemkt_feat: Deprecated - kept for interface compatibility
             finestock_feat: Deprecated - kept for interface compatibility
-            prev_holdings: (B, N) Binary mask of currently held stocks for Inertia Bias
+            holding_alpha_bias: (B, N) Smart Holding Bias: alpha × sensitivity × is_held
             **kwargs: Must include 'mode' ('train', 'valid', 'test')
 
         Returns:
@@ -886,7 +1616,8 @@ class MAFIAObserver:
                 force_topk_indices=force_topk_indices,
                 router_context_buffer=router_context_buffer,
                 explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
-                prev_holdings=prev_holdings,  # Memory Injection
+                holding_alpha_bias=holding_alpha_bias,  # Smart Holding Bias
+                portfolio_state=kwargs.get("portfolio_state", None),  # Portfolio context
             )
         else:
             self.mafia_model.eval()
@@ -907,7 +1638,8 @@ class MAFIAObserver:
                     force_topk_indices=force_topk_indices,
                     router_context_buffer=router_context_buffer,
                     explicit_signals=explicit_signals,  # Direction Head signals (Spec 3.5)
-                    prev_holdings=kwargs.get("prev_holdings", None),  # Memory Injection
+                    holding_alpha_bias=kwargs.get("holding_alpha_bias", None),  # Smart Holding Bias
+                    portfolio_state=kwargs.get("portfolio_state", None),  # Portfolio context
                 )
 
         # Update context buffer with new market_context (Spec 3.6)
@@ -2606,15 +3338,37 @@ class MAFIAObserver:
 
         # Load model state
         mafia_state = checkpoint["mafia_model_state_dict"]
+
+        # Remap old checkpoint keys: input_norm.weight -> input_norm.norm.weight
+        # This handles backward compatibility when StableLayerNorm replaced nn.LayerNorm
+        mafia_state = self._remap_legacy_layernorm_keys(mafia_state)
+
         # Ensure dynamically created temp embeddings exist before strict load
         self._ensure_temp_embeddings_from_state(mafia_state)
         try:
             self.mafia_model.load_state_dict(mafia_state)
+            smart_print("[MAFIA] Strict load SUCCESS.", flush=True)
         except RuntimeError as e:
             smart_print(
-                f"[MAFIA] Warning: Strict load failed ({e}). Retrying with strict=False to allow partial loading...",
+                f"[MAFIA] Warning: Strict load failed ({e}). Retrying with strict=False...",
                 flush=True,
             )
+            # DEBUG: Print exact mismatches
+            model_keys = set(self.mafia_model.state_dict().keys())
+            ckpt_keys = set(mafia_state.keys())
+            missing_in_model = ckpt_keys - model_keys
+            missing_in_ckpt = model_keys - ckpt_keys
+            intersection = model_keys & ckpt_keys
+            
+            smart_print(f"[DEBUG] Checkpoint keys: {len(ckpt_keys)}", flush=True)
+            smart_print(f"[DEBUG] Model keys: {len(model_keys)}", flush=True)
+            smart_print(f"[DEBUG] Intersection (Matched): {len(intersection)}", flush=True)
+            
+            if len(missing_in_model) > 0:
+                smart_print(f"[DEBUG] Keys in Checkpoint BUT NOT in Model: {list(missing_in_model)}", flush=True)
+            if len(missing_in_ckpt) > 0:
+                smart_print(f"[DEBUG] Keys in Model BUT NOT in Checkpoint: {list(missing_in_ckpt)}", flush=True)
+                
             self.mafia_model.load_state_dict(mafia_state, strict=False)
         
         if load_optimizer:
@@ -2675,18 +3429,21 @@ class MAFIAObserver:
         frozen_state = frozen_ckpt["mafia_model_state_dict"]
         trainable_state = trainable_ckpt["mafia_model_state_dict"]
 
+        # Remap legacy LayerNorm keys for backward compatibility
+        frozen_state = self._remap_legacy_layernorm_keys(frozen_state)
+        trainable_state = self._remap_legacy_layernorm_keys(trainable_state)
+
         # Define frozen param prefixes (SELECTION_ONLY frozen components)
         # These come from MACRO checkpoint (aligned with current year's window)
         frozen_prefixes = [
             # Macro Stream (Direction/Risk Heads)
             "signal_generator.direction_head.",
             "signal_generator.risk_head.",
-            "signal_generator.macro_adapter.",
-            "signal_generator.delta_norm.",
+            "signal_generator.macro_context_norm.",  # Separate LayerNorm for Macro path
             # Temporal Encoder (Router backbone)
             "signal_generator.gating_router.temporal_encoder.",
             "signal_generator.gating_router.mkt_proj.",
-            "signal_generator.gating_router.context_norm.",
+            "signal_generator.gating_router.context_norm.",  # Used by Selection stream
             # Market Agents
             "mkt_ta.",
             "mkt_dc_ta_list.",
